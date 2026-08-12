@@ -1,0 +1,305 @@
+diff --git a/examples/h007_clean_decode_gifstream.py b/examples/h007_clean_decode_gifstream.py
+index e82316b..fc64ae8 100644
+--- a/examples/h007_clean_decode_gifstream.py
++++ b/examples/h007_clean_decode_gifstream.py
+@@ -249,4 +249,4 @@ def clean_decode(
+     )
+-    if len(runtime_provenance.get("patch_sha256", [])) != 7:
+-        raise ValueError("clean decoder is not bound to the registered seven-stage patch chain")
++    if len(runtime_provenance.get("patch_sha256", [])) != 8:
++        raise ValueError("clean decoder is not bound to the registered eight-stage patch chain")
+     counted_manifest = container / "preregistered_patch_chain_manifest.json"
+diff --git a/examples/simple_trainer_GIFStream.py b/examples/simple_trainer_GIFStream.py
+index cdf348a..62d99ec 100644
+--- a/examples/simple_trainer_GIFStream.py
++++ b/examples/simple_trainer_GIFStream.py
+@@ -358,2 +358,12 @@ class Config:
+         },
++        {
++            "anchors": None,
++            "scales": 0.038,
++            "quats": None,
++            "opacities": None,
++            "anchor_features": 1,
++            "offsets": 0.038,
++            "factors": 1/16,
++            "time_features": 1,
++        },
+     ]
+@@ -2570,4 +2580,4 @@ class Runner:
+         patch_chain = list(self.ap_runtime_provenance["patch_sha256"])
+-        if len(patch_chain) != 7:
+-            raise ValueError("official/AP compression lacks the registered seven-stage runtime chain")
++        if len(patch_chain) != 8:
++            raise ValueError("official/AP compression lacks the registered eight-stage runtime chain")
+         decoder_config = {
+diff --git a/gsplat/compression/h007_certification.py b/gsplat/compression/h007_certification.py
+index a8308ae..9f94fe7 100644
+--- a/gsplat/compression/h007_certification.py
++++ b/gsplat/compression/h007_certification.py
+@@ -5,3 +5,3 @@ no-follow freeze of an exact five-scene x five-GOP reference grid, the selected
+ real nested sequence archives, ordinary image/rate preconditions, and the
+-active six-stage evaluator provenance.  Validation reopens and recomputes the
++active eight-stage evaluator provenance.  Validation reopens and recomputes the
+ complete closure; a caller-supplied PASS object is never trusted.
+@@ -275,4 +275,4 @@ def _verify_runtime(
+     )
+-    if len(receipt.get("patch_sha256", [])) != 6:
+-        raise ValueError("Stage 02 requires the exact six-stage runtime provenance")
++    if len(receipt.get("patch_sha256", [])) != 8:
++        raise ValueError("Stage 02 requires the exact eight-stage runtime provenance")
+     return receipt
+@@ -1008,3 +1008,3 @@ def validate_stage02_freeze(
+     ):
+-        raise ValueError("Stage-02 six-stage runtime receipt mismatch")
++        raise ValueError("Stage-02 eight-stage runtime receipt mismatch")
+     reference_cases, reference_files, reference_rebuilds = _validate_reference_grid(
+diff --git a/gsplat/compression/h007_runtime_provenance.py b/gsplat/compression/h007_runtime_provenance.py
+index cf5fb27..34ff05a 100644
+--- a/gsplat/compression/h007_runtime_provenance.py
++++ b/gsplat/compression/h007_runtime_provenance.py
+@@ -22,3 +22,12 @@ PATCH2_SHA256 = "347e3fbb59cdab49160a0c5291ecbd375e2de37d6bf3dea3e927d07f0ed8a25
+ PATCH2B_SHA256 = "537b7a6c1607204000f6d4ce198d60c0b69917e46cdd89e9d6fcc431d37af40b"
+-PATCH_STAGES = ("patch1", "patch2", "patch2b", "patch3", "patch4", "patch5", "patch6")
++PATCH_STAGES = (
++    "patch1",
++    "patch2",
++    "patch2b",
++    "patch3",
++    "patch4",
++    "patch5",
++    "patch6",
++    "patch7",
++)
+ TREE_ROOTS = ("examples", "gsplat", "third_party")
+diff --git a/gsplat/compression/h007_sequence_container.py b/gsplat/compression/h007_sequence_container.py
+index 7fab502..3f53da3 100644
+--- a/gsplat/compression/h007_sequence_container.py
++++ b/gsplat/compression/h007_sequence_container.py
+@@ -63,2 +63,6 @@ FROZEN_RATE_LAMBDAS = {
+     4: 0.0009,
++    5: 0.00095,
++}
++FROZEN_ORDINARY_RATE_LAMBDAS = {
++    index: FROZEN_RATE_LAMBDAS[index] for index in range(4)
+ }
+@@ -515,4 +519,4 @@ def _expected_codec_scaling(rate: int) -> Dict[str, Any]:
+         raise ValueError("codec scaling rate is outside the registered rate grid")
+-    scale = (0.02, 0.04, 0.06, 0.08, 0.036)[rate]
+-    feature = (1, 1, 1.5, 2, 1)[rate]
++    scale = (0.02, 0.04, 0.06, 0.08, 0.036, 0.038)[rate]
++    feature = (1, 1, 1.5, 2, 1, 1)[rate]
+     return {
+@@ -965,3 +969,3 @@ def _ap_score_npz_contract(
+         "normalized_code_tree_sha256.npy": ("<U64", ()),
+-        "patch_chain_sha256.npy": ("<U64", (7,)),
++        "patch_chain_sha256.npy": ("<U64", (8,)),
+         "path_definition.npy": (_unicode_scalar_descr(AP_PATH_DEFINITION), ()),
+@@ -2321,3 +2325,3 @@ def _validate_runtime_provenance_shape(value: Any, label: str) -> Dict[str, Any]
+         or not isinstance(value["patch_sha256"], list)
+-        or len(value["patch_sha256"]) != 7
++        or len(value["patch_sha256"]) != 8
+         or not isinstance(tree, dict)
+@@ -2824,4 +2828,4 @@ def _validate_gifstream_decoder_closure(
+     patch_chain = config.get("patch_chain_sha256")
+-    if not isinstance(patch_chain, list) or len(patch_chain) != 7:
+-        raise ValueError("GIFStream GOP is not bound to the registered seven-stage runtime")
++    if not isinstance(patch_chain, list) or len(patch_chain) != 8:
++        raise ValueError("GIFStream GOP is not bound to the registered eight-stage runtime")
+     for index, digest in enumerate(patch_chain):
+@@ -2866,3 +2870,12 @@ def _validate_gifstream_decoder_closure(
+         or [row.get("stage") for row in prereg_patches]
+-        != ["patch1", "patch2", "patch2b", "patch3", "patch4", "patch5"]
++        != [
++            "patch1",
++            "patch2",
++            "patch2b",
++            "patch3",
++            "patch4",
++            "patch5",
++            "patch6",
++            "patch7",
++        ]
+         or any(
+@@ -4272,4 +4285,4 @@ def validate_eligibility_recomputation_contract(
+     expected_grid = {
+-        str(index): FROZEN_RATE_LAMBDAS[index]
+-        for index in sorted(FROZEN_RATE_LAMBDAS)
++        str(index): FROZEN_ORDINARY_RATE_LAMBDAS[index]
++        for index in sorted(FROZEN_ORDINARY_RATE_LAMBDAS)
+     }
+@@ -4285,3 +4298,3 @@ def validate_eligibility_recomputation_contract(
+     ordered_bytes = []
+-    for index in sorted(FROZEN_RATE_LAMBDAS):
++    for index in sorted(FROZEN_ORDINARY_RATE_LAMBDAS):
+         item = actual_bytes[str(index)]
+@@ -4301,3 +4314,3 @@ def validate_eligibility_recomputation_contract(
+         or not isinstance(selected_rate, int)
+-        or selected_rate not in FROZEN_RATE_LAMBDAS
++        or selected_rate not in FROZEN_ORDINARY_RATE_LAMBDAS
+         or value["selected_point_id"] != expected_point_id
+@@ -4353,3 +4366,3 @@ def validate_eligibility_recomputation_contract(
+         or not isinstance(patches, list)
+-        or len(patches) != 7
++        or len(patches) != 8
+         or not isinstance(tree, dict)
+@@ -4850,3 +4863,3 @@ def _validate_ordinary_rate_quality_evidence(
+     referenced archive and every source RGB member, validates the active
+-    registered seven-stage runtime, and recomputes the ordinary rate/quality accounting.
++    registered eight-stage runtime, and recomputes the ordinary rate/quality accounting.
+     """
+@@ -4919,4 +4932,4 @@ def _validate_ordinary_rate_quality_evidence(
+     )
+-    if len(runtime_receipt.get("patch_sha256", [])) != 7:
+-        raise ValueError("ordinary evidence does not bind the registered seven-stage runtime")
++    if len(runtime_receipt.get("patch_sha256", [])) != 8:
++        raise ValueError("ordinary evidence does not bind the registered eight-stage runtime")
+     evaluator_relative = _nonempty_string(
+@@ -5018,5 +5031,9 @@ def _validate_ordinary_rate_quality_evidence(
+         if (
+-            producer_rate not in FROZEN_RATE_LAMBDAS
++            producer_rate not in FROZEN_ORDINARY_RATE_LAMBDAS
+             or not math.isfinite(producer_lambda)
+-            or abs(producer_lambda - FROZEN_RATE_LAMBDAS[producer_rate]) > 1e-15
++            or abs(
++                producer_lambda
++                - FROZEN_ORDINARY_RATE_LAMBDAS[producer_rate]
++            )
++            > 1e-15
+             or producer_rate in producer_rates
+@@ -5086,3 +5103,3 @@ def _validate_ordinary_rate_quality_evidence(
+         or len(training_config_hashes) != 4
+-        or set(producer_rates) != set(FROZEN_RATE_LAMBDAS)
++        or set(producer_rates) != set(FROZEN_ORDINARY_RATE_LAMBDAS)
+     ):
+@@ -5126,4 +5143,4 @@ def _validate_ordinary_rate_quality_evidence(
+         "frozen_rate_lambda_grid": {
+-            str(index): FROZEN_RATE_LAMBDAS[index]
+-            for index in sorted(FROZEN_RATE_LAMBDAS)
++            str(index): FROZEN_ORDINARY_RATE_LAMBDAS[index]
++            for index in sorted(FROZEN_ORDINARY_RATE_LAMBDAS)
+         },
+diff --git a/tests/test_ap_gifstream_core.py b/tests/test_ap_gifstream_core.py
+index 0f02c90..75b3e70 100644
+--- a/tests/test_ap_gifstream_core.py
++++ b/tests/test_ap_gifstream_core.py
+@@ -62,2 +62,4 @@ class APGIFStreamCoreTest(unittest.TestCase):
+                 "8" * 64,
++                "9" * 64,
++                "a" * 64,
+             ],
+@@ -166,2 +168,4 @@ class APGIFStreamCoreTest(unittest.TestCase):
+                         "8" * 64,
++                        "9" * 64,
++                        "a" * 64,
+                     ]
+diff --git a/tests/test_h007_certification_stdlib.py b/tests/test_h007_certification_stdlib.py
+index f24aee1..0394cd4 100644
+--- a/tests/test_h007_certification_stdlib.py
++++ b/tests/test_h007_certification_stdlib.py
+@@ -144,2 +144,4 @@ class H007CertificationStdlibTest(unittest.TestCase):
+                         "7" * 64,
++                        "8" * 64,
++                        "9" * 64,
+                     ],
+@@ -350,3 +352,3 @@ class H007CertificationStdlibTest(unittest.TestCase):
+             "freeze": {"evaluator_sha256": "1" * 64},
+-            "runtime_provenance": {"patch_sha256": ["a" * 64] * 6},
++            "runtime_provenance": {"patch_sha256": ["a" * 64] * 8},
+         }
+diff --git a/tests/test_h007_runtime_provenance_stdlib.py b/tests/test_h007_runtime_provenance_stdlib.py
+index 69dae21..eda0861 100644
+--- a/tests/test_h007_runtime_provenance_stdlib.py
++++ b/tests/test_h007_runtime_provenance_stdlib.py
+@@ -1,2 +1,2 @@
+-"""Stdlib-only tamper tests for the six-stage H007 provenance contract."""
++"""Stdlib-only tamper tests for the eight-stage H007 provenance contract."""
+ 
+@@ -40,3 +40,3 @@ class H007RuntimeProvenanceStdlibTest(unittest.TestCase):
+         patch_dir.mkdir()
+-        self.patch_payloads = [f"patch-{index}\n".encode() for index in range(1, 7)]
++        self.patch_payloads = [f"patch-{index}\n".encode() for index in range(1, 9)]
+         self.patch_hashes = []
+@@ -79,3 +79,3 @@ class H007RuntimeProvenanceStdlibTest(unittest.TestCase):
+ 
+-    def test_clean_six_stage_chain_is_accepted(self) -> None:
++    def test_clean_eight_stage_chain_is_accepted(self) -> None:
+         receipt = self._verify()
+diff --git a/tests/test_h007_sequence_container.py b/tests/test_h007_sequence_container.py
+index 90f9dcc..109441d 100644
+--- a/tests/test_h007_sequence_container.py
++++ b/tests/test_h007_sequence_container.py
+@@ -145,3 +145,3 @@ def fixture_ap_meta(method="ap-gifstream-full"):
+         "normalized_code_tree_sha256": digest,
+-        "patch_chain_sha256": [digest] * 6,
++        "patch_chain_sha256": [digest] * 8,
+         "anchor_count": anchor_count,
+@@ -171,3 +171,3 @@ def fixture_ap_meta(method="ap-gifstream-full"):
+         "official_commit": sequence.OFFICIAL_COMMIT,
+-        "patch_sha256": [digest] * 6,
++        "patch_sha256": [digest] * 8,
+         "normalized_code_tree": {
+@@ -698,2 +698,39 @@ class H007SequenceContainerTest(unittest.TestCase):
+ 
++    def test_registered_f02_rate_controls_match_producer_and_validator(self):
++        trainer = MODULE_PATH.parents[2] / "examples/simple_trainer_GIFStream.py"
++        tree = ast.parse(trainer.read_text(encoding="utf-8"))
++        config = next(
++            node
++            for node in tree.body
++            if isinstance(node, ast.ClassDef) and node.name == "Config"
++        )
++        assignment = next(
++            node
++            for node in config.body
++            if isinstance(node, ast.Assign)
++            and any(
++                isinstance(target, ast.Name)
++                and target.id == "compression_scaling"
++                for target in node.targets
++            )
++        )
++        producer_grid = eval(
++            compile(ast.Expression(assignment.value), str(trainer), "eval"),
++            {"__builtins__": {}},
++        )
++        expected = {
++            "anchors": None,
++            "scales": 0.038,
++            "quats": None,
++            "opacities": None,
++            "anchor_features": 1,
++            "offsets": 0.038,
++            "factors": 0.0625,
++            "time_features": 1,
++        }
++        self.assertEqual(len(producer_grid), 6)
++        self.assertEqual(producer_grid[5], expected)
++        self.assertEqual(sequence.FROZEN_RATE_LAMBDAS[5], 0.00095)
++        self.assertEqual(sequence._expected_codec_scaling(5), expected)
++
+     def test_ordinary_evaluator_has_no_external_prediction_input(self):
+@@ -805,3 +842,3 @@ class H007SequenceContainerTest(unittest.TestCase):
+             "official_commit": sequence.OFFICIAL_COMMIT,
+-            "patch_sha256": ["a" * 64] * 6,
++            "patch_sha256": ["a" * 64] * 8,
+             "normalized_code_tree": {
+@@ -932,3 +969,3 @@ class H007SequenceContainerTest(unittest.TestCase):
+         }
+-        patch_hashes = [f"{index:x}" * 64 for index in range(1, 7)]
++        patch_hashes = [f"{index:x}" * 64 for index in range(1, 9)]
+         runtime_manifest_payload = sequence.canonical_json_bytes(
+@@ -944,3 +981,12 @@ class H007SequenceContainerTest(unittest.TestCase):
+                     for stage, digest in zip(
+-                        ("patch1", "patch2", "patch2b", "patch3", "patch4", "patch5"),
++                        (
++                            "patch1",
++                            "patch2",
++                            "patch2b",
++                            "patch3",
++                            "patch4",
++                            "patch5",
++                            "patch6",
++                            "patch7",
++                        ),
+                         patch_hashes,

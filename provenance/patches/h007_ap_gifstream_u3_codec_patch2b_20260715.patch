@@ -1,0 +1,2383 @@
+diff --git a/examples/h007_clean_decode_gifstream.py b/examples/h007_clean_decode_gifstream.py
+index dff6547..99e3df8 100644
+--- a/examples/h007_clean_decode_gifstream.py
++++ b/examples/h007_clean_decode_gifstream.py
+@@ -16,7 +16,7 @@ import os
+ import stat
+ import zipfile
+ from pathlib import Path
+-from typing import Any, Dict
++from typing import Any, Dict, Optional, Tuple
+ 
+ import numpy as np
+ import torch
+@@ -28,6 +28,11 @@ from gsplat.compression.ap_gifstream import (
+     tensor_mapping_sha256,
+     variant_spec,
+ )
++from gsplat.compression.h007_clean_runtime import (
++    counted_camera_render_benchmark,
++    instantiate_counted_models,
++)
++from gsplat.compression.h007_runtime_provenance import verify_runtime_provenance
+ from gsplat.compression_simulation.simulation import GIFStreamCompressionSimulation
+ 
+ 
+@@ -92,7 +97,9 @@ def _validate_census(root: Path) -> None:
+             raise ValueError(f"byte-census hash mismatch: {name}")
+ 
+ 
+-def _validate_camera_metadata(root: Path) -> Dict[str, Any]:
++def _validate_camera_metadata(
++    root: Path,
++) -> Tuple[Dict[str, np.ndarray], Dict[str, Any]]:
+     camera_dir = root / "camera_metadata"
+     arrays = {
+         name: np.load(camera_dir / f"{name}.npy", allow_pickle=False)
+@@ -119,11 +126,20 @@ def _validate_camera_metadata(root: Path) -> Dict[str, Any]:
+         raise ValueError("counted camera poses are malformed")
+     if arrays["camera_ids"].shape[0] != arrays["camtoworlds"].shape[0]:
+         raise ValueError("counted camera IDs/poses disagree")
++    if arrays["camera_names"].shape[0] != arrays["camtoworlds"].shape[0]:
++        raise ValueError("counted camera names/poses disagree")
++    if np.unique(arrays["camera_keys"]).shape[0] != n_cameras:
++        raise ValueError("counted camera keys are duplicated")
++    if not set(int(value) for value in arrays["camera_ids"].tolist()).issubset(
++        set(int(value) for value in arrays["camera_keys"].tolist())
++    ):
++        raise ValueError("counted pose camera IDs are absent from intrinsic keys")
+     if not all(np.isfinite(value).all() for value in arrays.values() if value.dtype.kind in "f"):
+         raise ValueError("nonfinite counted camera metadata")
+-    return {
++    return arrays, {
+         "camera_key_count": n_cameras,
+         "pose_count": int(arrays["camtoworlds"].shape[0]),
++        "source": "counted_archive_only",
+     }
+ 
+ 
+@@ -142,7 +158,15 @@ def _tensor_manifest(splats: Dict[str, torch.Tensor]) -> Dict[str, Any]:
+     return output
+ 
+ 
+-def clean_decode(archive: Path, output_dir: Path, device: str) -> Dict[str, Any]:
++def clean_decode(
++    archive: Path,
++    output_dir: Path,
++    device: str,
++    provenance_manifest: Optional[Path],
++    provenance_manifest_sha256: Optional[str],
++    warmup_renders: Optional[int] = None,
++    timed_renders: Optional[int] = None,
++) -> Dict[str, Any]:
+     archive = archive.resolve()
+     if not archive.is_file():
+         raise ValueError(f"archive does not exist: {archive}")
+@@ -154,31 +178,72 @@ def clean_decode(archive: Path, output_dir: Path, device: str) -> Dict[str, Any]
+     _validate_census(container)
+ 
+     config = json.loads((container / "decoder_config.json").read_text(encoding="utf-8"))
+-    if config.get("schema") != "h007.gifstream_decoder_config.v1":
++    if config.get("schema") != "h007.gifstream_decoder_config.v2":
+         raise ValueError("unsupported decoder-config schema")
+     if config.get("official_commit") != OFFICIAL_COMMIT:
+         raise ValueError("container official commit mismatch")
++    runtime_provenance = None
++    repo_root = Path(__file__).resolve().parents[1]
+     if config.get("variant") != "official":
+-        patch_sha = str(config.get("patch_sha256", ""))
+-        if len(patch_sha) != 64 or any(
+-            ch not in "0123456789abcdef" for ch in patch_sha.lower()
+-        ):
+-            raise ValueError("AP container patch SHA-256 is malformed")
+-        if config.get("patch1_sha256") != PATCH1_SHA256 or config.get(
+-            "patch2_sha256"
+-        ) != patch_sha:
+-            raise ValueError("AP container patch-chain provenance is malformed")
++        if provenance_manifest is None or provenance_manifest_sha256 is None:
++            raise ValueError("AP clean decode requires external preregistration manifest/hash")
++        counted_manifest = container / "preregistered_patch_chain_manifest.json"
++        external_payload = provenance_manifest.resolve().read_bytes()
++        if counted_manifest.read_bytes() != external_payload:
++            raise ValueError("counted/external preregistration manifests differ")
++        runtime_provenance = verify_runtime_provenance(
++            provenance_manifest,
++            repo_root,
++            provenance_manifest_sha256,
++        )
++        counted_receipt = json.loads(
++            (container / "runtime_provenance.json").read_text(encoding="utf-8")
++        )
++        if counted_receipt != runtime_provenance:
++            raise ValueError("counted runtime-provenance receipt mismatch")
++        if config.get("patch_chain_sha256") != runtime_provenance["patch_sha256"]:
++            raise ValueError("decoder config patch chain differs from preregistration")
++        if config.get("runtime_manifest_sha256") != runtime_provenance[
++            "manifest_sha256"
++        ] or config.get("normalized_code_tree_sha256") != runtime_provenance[
++            "normalized_code_tree"
++        ]["sha256"]:
++            raise ValueError("decoder config runtime/code-tree provenance mismatch")
+     if config.get("clean_decode_entrypoint") != "examples/h007_clean_decode_gifstream.py":
+         raise ValueError("container clean-decode entrypoint mismatch")
+     if int(config["GOP_size"]) != 60 and config.get("variant") != "official":
+         raise ValueError("U3 AP container must contain a 60-frame GOP")
+-    camera_audit = _validate_camera_metadata(container)
++    camera_arrays, camera_audit = _validate_camera_metadata(container)
+     edit_audit_path = container / "ap_edit_hook.json"
+     if edit_audit_path.is_file():
+         edit_audit = json.loads(edit_audit_path.read_text(encoding="utf-8"))
+         edit_artifact = container / str(edit_audit["counted_artifact"])
+         if _sha256(edit_artifact) != edit_audit["counted_artifact_sha256"]:
+             raise ValueError("counted edit artifact differs from edit-hook receipt")
++        edit_score = container / str(edit_audit["counted_source_score"])
++        edit_reference = container / str(edit_audit["counted_reference_manifest"])
++        if _sha256(edit_score) != edit_audit["counted_source_score_sha256"] or _sha256(
++            edit_score
++        ) != edit_audit["source_score_sha256"]:
++            raise ValueError("counted edit source score differs from edit-hook receipt")
++        if _sha256(edit_reference) != edit_audit[
++            "counted_reference_manifest_sha256"
++        ] or _sha256(edit_reference) != edit_audit["reference_manifest_sha256"]:
++            raise ValueError("counted edit reference manifest differs from edit-hook receipt")
++        reference = json.loads(edit_reference.read_text(encoding="utf-8"))
++        if reference.get("source_score_sha256") != edit_audit[
++            "source_score_sha256"
++        ] or reference.get("selection") != edit_audit["selection"]:
++            raise ValueError("edit reference manifest score/selection mismatch")
++        with np.load(edit_artifact, allow_pickle=False) as edit:
++            if str(np.asarray(edit["source_score_sha256"]).item()) != edit_audit[
++                "source_score_sha256"
++            ] or str(np.asarray(edit["selection"]).item()) != edit_audit["selection"]:
++                raise ValueError("counted edit artifact score/selection mismatch")
++            if str(np.asarray(edit["reference_manifest_sha256"]).item()) != edit_audit[
++                "reference_manifest_sha256"
++            ]:
++                raise ValueError("counted edit artifact reference-manifest mismatch")
+     receipt = None
+     if config.get("variant") != "official":
+         receipt_path = container / "ap_training_receipt.json"
+@@ -196,6 +261,8 @@ def clean_decode(archive: Path, output_dir: Path, device: str) -> Dict[str, Any]
+             raise ValueError("counted AP receipt lacks entropy-estimator freeze evidence")
+         if receipt.get("factor_membership_columns_frozen") != [0, 3]:
+             raise ValueError("counted AP receipt lacks factor-membership freeze evidence")
++        if receipt.get("runtime_provenance") != runtime_provenance:
++            raise ValueError("counted AP receipt runtime provenance mismatch")
+         if spec.action_loss and (
+             int(receipt.get("path_loss_applications", 0)) <= 0
+             or not receipt.get("path_loss_steps")
+@@ -209,6 +276,9 @@ def clean_decode(archive: Path, output_dir: Path, device: str) -> Dict[str, Any]
+     nets = torch.load(container / "nets.pt", map_location=target_device, weights_only=True)
+     if "decoders" not in nets or "scaling" not in nets:
+         raise ValueError("counted nets.pt is incomplete")
++    decoders, app_module, model_audit = instantiate_counted_models(
++        nets, config, target_device
++    )
+     entropy_steps = {name: 1 for name in ENTROPY_KEYS}
+     simulation = GIFStreamCompressionSimulation(
+         entropy_model_enable=True,
+@@ -227,6 +297,11 @@ def clean_decode(archive: Path, output_dir: Path, device: str) -> Dict[str, Any]
+         key = f"{name}_entropy_model"
+         if key not in nets:
+             raise ValueError(f"counted nets.pt lacks {key}")
++        if not isinstance(nets[key], dict) or any(
++            not isinstance(value, torch.Tensor) or not torch.isfinite(value).all()
++            for value in nets[key].values()
++        ):
++            raise ValueError(f"counted entropy state is malformed/nonfinite: {key}")
+         model.load_state_dict(nets[key], strict=True)
+         model.eval()
+     if receipt is not None:
+@@ -239,6 +314,15 @@ def clean_decode(archive: Path, output_dir: Path, device: str) -> Dict[str, Any]
+             )
+             frozen_scaling = float(np.asarray(score["time_feature_scaling"]).item())
+             estimator_version = str(np.asarray(score["estimator_version"]).item())
++            score_runtime_manifest = str(
++                np.asarray(score["runtime_manifest_sha256"]).item()
++            )
++            score_code_tree = str(
++                np.asarray(score["normalized_code_tree_sha256"]).item()
++            )
++            score_patch_chain = [
++                str(value) for value in np.asarray(score["patch_chain_sha256"]).tolist()
++            ]
+         if current_time_hash != frozen_time_hash or receipt.get(
+             "time_entropy_model_sha256"
+         ) != frozen_time_hash:
+@@ -247,8 +331,22 @@ def clean_decode(archive: Path, output_dir: Path, device: str) -> Dict[str, Any]
+             raise ValueError("clean decoder temporal scaling differs from byte estimator")
+         if estimator_version != "h007.conditional_gaussian_per_row_bits.v1":
+             raise ValueError("clean decoder byte estimator version mismatch")
++        if (
++            score_runtime_manifest != runtime_provenance["manifest_sha256"]
++            or score_code_tree != runtime_provenance["normalized_code_tree"]["sha256"]
++            or score_patch_chain != runtime_provenance["patch_sha256"]
++        ):
++            raise ValueError("clean decoder score/runtime provenance mismatch")
+ 
+-    codec = GIFStreamEnd2endCompression()
++    codec = GIFStreamEnd2endCompression(
++        ap_config={
++            "provenance_manifest_path": str(provenance_manifest.resolve())
++            if provenance_manifest is not None
++            else None,
++            "provenance_manifest_sha256": provenance_manifest_sha256,
++            "repo_root": str(repo_root),
++        }
++    )
+     splats = codec.decompress(container.as_posix(), simulation.entropy_models, target_device)
+     expected = {
+         "anchors",
+@@ -268,13 +366,23 @@ def clean_decode(archive: Path, output_dir: Path, device: str) -> Dict[str, Any]
+     ):
+         raise ValueError("decoded temporal tensor shape disagrees with configuration")
+     decoded_ids = canonical_voxel_ids(splats["anchors"], float(config["voxel_size"]))
+-    sidecar_ids = np.load(container / "ap_canonical_ids.npy", allow_pickle=False) if (
+-        container / "ap_canonical_ids.npy"
++    sidecar_ids = np.load(container / "ap_retained_canonical_ids.npy", allow_pickle=False) if (
++        container / "ap_retained_canonical_ids.npy"
+     ).is_file() else None
+     if sidecar_ids is not None:
+-        sidecar_set = {tuple(int(v) for v in row) for row in sidecar_ids.tolist()}
+-        if not all(tuple(int(v) for v in row) in sidecar_set for row in decoded_ids.cpu().tolist()):
+-            raise ValueError("decoded canonical IDs are absent from counted AP sidecar")
++        decoded_array = decoded_ids.detach().cpu().numpy().astype(np.int64, copy=False)
++        if not np.array_equal(decoded_array, sidecar_ids):
++            raise ValueError("decoded retained canonical ID set/count/order mismatch")
++
++    clean_render = counted_camera_render_benchmark(
++        splats,
++        decoders,
++        app_module,
++        config,
++        camera_arrays,
++        int(config["warmup_renders"] if warmup_renders is None else warmup_renders),
++        int(config["timed_renders"] if timed_renders is None else timed_renders),
++    )
+ 
+     decoded_path = output_dir / "decoded_splats.pt"
+     torch.save({name: value.detach().cpu() for name, value in splats.items()}, decoded_path)
+@@ -291,6 +399,10 @@ def clean_decode(archive: Path, output_dir: Path, device: str) -> Dict[str, Any]
+         "decoded_splats": decoded_path.name,
+         "decoded_splats_sha256": _sha256(decoded_path),
+         "camera_audit": camera_audit,
++        "counted_model_audit": model_audit,
++        "counted_camera_render": clean_render,
++        "warm_render_fps": clean_render["fps"],
++        "runtime_provenance_validated": runtime_provenance is not None,
+         "ap_training_receipt_validated": receipt is not None,
+         "edit_hook_validated": edit_audit_path.is_file(),
+         "tensors": _tensor_manifest(splats),
+@@ -304,8 +416,20 @@ def main() -> None:
+     parser.add_argument("--archive", type=Path, required=True)
+     parser.add_argument("--output-dir", type=Path, required=True)
+     parser.add_argument("--device", default="cuda:0")
++    parser.add_argument("--provenance-manifest", type=Path)
++    parser.add_argument("--provenance-manifest-sha256")
++    parser.add_argument("--warmup-renders", type=int)
++    parser.add_argument("--timed-renders", type=int)
+     args = parser.parse_args()
+-    manifest = clean_decode(args.archive, args.output_dir, args.device)
++    manifest = clean_decode(
++        args.archive,
++        args.output_dir,
++        args.device,
++        args.provenance_manifest,
++        args.provenance_manifest_sha256,
++        args.warmup_renders,
++        args.timed_renders,
++    )
+     print(json.dumps(manifest, sort_keys=True))
+ 
+ 
+diff --git a/examples/h007_make_ap_edit_ids.py b/examples/h007_make_ap_edit_ids.py
+index e5afd3e..a8f85d5 100644
+--- a/examples/h007_make_ap_edit_ids.py
++++ b/examples/h007_make_ap_edit_ids.py
+@@ -11,14 +11,47 @@ from pathlib import Path
+ import numpy as np
+ 
+ 
++SELECTION = "top_path_score_intersection_official_and_ap_retained"
++
++
++def _ids_sha256(ids: np.ndarray) -> str:
++    value = np.asarray(ids, dtype="<i8")
++    return hashlib.sha256(value.tobytes(order="C")).hexdigest()
++
++
+ def main() -> None:
+     parser = argparse.ArgumentParser()
+     parser.add_argument("--score-artifact", type=Path, required=True)
+     parser.add_argument("--count", type=int, required=True)
++    parser.add_argument("--reference-manifest", type=Path, required=True)
+     parser.add_argument("--output", type=Path, required=True)
+     args = parser.parse_args()
+     if args.count <= 0:
+         raise ValueError("edit anchor count must be positive")
++    score_payload = args.score_artifact.read_bytes()
++    score_sha256 = hashlib.sha256(score_payload).hexdigest()
++    reference_payload = args.reference_manifest.read_bytes()
++    reference = json.loads(reference_payload.decode("utf-8"))
++    required_reference = {
++        "schema",
++        "scene",
++        "source_score_sha256",
++        "selection",
++        "selection_count",
++        "selected_canonical_ids_sha256",
++    }
++    if set(reference) != required_reference:
++        raise ValueError("edit reference manifest fields are incomplete or unexpected")
++    if reference["schema"] != "h007.ap_edit_reference_manifest.v1":
++        raise ValueError("unsupported edit reference manifest schema")
++    if reference["scene"] != "flame_salmon_1":
++        raise ValueError("edit reference manifest scene mismatch")
++    if reference["source_score_sha256"] != score_sha256:
++        raise ValueError("edit reference manifest score SHA-256 mismatch")
++    if reference["selection"] != SELECTION or int(reference["selection_count"]) != int(
++        args.count
++    ):
++        raise ValueError("edit reference manifest selection/count mismatch")
+     with np.load(args.score_artifact, allow_pickle=False) as score:
+         if str(np.asarray(score["schema"]).item()) != "h007.ap_scores.v2":
+             raise ValueError("unsupported AP score schema")
+@@ -47,17 +80,22 @@ def main() -> None:
+         )
+     )
+     chosen = candidates[order[: args.count]]
++    chosen_ids = ids[chosen]
++    if _ids_sha256(chosen_ids) != reference["selected_canonical_ids_sha256"]:
++        raise ValueError("deterministic edit selection differs from preregistered ID hash")
+     args.output.parent.mkdir(parents=True, exist_ok=True)
+     np.savez(
+         args.output,
+         schema=np.asarray("h007.ap_edit_ids.v1"),
+         scene=np.asarray("flame_salmon_1"),
+         voxel_size=np.asarray(voxel_size, dtype=np.float64),
+-        canonical_ids=ids[chosen],
+-        source_score_sha256=np.asarray(
+-            hashlib.sha256(args.score_artifact.read_bytes()).hexdigest()
++        canonical_ids=chosen_ids,
++        source_score_sha256=np.asarray(score_sha256),
++        selection=np.asarray(SELECTION),
++        reference_manifest_sha256=np.asarray(
++            hashlib.sha256(reference_payload).hexdigest()
+         ),
+-        selection=np.asarray("top_path_score_intersection_official_and_ap_retained"),
++        selected_canonical_ids_sha256=np.asarray(_ids_sha256(chosen_ids)),
+         path_score=path_score[chosen],
+     )
+     print(
+diff --git a/examples/simple_trainer_GIFStream.py b/examples/simple_trainer_GIFStream.py
+index 8ba9415..b706f12 100644
+--- a/examples/simple_trainer_GIFStream.py
++++ b/examples/simple_trainer_GIFStream.py
+@@ -48,6 +48,7 @@ from gsplat.compression.ap_gifstream import (
+     tensor_mapping_sha256,
+     variant_spec,
+ )
++from gsplat.compression.h007_runtime_provenance import verify_runtime_provenance
+ from gsplat.distributed import cli
+ from gsplat.rendering import rasterization, view_to_visible_anchors
+ from gsplat.strategy import GIFStreamStrategy
+@@ -259,6 +260,10 @@ class Config:
+         "ap-gifstream-full",
+     ] = "official"
+     ap_score_path: Optional[str] = None
++    # External preregistration.  The manifest is intentionally not patched into
++    # this repository, avoiding a code-tree/hash self-reference.
++    ap_provenance_manifest: Optional[str] = None
++    ap_provenance_manifest_sha256: Optional[str] = None
+     ap_protected_fraction: float = 0.05
+     ap_random_seed: int = 11
+     ap_q_ap_multiplier: float = 0.5
+@@ -270,6 +275,7 @@ class Config:
+     # Optional deterministic parent-anchor recolor witness.  The same frozen
+     # canonical-ID artifact is consumed by official and AP variants.
+     ap_edit_ids_path: Optional[str] = None
++    ap_edit_reference_manifest_path: Optional[str] = None
+     ap_edit_strength: float = 0.75
+     ap_warmup_renders: int = 5
+     ap_timed_renders: int = 30
+@@ -467,21 +473,60 @@ def create_splats_with_optimizers(
+     }
+     return splats, decoders, optimizers, decoder_optimizers
+ 
++
++def validate_ap_entry_config(cfg: Config, world_size: int) -> Optional[Dict]:
++    """Fail before dataset/result access for every non-official AP entry."""
++
++    if cfg.ap_variant == "official":
++        if cfg.ap_edit_ids_path is not None:
++            if not cfg.ap_score_path or not cfg.ap_edit_reference_manifest_path:
++                raise ValueError(
++                    "official edit evaluation requires the frozen score and reference manifest"
++                )
++        return None
++    if os.path.basename(os.path.normpath(cfg.data_dir)) != "flame_salmon_1":
++        raise ValueError("U3 AP-GIFStream patch is development-locked to flame_salmon_1")
++    if int(cfg.GOP_size) != 60:
++        raise ValueError("U3 AP-GIFStream requires an exact 60-frame GOP")
++    if int(world_size) != 1:
++        raise ValueError("U3 AP-GIFStream frozen-ID allocation requires world_size=1")
++    if cfg.continue_training:
++        raise ValueError("AP continuation is unsupported and rejected before Runner construction")
++    if not cfg.compression_sim or not cfg.entropy_model_opt:
++        raise ValueError("every AP entry requires compression_sim and entropy_model_opt")
++    if cfg.compression not in (None, "end2end"):
++        raise ValueError("AP entries support only the end2end codec")
++    if not cfg.ap_provenance_manifest or not cfg.ap_provenance_manifest_sha256:
++        raise ValueError("AP entry requires an external preregistered provenance manifest and hash")
++    repo_root = Path(__file__).resolve().parents[1]
++    receipt = verify_runtime_provenance(
++        Path(cfg.ap_provenance_manifest),
++        repo_root,
++        cfg.ap_provenance_manifest_sha256,
++    )
++    if cfg.ap_score_path is not None and not Path(cfg.ap_score_path).is_file():
++        raise ValueError("explicit AP score path does not exist")
++    if cfg.ckpt is None and cfg.ap_score_path is not None:
++        raise ValueError(
++            "fresh AP training must generate its score path at the frozen step"
++        )
++    if cfg.ap_edit_ids_path is not None:
++        if not cfg.ap_score_path or not cfg.ap_edit_reference_manifest_path:
++            raise ValueError("AP edit evaluation requires score and reference-manifest paths")
++        if not Path(cfg.ap_edit_ids_path).is_file() or not Path(
++            cfg.ap_edit_reference_manifest_path
++        ).is_file():
++            raise ValueError("AP edit artifact/reference manifest is unavailable")
++    return receipt
++
++
+ class Runner:
+     """Engine for training and testing."""
+ 
+     def __init__(
+         self, local_rank: int, world_rank, world_size: int, cfg: Config
+     ) -> None:
+-        if cfg.ap_variant != "official":
+-            if os.path.basename(os.path.normpath(cfg.data_dir)) != "flame_salmon_1":
+-                raise ValueError(
+-                    "U3 AP-GIFStream patch is development-locked to flame_salmon_1"
+-                )
+-            if int(cfg.GOP_size) != 60:
+-                raise ValueError("U3 AP-GIFStream requires an exact 60-frame GOP")
+-            if int(world_size) != 1:
+-                raise ValueError("U3 AP-GIFStream frozen-ID allocation requires world_size=1")
++        self.ap_runtime_provenance = validate_ap_entry_config(cfg, world_size)
+         set_random_seed(42 + local_rank)
+ 
+         self.cfg = cfg
+@@ -586,6 +631,10 @@ class Runner:
+                         "q_ap_multiplier": cfg.ap_q_ap_multiplier,
+                         "q_bg_multiplier": cfg.ap_q_bg_multiplier,
+                         "compression_seed": cfg.ap_compression_seed,
++                        "provenance_manifest_path": cfg.ap_provenance_manifest,
++                        "provenance_manifest_sha256": cfg.ap_provenance_manifest_sha256,
++                        "repo_root": str(Path(__file__).resolve().parents[1]),
++                        "runtime_provenance": self.ap_runtime_provenance,
+                     }
+                 )
+             elif cfg.compression == "2dcodec":
+@@ -613,9 +662,7 @@ class Runner:
+             if cfg.entropy_model_opt:
+                 selected_key = min((k for k, v in cfg.entropy_steps.items() if v > 0), key=lambda k: cfg.entropy_steps[k])
+                 self.entropy_min_step = cfg.entropy_steps[selected_key]
+-        if cfg.ap_variant != "official" and cfg.compression is None:
+-            if not cfg.compression_sim or not cfg.entropy_model_opt:
+-                raise ValueError("AP-GIFStream training requires compression_sim and entropy_model_opt")
++        if cfg.ap_variant != "official":
+             last_topology_boundary = max(
+                 int(cfg.strategy.refine_stop_iter), int(2 * cfg.max_steps / 3)
+             )
+@@ -890,6 +937,7 @@ class Runner:
+             "time_feature_scaling": time_feature_scaling,
+             "time_entropy_model_frozen_after_freeze": True,
+             "factor_membership_columns_frozen": [0, 3],
++            "runtime_provenance": dict(self.ap_runtime_provenance),
+         }
+         factor_param = self.splats["factors"]
+         if self._ap_factor_gradient_hook is not None:
+@@ -937,6 +985,15 @@ class Runner:
+             time_entropy_model_sha256=np.asarray(time_entropy_model_sha256),
+             time_feature_scaling=np.asarray(time_feature_scaling, dtype=np.float64),
+             time_entropy_model_frozen_after_freeze=np.asarray(True),
++            runtime_manifest_sha256=np.asarray(
++                self.ap_runtime_provenance["manifest_sha256"]
++            ),
++            normalized_code_tree_sha256=np.asarray(
++                self.ap_runtime_provenance["normalized_code_tree"]["sha256"]
++            ),
++            patch_chain_sha256=np.asarray(
++                self.ap_runtime_provenance["patch_sha256"], dtype=np.str_
++            ),
+             path_definition=np.asarray("sum_consecutive_euclidean_displacement"),
+             motion_definition=np.asarray("mean_distance_from_canonical_anchor"),
+             estimated_byte_definition=np.asarray(
+@@ -962,6 +1019,7 @@ class Runner:
+             "anchor_count": int(ids.shape[0]),
+             "eligible_count": int(eligible.sum().item()),
+             "ap_score_seconds": float(ap_score_seconds),
++            "runtime_provenance": dict(self.ap_runtime_provenance),
+             "outcome_fields_read": [],
+         }
+         with open(os.path.join(freeze_dir, "freeze_audit.json"), "wb") as f:
+@@ -969,6 +1027,11 @@ class Runner:
+         self.ap_state["score_path"] = score_path
+         self.ap_state["score_sha256"] = freeze_audit["score_sha256"]
+         self.ap_state["ap_score_seconds"] = float(ap_score_seconds)
++        # Every training entry creates exactly one frozen score artifact and
++        # immediately wires that exact path into the eventual real codec.
++        self.cfg.ap_score_path = score_path
++        if isinstance(self.compression_method, GIFStreamEnd2endCompression):
++            self.compression_method.ap_config["score_path"] = score_path
+ 
+     def compute_ap_path_loss(self) -> Tensor:
+         if self.ap_state is None:
+@@ -1006,6 +1069,10 @@ class Runner:
+             raise ValueError("unsupported AP training-receipt schema")
+         if state["variant"] != self.cfg.ap_variant or receipt["variant"] != self.cfg.ap_variant:
+             raise ValueError("checkpoint AP variant differs from requested variant")
++        if state.get("runtime_provenance") != self.ap_runtime_provenance or receipt.get(
++            "runtime_provenance"
++        ) != self.ap_runtime_provenance:
++            raise ValueError("checkpoint AP runtime provenance differs from active preregistration")
+         restored = {}
+         for key, value in state.items():
+             restored[key] = value.to(self.device) if isinstance(value, Tensor) else value
+@@ -1058,6 +1125,10 @@ class Runner:
+                 raise ValueError(f"AP receipt {name} mismatch")
+         if receipt.get("score_sha256") != state.get("score_sha256"):
+             raise ValueError("AP state/receipt score hashes disagree")
++        if receipt.get("runtime_provenance") != self.ap_runtime_provenance or state.get(
++            "runtime_provenance"
++        ) != self.ap_runtime_provenance:
++            raise ValueError("AP runtime provenance changed before compression")
+         for name in (
+             "estimator_version",
+             "time_entropy_model_sha256",
+@@ -1163,7 +1234,16 @@ class Runner:
+         if not path.is_file():
+             raise ValueError(f"AP edit-ID artifact does not exist: {path}")
+         with np.load(path, allow_pickle=False) as artifact:
+-            required = {"schema", "scene", "voxel_size", "canonical_ids"}
++            required = {
++                "schema",
++                "scene",
++                "voxel_size",
++                "canonical_ids",
++                "source_score_sha256",
++                "selection",
++                "reference_manifest_sha256",
++                "selected_canonical_ids_sha256",
++            }
+             missing = sorted(required - set(artifact.files))
+             if missing:
+                 raise ValueError(f"AP edit-ID artifact missing members: {missing}")
+@@ -1176,10 +1256,66 @@ class Runner:
+             ):
+                 raise ValueError("AP edit-ID voxel size differs from decoder")
+             edit_ids = np.asarray(artifact["canonical_ids"], dtype=np.int64)
++            source_score_sha256 = str(np.asarray(artifact["source_score_sha256"]).item())
++            selection = str(np.asarray(artifact["selection"]).item())
++            reference_manifest_sha256 = str(
++                np.asarray(artifact["reference_manifest_sha256"]).item()
++            )
++            selected_ids_sha256 = str(
++                np.asarray(artifact["selected_canonical_ids_sha256"]).item()
++            )
+         if edit_ids.ndim != 2 or edit_ids.shape[1] != 3 or edit_ids.shape[0] == 0:
+             raise ValueError("AP edit-ID artifact must contain a nonempty [J,3] array")
+         if np.unique(edit_ids, axis=0).shape[0] != edit_ids.shape[0]:
+             raise ValueError("AP edit-ID artifact contains duplicates")
++        if selection != "top_path_score_intersection_official_and_ap_retained":
++            raise ValueError("AP edit-ID artifact selection rule is not preregistered")
++        actual_ids_sha256 = hashlib.sha256(
++            np.asarray(edit_ids, dtype="<i8").tobytes(order="C")
++        ).hexdigest()
++        if actual_ids_sha256 != selected_ids_sha256:
++            raise ValueError("AP edit-ID artifact selected-ID hash mismatch")
++        score_path = Path(str(self.cfg.ap_score_path or ""))
++        reference_path = Path(str(self.cfg.ap_edit_reference_manifest_path or ""))
++        if not score_path.is_file() or not reference_path.is_file():
++            raise ValueError("AP edit consumer lacks source score/reference manifest")
++        score_payload = score_path.read_bytes()
++        reference_payload = reference_path.read_bytes()
++        if hashlib.sha256(score_payload).hexdigest() != source_score_sha256:
++            raise ValueError("AP edit artifact source-score SHA-256 mismatch")
++        if hashlib.sha256(reference_payload).hexdigest() != reference_manifest_sha256:
++            raise ValueError("AP edit artifact reference-manifest SHA-256 mismatch")
++        reference = json.loads(reference_payload.decode("utf-8"))
++        if reference != {
++            "schema": "h007.ap_edit_reference_manifest.v1",
++            "scene": "flame_salmon_1",
++            "source_score_sha256": source_score_sha256,
++            "selection": selection,
++            "selection_count": int(edit_ids.shape[0]),
++            "selected_canonical_ids_sha256": selected_ids_sha256,
++        }:
++            raise ValueError("AP edit reference manifest content mismatch")
++        with np.load(score_path, allow_pickle=False) as score_artifact:
++            score_ids = np.asarray(score_artifact["canonical_ids"], dtype=np.int64)
++            path_score = np.asarray(score_artifact["path_score"], dtype=np.float64)
++            eligible = np.asarray(score_artifact["eligible"], dtype=np.bool_)
++            official_retain = np.asarray(
++                score_artifact["official_retain_mask"], dtype=np.bool_
++            )
++            ap_retain = np.asarray(score_artifact["ap_retain_mask"], dtype=np.bool_)
++        universe = eligible & official_retain & ap_retain & np.isfinite(path_score)
++        candidates = np.flatnonzero(universe)
++        order = np.lexsort(
++            (
++                score_ids[candidates, 2],
++                score_ids[candidates, 1],
++                score_ids[candidates, 0],
++                -path_score[candidates],
++            )
++        )
++        expected_edit_ids = score_ids[candidates[order[: edit_ids.shape[0]]]]
++        if not np.array_equal(edit_ids, expected_edit_ids):
++            raise ValueError("AP edit IDs differ from source-score deterministic selection")
+ 
+         current_ids = canonical_voxel_ids(anchors, self.cfg.voxel_size)
+         current_map = {
+@@ -1212,6 +1348,12 @@ class Runner:
+             "edit_strength": float(self.cfg.ap_edit_strength),
+             "target_rgb": [1.0, 0.0, 1.0],
+             "alignment": "exact_canonical_voxel_id",
++            "source_score": str(score_path.resolve()),
++            "source_score_sha256": source_score_sha256,
++            "selection": selection,
++            "reference_manifest": str(reference_path.resolve()),
++            "reference_manifest_sha256": reference_manifest_sha256,
++            "selected_canonical_ids_sha256": selected_ids_sha256,
+         }
+         return mask
+ 
+@@ -1906,6 +2048,7 @@ class Runner:
+                             "simulation_mask_rule": "quantized_factor3_gt0_and_factor0_gt0",
+                             "estimated_byte_rule": "exact_frozen_integer_subset_sum",
+                             "path_loss_reference": "current_raw_stop_gradient_with_frozen_action_weights",
++                            "runtime_provenance": dict(self.ap_runtime_provenance),
+                         }
+                         data["ap_training_receipt"] = self.ap_training_receipt
+ 
+@@ -2157,58 +2300,9 @@ class Runner:
+ 
+     @torch.no_grad()
+     def benchmark_warm_render_fps(self) -> Dict[str, Union[int, float]]:
+-        """Benchmark one frozen camera using metadata only, never source pixels."""
+-        camera_index = int(self.cfg.test_set[0]) if self.cfg.test_set else 0
+-        if camera_index < 0 or camera_index >= len(self.parser.camtoworlds):
+-            raise ValueError("warm-render camera index is out of range")
+-        camera_key = int(self.parser.camera_ids[camera_index])
+-        camtoworlds = torch.from_numpy(
+-            np.asarray(self.parser.camtoworlds[camera_index], dtype=np.float32)
+-        ).unsqueeze(0).to(self.device)
+-        Ks = torch.from_numpy(
+-            np.asarray(self.parser.Ks_dict[camera_key], dtype=np.float32)
+-        ).unsqueeze(0).to(self.device)
+-        width, height = self.parser.imsize_dict[camera_key]
+-        camera_ids = torch.tensor([-1], dtype=torch.long, device=self.device)
+-        render_kwargs = {
+-            "camtoworlds": camtoworlds,
+-            "Ks": Ks,
+-            "width": int(width),
+-            "height": int(height),
+-            "sh_degree": None,
+-            "near_plane": self.cfg.near_plane,
+-            "far_plane": self.cfg.far_plane,
+-            "time": 0.0,
+-            "camera_ids": camera_ids,
+-        }
+-        previous_training = self.istraining
+-        self.istraining = False
+-        try:
+-            for _ in range(int(self.cfg.ap_warmup_renders)):
+-                self.rasterize_splats(**render_kwargs)
+-            if torch.cuda.is_available():
+-                torch.cuda.synchronize()
+-            started = time.perf_counter()
+-            for _ in range(int(self.cfg.ap_timed_renders)):
+-                self.rasterize_splats(**render_kwargs)
+-            if torch.cuda.is_available():
+-                torch.cuda.synchronize()
+-            seconds = time.perf_counter() - started
+-        finally:
+-            self.istraining = previous_training
+-        if not math.isfinite(seconds) or seconds <= 0:
+-            raise ValueError("invalid warm-render timing")
+-        return {
+-            "warmup_renders": int(self.cfg.ap_warmup_renders),
+-            "timed_renders": int(self.cfg.ap_timed_renders),
+-            "seconds": float(seconds),
+-            "fps": float(self.cfg.ap_timed_renders / seconds),
+-            "width": int(width),
+-            "height": int(height),
+-            "camera_index": camera_index,
+-            "frame_index": 0,
+-            "source_pixels_read": 0,
+-        }
++        raise RuntimeError(
++            "warm FPS is archive-only and must run in h007_clean_decode_gifstream.py"
++        )
+ 
+     @torch.no_grad()
+     def run_compression(self, step: int):
+@@ -2230,23 +2324,25 @@ class Runner:
+ 
+         self.run_param_distribution_vis(self.splats, save_dir=f"{cfg.result_dir}/visualization/raw")
+ 
+-        patch_sha256 = os.environ.get("H007_AP_GIFSTREAM_PATCH_SHA256")
+-        if cfg.ap_variant != "official" and (
+-            patch_sha256 is None
+-            or len(patch_sha256) != 64
+-            or any(ch not in "0123456789abcdef" for ch in patch_sha256.lower())
+-        ):
+-            raise ValueError(
+-                "AP compression requires H007_AP_GIFSTREAM_PATCH_SHA256 to freeze code provenance"
+-            )
+-        if patch_sha256 is not None:
+-            patch_sha256 = patch_sha256.lower()
++        patch_chain = (
++            list(self.ap_runtime_provenance["patch_sha256"])
++            if self.ap_runtime_provenance is not None
++            else []
++        )
++        if cfg.ap_variant != "official" and len(patch_chain) != 3:
++            raise ValueError("AP compression lacks a verified three-patch runtime chain")
+         decoder_config = {
+-            "schema": "h007.gifstream_decoder_config.v1",
++            "schema": "h007.gifstream_decoder_config.v2",
+             "official_commit": "c98486632e7dafd830740b1a1692bd08c48b96e3",
+-            "patch_sha256": patch_sha256,
+-            "patch1_sha256": "65ecd8f1fe30fac5d5bce3aed295cfe04f0b0582f106efaf37489b005d2e431b",
+-            "patch2_sha256": patch_sha256,
++            "patch_chain_sha256": patch_chain,
++            "runtime_manifest_sha256": self.ap_runtime_provenance["manifest_sha256"]
++            if self.ap_runtime_provenance is not None
++            else None,
++            "normalized_code_tree_sha256": self.ap_runtime_provenance[
++                "normalized_code_tree"
++            ]["sha256"]
++            if self.ap_runtime_provenance is not None
++            else None,
+             "variant": cfg.ap_variant,
+             "data_factor": cfg.data_factor,
+             "start_frame": cfg.start_frame,
+@@ -2266,13 +2362,33 @@ class Runner:
+             "add_color_dist": cfg.add_color_dist,
+             "app_opt": cfg.app_opt,
+             "app_embed_dim": cfg.app_embed_dim,
++            "appearance_embedding_count": int(self.trainset.cameras_length),
++            "packed": bool(cfg.packed),
++            "antialiased": bool(cfg.antialiased),
++            "camera_model": str(cfg.camera_model),
++            "phi": float(cfg.phi),
+             "test_set": cfg.test_set,
+             "remove_set": cfg.remove_set,
+             "compression_seed": cfg.ap_compression_seed,
++            "warm_camera_pose_index": int(cfg.test_set[0]) if cfg.test_set else 0,
++            "warm_frame_index": 0,
++            "warmup_renders": int(cfg.ap_warmup_renders),
++            "timed_renders": int(cfg.ap_timed_renders),
+             "clean_decode_entrypoint": "examples/h007_clean_decode_gifstream.py",
+         }
+         with open(os.path.join(compress_dir, "decoder_config.json"), "wb") as f:
+             f.write(canonical_json_bytes(decoder_config))
++        if self.ap_runtime_provenance is not None:
++            with open(os.path.join(compress_dir, "runtime_provenance.json"), "wb") as f:
++                f.write(canonical_json_bytes(self.ap_runtime_provenance))
++            manifest_payload = Path(str(cfg.ap_provenance_manifest)).read_bytes()
++            if hashlib.sha256(manifest_payload).hexdigest() != self.ap_runtime_provenance[
++                "manifest_sha256"
++            ]:
++                raise ValueError("external preregistration manifest changed before container build")
++            (Path(compress_dir) / "preregistered_patch_chain_manifest.json").write_bytes(
++                manifest_payload
++            )
+ 
+         camera_dir = os.path.join(compress_dir, "camera_metadata")
+         os.makedirs(camera_dir)
+@@ -2355,7 +2471,6 @@ class Runner:
+         # compression simulation here would erase q_ap < 1 precision and no
+         # longer evaluate the decoded container.
+         self.cfg.compression_sim = False
+-        warm_render = self.benchmark_warm_render_fps()
+         runtime = {
+             "schema": "h007.gifstream_runtime.v1",
+             "encode_seconds": encode_seconds,
+@@ -2363,8 +2478,11 @@ class Runner:
+             "peak_decode_cuda_bytes": int(torch.cuda.max_memory_allocated())
+             if torch.cuda.is_available()
+             else None,
+-            "warm_render": warm_render,
+-            "warm_render_fps": warm_render["fps"],
++            "warm_render": {
++                "status": "REQUIRED_IN_CLEAN_PROCESS",
++                "camera_metadata_source": "counted_archive_only",
++            },
++            "warm_render_fps": None,
+             "ap_score_seconds": (
+                 float(self.ap_state["ap_score_seconds"])
+                 if self.ap_state is not None
+@@ -2376,12 +2494,32 @@ class Runner:
+             f.write(canonical_json_bytes(runtime))
+         if self.ap_edit_audit is not None:
+             edit_payload = Path(str(self.cfg.ap_edit_ids_path)).read_bytes()
++            edit_score_payload = Path(str(self.cfg.ap_score_path)).read_bytes()
++            edit_reference_payload = Path(
++                str(self.cfg.ap_edit_reference_manifest_path)
++            ).read_bytes()
+             counted_edit_path = Path(compress_dir) / "ap_edit_ids.npz"
++            counted_score_path = Path(compress_dir) / "ap_edit_source_score.npz"
++            counted_reference_path = (
++                Path(compress_dir) / "ap_edit_reference_manifest.json"
++            )
+             counted_edit_path.write_bytes(edit_payload)
++            counted_score_path.write_bytes(edit_score_payload)
++            counted_reference_path.write_bytes(edit_reference_payload)
+             self.ap_edit_audit["counted_artifact"] = counted_edit_path.name
+             self.ap_edit_audit["counted_artifact_sha256"] = hashlib.sha256(
+                 edit_payload
+             ).hexdigest()
++            self.ap_edit_audit["counted_source_score"] = counted_score_path.name
++            self.ap_edit_audit["counted_source_score_sha256"] = hashlib.sha256(
++                edit_score_payload
++            ).hexdigest()
++            self.ap_edit_audit[
++                "counted_reference_manifest"
++            ] = counted_reference_path.name
++            self.ap_edit_audit[
++                "counted_reference_manifest_sha256"
++            ] = hashlib.sha256(edit_reference_payload).hexdigest()
+             with open(os.path.join(compress_dir, "ap_edit_hook.json"), "wb") as f:
+                 f.write(canonical_json_bytes(self.ap_edit_audit))
+         clean_decode_request = {
+@@ -2389,6 +2527,15 @@ class Runner:
+             "archive_only": True,
+             "entrypoint": "examples/h007_clean_decode_gifstream.py",
+             "expected_output": "decoded_splats.pt",
++            "expected_runtime_output": "counted_camera_render",
++            "external_shared_runtime": {
++                "provenance_manifest_required": cfg.ap_variant != "official",
++                "provenance_manifest_sha256": self.ap_runtime_provenance[
++                    "manifest_sha256"
++                ]
++                if self.ap_runtime_provenance is not None
++                else None,
++            },
+         }
+         with open(os.path.join(compress_dir, "clean_decode_request.json"), "wb") as f:
+             f.write(canonical_json_bytes(clean_decode_request))
+@@ -2539,6 +2686,9 @@ class Runner:
+ 
+ 
+ def main(local_rank: int, world_rank, world_size: int, cfg: Config):
++    # Duplicate the check in Runner deliberately: CLI entry and Runner are both
++    # fail-closed, so alternate callers cannot bypass preregistration.
++    validate_ap_entry_config(cfg, world_size)
+     if world_size > 1 and not cfg.disable_viewer:
+         cfg.disable_viewer = True
+         if world_rank == 0:
+diff --git a/gsplat/compression/ap_gifstream.py b/gsplat/compression/ap_gifstream.py
+index 037af77..682963c 100644
+--- a/gsplat/compression/ap_gifstream.py
++++ b/gsplat/compression/ap_gifstream.py
+@@ -24,7 +24,7 @@ from torch import Tensor
+ 
+ 
+ AP_SCORE_SCHEMA = "h007.ap_scores.v2"
+-AP_META_SCHEMA = "h007.ap_gifstream.codec.v2"
++AP_META_SCHEMA = "h007.ap_gifstream.codec.v3"
+ DETERMINISTIC_ZIP_EPOCH = (1980, 1, 1, 0, 0, 0)
+ 
+ 
+@@ -112,6 +112,7 @@ def load_aligned_score_artifact(
+     voxel_size: float,
+     ranking: str,
+     random_seed: int,
++    expected_runtime_provenance: Mapping[str, Any],
+     expected_variant: Optional[str] = None,
+ ) -> Tuple[Tensor, Tensor, Tensor, Dict[str, Any], Dict[str, Any]]:
+     """Load a frozen reference-only score artifact and align by canonical ID.
+@@ -153,6 +154,9 @@ def load_aligned_score_artifact(
+             "time_entropy_model_sha256",
+             "time_feature_scaling",
+             "time_entropy_model_frozen_after_freeze",
++            "runtime_manifest_sha256",
++            "normalized_code_tree_sha256",
++            "patch_chain_sha256",
+         }
+         missing = sorted(required - members)
+         if missing:
+@@ -220,6 +224,11 @@ def load_aligned_score_artifact(
+         time_entropy_model_frozen = bool(
+             np.asarray(artifact["time_entropy_model_frozen_after_freeze"]).item()
+         )
++        runtime_manifest_sha256 = str(np.asarray(artifact["runtime_manifest_sha256"]).item())
++        normalized_code_tree_sha256 = str(
++            np.asarray(artifact["normalized_code_tree_sha256"]).item()
++        )
++        patch_chain_sha256 = [str(value) for value in np.asarray(artifact["patch_chain_sha256"]).tolist()]
+ 
+     if (
+         eligible_src.shape != (artifact_ids.shape[0],)
+@@ -245,6 +254,17 @@ def load_aligned_score_artifact(
+         raise ValueError("malformed frozen estimated-byte estimator provenance")
+     if not time_entropy_model_frozen:
+         raise ValueError("estimated-byte entropy model was not frozen after allocation")
++    expected_runtime = dict(expected_runtime_provenance)
++    if expected_runtime.get("schema") != "h007.ap_gifstream.runtime_provenance.v1":
++        raise ValueError("score loader lacks verified runtime provenance")
++    if runtime_manifest_sha256 != expected_runtime.get("manifest_sha256"):
++        raise ValueError("score artifact runtime-manifest provenance mismatch")
++    if normalized_code_tree_sha256 != expected_runtime.get(
++        "normalized_code_tree", {}
++    ).get("sha256"):
++        raise ValueError("score artifact normalized code-tree provenance mismatch")
++    if patch_chain_sha256 != list(expected_runtime.get("patch_sha256", [])):
++        raise ValueError("score artifact patch-chain provenance mismatch")
+     source_index = _rows_to_index(artifact_ids)
+     aligned_indices = []
+     for row in current_ids.tolist():
+@@ -285,6 +305,9 @@ def load_aligned_score_artifact(
+         "time_entropy_model_sha256": time_entropy_model_sha256,
+         "time_feature_scaling": time_feature_scaling,
+         "time_entropy_model_frozen_after_freeze": time_entropy_model_frozen,
++        "runtime_manifest_sha256": runtime_manifest_sha256,
++        "normalized_code_tree_sha256": normalized_code_tree_sha256,
++        "patch_chain_sha256": patch_chain_sha256,
+         "anchor_count": int(current_ids.shape[0]),
+         "eligible_count": int(eligible.sum()),
+     }
+@@ -671,6 +694,170 @@ def read_ap_mask(compress_dir: str, meta: Mapping[str, Any], device: torch.devic
+     return mask
+ 
+ 
++def write_numpy_sidecar(path: str, array: np.ndarray) -> Dict[str, Any]:
++    """Write a non-pickle NumPy sidecar with strict shape/dtype provenance."""
++
++    value = np.asarray(array)
++    if value.dtype == np.dtype("O"):
++        raise ValueError("object arrays are forbidden in counted sidecars")
++    np.save(path, value, allow_pickle=False)
++    payload = Path(path).read_bytes()
++    return {
++        "path": os.path.basename(path),
++        "shape": list(value.shape),
++        "dtype": value.dtype.str,
++        "bytes": len(payload),
++        "sha256": hashlib.sha256(payload).hexdigest(),
++    }
++
++
++def read_numpy_sidecar(compress_dir: str, meta: Mapping[str, Any]) -> np.ndarray:
++    path = os.path.join(compress_dir, str(meta["path"]))
++    payload = Path(path).read_bytes()
++    if len(payload) != int(meta["bytes"]):
++        raise ValueError(f"counted NumPy sidecar byte mismatch: {meta['path']}")
++    if hashlib.sha256(payload).hexdigest() != str(meta["sha256"]):
++        raise ValueError(f"counted NumPy sidecar hash mismatch: {meta['path']}")
++    array = np.load(path, allow_pickle=False)
++    if list(array.shape) != list(meta["shape"]) or array.dtype.str != str(meta["dtype"]):
++        raise ValueError(f"counted NumPy sidecar shape/dtype mismatch: {meta['path']}")
++    return array
++
++
++def recompute_sorted_codec_invariants(
++    *,
++    official_retain_mask: Tensor,
++    official_active_mask: Tensor,
++    ap_retain_mask: Tensor,
++    expected_ap_active_mask: Tensor,
++    expected_ap_class_mask: Tensor,
++    source_estimated_bytes: Tensor,
++    pre_sort_retained_ids: Tensor,
++    pre_sort_estimated_bytes: Tensor,
++    sort_indices: Tensor,
++    encoded_ids: Tensor,
++    encoded_estimated_bytes: Tensor,
++    encoded_factors: Tensor,
++    real_mask: Tensor,
++    padding_mask: Tensor,
++    ap_class_mask: Tensor,
++) -> Dict[str, Any]:
++    """Recompute codec allocation after retention, padding and PLAS ordering."""
++
++    encoded_count = int(encoded_ids.shape[0])
++    one_dimensional = {
++        "encoded_estimated_bytes": encoded_estimated_bytes,
++        "real_mask": real_mask,
++        "padding_mask": padding_mask,
++        "ap_class_mask": ap_class_mask,
++        "sort_indices": sort_indices,
++    }
++    for name, value in one_dimensional.items():
++        if value.shape != (encoded_count,):
++            raise ValueError(f"post-PLAS {name} has an invalid shape")
++    if encoded_ids.shape != (encoded_count, 3) or encoded_factors.shape != (
++        encoded_count,
++        4,
++    ):
++        raise ValueError("post-PLAS ID/factor shapes are malformed")
++    if not torch.equal(real_mask, ~padding_mask):
++        raise ValueError("explicit real/padding masks are not complements")
++    if int(real_mask.sum().item()) != int(ap_retain_mask.sum().item()):
++        raise ValueError("real-row count differs from frozen retained-anchor count")
++    expected_permutation = torch.arange(encoded_count, device=sort_indices.device)
++    if not torch.equal(torch.sort(sort_indices.to(torch.long)).values, expected_permutation):
++        raise ValueError("PLAS permutation is not a complete encoded-row permutation")
++
++    pad = encoded_count - int(pre_sort_retained_ids.shape[0])
++    if pad < 0 or pre_sort_estimated_bytes.shape != (pre_sort_retained_ids.shape[0],):
++        raise ValueError("pre-sort retained ID/estimated-byte shapes disagree")
++    sentinel = torch.zeros((pad, 3), dtype=torch.int64, device=encoded_ids.device)
++    if pad:
++        sentinel[:, 0] = torch.arange(pad, device=encoded_ids.device, dtype=torch.int64)
++        sentinel[:, 0] += torch.iinfo(torch.int64).min
++    expected_pre_sort_ids = torch.cat([pre_sort_retained_ids, sentinel], dim=0)
++    expected_pre_sort_bytes = torch.cat(
++        [
++            pre_sort_estimated_bytes,
++            torch.zeros(pad, dtype=torch.int64, device=encoded_estimated_bytes.device),
++        ],
++        dim=0,
++    )
++    if not torch.equal(encoded_ids, expected_pre_sort_ids[sort_indices]):
++        raise ValueError("canonical IDs were not transformed by the counted PLAS permutation")
++    if not torch.equal(
++        encoded_estimated_bytes, expected_pre_sort_bytes[sort_indices]
++    ):
++        raise ValueError("estimated-byte rows were not transformed by the counted PLAS permutation")
++    expected_real = torch.arange(encoded_count, device=real_mask.device) < int(
++        pre_sort_retained_ids.shape[0]
++    )
++    if not torch.equal(real_mask, expected_real[sort_indices]):
++        raise ValueError("explicit real/padding mask was not transformed by PLAS")
++    factor_whole = encoded_factors[:, 3] > 0
++    factor_active = real_mask & (encoded_factors[:, 0] > 0)
++    if not torch.equal(factor_whole, real_mask):
++        raise ValueError("post-PLAS factor-3 whole mask differs from explicit real mask")
++    if torch.any(ap_class_mask & ~real_mask):
++        raise ValueError("post-PLAS AP class marks padding rows")
++
++    whole_promoted = ap_retain_mask & ~official_retain_mask
++    whole_demoted = official_retain_mask & ~ap_retain_mask
++    if int(whole_promoted.sum().item()) != int(whole_demoted.sum().item()):
++        raise ValueError("whole-anchor count swap is not balanced")
++    source_shape = official_retain_mask.shape
++    if any(
++        value.shape != source_shape
++        for value in (
++            official_active_mask,
++            ap_retain_mask,
++            expected_ap_active_mask,
++            expected_ap_class_mask,
++            source_estimated_bytes,
++        )
++    ):
++        raise ValueError("score-derived whole/active masks disagree in shape")
++    if torch.any(official_active_mask & ~official_retain_mask):
++        raise ValueError("score-derived official active mask escapes retention")
++    expected_pre_sort_active = expected_ap_active_mask[ap_retain_mask]
++    expected_pre_sort_class = expected_ap_class_mask[ap_retain_mask]
++    expected_encoded_active = torch.cat(
++        [
++            expected_pre_sort_active,
++            torch.zeros(pad, dtype=torch.bool, device=real_mask.device),
++        ],
++        dim=0,
++    )[sort_indices]
++    expected_encoded_class = torch.cat(
++        [
++            expected_pre_sort_class,
++            torch.zeros(pad, dtype=torch.bool, device=real_mask.device),
++        ],
++        dim=0,
++    )[sort_indices]
++    if not torch.equal(factor_active, expected_encoded_active):
++        raise ValueError("factor-derived active mask differs from score/PLAS/padding recomputation")
++    if not torch.equal(ap_class_mask, expected_encoded_class):
++        raise ValueError("AP class mask differs from score/PLAS/padding recomputation")
++    official_mass = int(source_estimated_bytes[official_active_mask].sum().item())
++    ap_mass = int(encoded_estimated_bytes[factor_active].sum().item())
++    if official_mass != ap_mass:
++        raise ValueError("post-PLAS AP estimated mass differs from score-derived official mass")
++    return {
++        "encoded_row_count": encoded_count,
++        "real_row_count": int(real_mask.sum().item()),
++        "padding_row_count": int(padding_mask.sum().item()),
++        "active_row_count": int(factor_active.sum().item()),
++        "ap_class_real_count": int((ap_class_mask & real_mask).sum().item()),
++        "whole_promoted_count": int(whole_promoted.sum().item()),
++        "whole_demoted_count": int(whole_demoted.sum().item()),
++        "official_estimated_time_bytes": official_mass,
++        "ap_estimated_time_bytes": ap_mass,
++        "plas_permutation_complete": True,
++        "id_order_definition": "decoded_rows_equal_encoded_canonical_ids_at_real_mask",
++    }
++
++
+ def file_byte_census(root: str) -> Dict[str, Any]:
+     root_path = Path(root)
+     files = []
+diff --git a/gsplat/compression/gifstream_end2end_compression.py b/gsplat/compression/gifstream_end2end_compression.py
+index 2a7ae25..b1a1a6d 100644
+--- a/gsplat/compression/gifstream_end2end_compression.py
++++ b/gsplat/compression/gifstream_end2end_compression.py
+@@ -19,11 +19,15 @@ from gsplat.compression.ap_gifstream import (
+     canonical_voxel_ids,
+     load_aligned_score_artifact,
+     read_ap_mask,
++    read_numpy_sidecar,
++    recompute_sorted_codec_invariants,
+     tensor_mapping_sha256,
+     variant_metadata,
+     variant_spec,
+     write_ap_mask,
++    write_numpy_sidecar,
+ )
++from gsplat.compression.h007_runtime_provenance import verify_runtime_provenance
+ from gsplat.utils import inverse_log_transform, log_transform
+ import math
+ 
+@@ -135,6 +139,23 @@ class GIFStreamEnd2endCompression:
+         ap_variant = str(ap_cfg.get("variant", "official"))
+         ap_spec = variant_spec(ap_variant)
+         ap_enabled = ap_variant != "official"
++        runtime_provenance = None
++        if ap_enabled:
++            provenance_required = {
++                "provenance_manifest_path",
++                "provenance_manifest_sha256",
++                "repo_root",
++                "runtime_provenance",
++            }
++            missing = sorted(provenance_required - set(ap_cfg))
++            if missing:
++                raise ValueError(f"AP codec lacks runtime provenance fields: {missing}")
++            runtime_provenance = verify_runtime_provenance(
++                Path(str(ap_cfg["provenance_manifest_path"])),
++                Path(str(ap_cfg["repo_root"])),
++                str(ap_cfg["provenance_manifest_sha256"]),
++                expected_container_receipt=ap_cfg["runtime_provenance"],
++            )
+         if raw_time_features is not None:
+             if raw_time_features.shape != splats["time_features"].shape:
+                 raise ValueError("raw_time_features shape mismatch")
+@@ -159,6 +180,7 @@ class GIFStreamEnd2endCompression:
+                 voxel_size,
+                 ap_spec.ranking,
+                 int(ap_cfg.get("random_seed", 11)),
++                runtime_provenance,
+                 expected_variant=ap_variant,
+             )
+             for config_name, frozen_name, default in (
+@@ -178,6 +200,8 @@ class GIFStreamEnd2endCompression:
+             ):
+                 raise ValueError("codec temporal scaling differs from frozen byte estimator")
+ 
++        source_estimated_bytes = estimated_bytes
++
+         # Param-specific preprocessing
+         # splats["anchors"] = log_transform(splats["anchors"])
+         splats["quats"] = F.normalize(splats["quats"], dim=-1)
+@@ -234,6 +258,12 @@ class GIFStreamEnd2endCompression:
+             eligible = eligible[pruning_mask]
+             estimated_bytes = estimated_bytes[pruning_mask]
+             canonical_ids = canonical_ids[pruning_mask]
++            pre_sort_retained_ids = canonical_ids.clone()
++            pre_sort_estimated_bytes = estimated_bytes.clone()
++            real_mask = torch.ones(
++                canonical_ids.shape[0], dtype=torch.bool, device=canonical_ids.device
++            )
++            padding_mask = ~real_mask
+ 
+         n_gs = len(splats["anchors"])
+         n_sidelen = math.ceil(n_gs**0.5)
+@@ -264,6 +294,10 @@ class GIFStreamEnd2endCompression:
+                 sentinel[:, 0] = torch.arange(pad, device=canonical_ids.device, dtype=torch.int64)
+                 sentinel[:, 0] += torch.iinfo(torch.int64).min
+                 canonical_ids = torch.cat([canonical_ids, sentinel], dim=0)
++                real_mask = torch.cat(
++                    [real_mask, torch.zeros(pad, dtype=torch.bool, device=real_mask.device)]
++                )
++                padding_mask = ~real_mask
+             print(
+                 f"Warning: Number of Gaussians was not square. Removed {n_crop} Gaussians."
+             )
+@@ -279,7 +313,10 @@ class GIFStreamEnd2endCompression:
+                 ap_class = ap_class[sort_indices]
+                 score = score[sort_indices]
+                 eligible = eligible[sort_indices]
++                estimated_bytes = estimated_bytes[sort_indices]
+                 canonical_ids = canonical_ids[sort_indices]
++                real_mask = real_mask[sort_indices]
++                padding_mask = padding_mask[sort_indices]
+             else:
+                 splats = sort_anchors(splats)
+                 sort_indices = None
+@@ -289,6 +326,25 @@ class GIFStreamEnd2endCompression:
+         if ap_enabled:
+             if not torch.equal(splats["factors"][:, 0] > 0, ap_active):
+                 raise AssertionError("sorted factor activation disagrees with frozen AP allocation")
++            allocation_audit.update(
++                recompute_sorted_codec_invariants(
++                    official_retain_mask=frozen_allocation["official_retain_mask"],
++                    official_active_mask=frozen_allocation["official_active_mask"],
++                    ap_retain_mask=frozen_allocation["ap_retain_mask"],
++                    expected_ap_active_mask=frozen_allocation["ap_active_mask"],
++                    expected_ap_class_mask=frozen_allocation["ap_class_mask"],
++                    source_estimated_bytes=source_estimated_bytes,
++                    pre_sort_retained_ids=pre_sort_retained_ids,
++                    pre_sort_estimated_bytes=pre_sort_estimated_bytes,
++                    sort_indices=sort_indices,
++                    encoded_ids=canonical_ids,
++                    encoded_estimated_bytes=estimated_bytes,
++                    encoded_factors=splats["factors"],
++                    real_mask=real_mask,
++                    padding_mask=padding_mask,
++                    ap_class_mask=ap_class,
++                )
++            )
+ 
+         choose_idx = splats["factors"][:,0] > 0
+         splats["time_features"] = splats["time_features"][choose_idx]
+@@ -325,41 +381,59 @@ class GIFStreamEnd2endCompression:
+ 
+         if ap_enabled:
+             mask_meta = write_ap_mask(os.path.join(compress_dir, "ap_class_mask.bin"), ap_class)
++            real_mask_meta = write_ap_mask(
++                os.path.join(compress_dir, "ap_real_row_mask.bin"), real_mask
++            )
++            padding_mask_meta = write_ap_mask(
++                os.path.join(compress_dir, "ap_padding_row_mask.bin"), padding_mask
++            )
++            active_mask_meta = write_ap_mask(
++                os.path.join(compress_dir, "ap_active_row_mask.bin"),
++                real_mask & (splats["factors"][:, 0] > 0),
++            )
+             score_copy_path = os.path.join(compress_dir, "ap_score_artifact.npz")
+             score_copy_payload = Path(str(ap_cfg["score_path"])).read_bytes()
+             Path(score_copy_path).write_bytes(score_copy_payload)
+             permutation_path = os.path.join(compress_dir, "ap_plas_permutation.npy")
+-            np.save(permutation_path, sort_indices.detach().cpu().numpy().astype(np.int64, copy=False))
+-            permutation_payload = Path(permutation_path).read_bytes()
++            permutation_meta = write_numpy_sidecar(
++                permutation_path,
++                sort_indices.detach().cpu().numpy().astype(np.int64, copy=False),
++            )
+             ids_path = os.path.join(compress_dir, "ap_canonical_ids.npy")
+-            np.save(ids_path, canonical_ids.detach().cpu().numpy().astype(np.int64, copy=False))
+-            ids_payload = Path(ids_path).read_bytes()
++            ids_meta = write_numpy_sidecar(
++                ids_path,
++                canonical_ids.detach().cpu().numpy().astype(np.int64, copy=False),
++            )
++            retained_ids_path = os.path.join(compress_dir, "ap_retained_canonical_ids.npy")
++            retained_ids_meta = write_numpy_sidecar(
++                retained_ids_path,
++                canonical_ids[real_mask]
++                .detach()
++                .cpu()
++                .numpy()
++                .astype(np.int64, copy=False),
++            )
+             meta["__ap__"] = {
+                 "schema": AP_META_SCHEMA,
+                 "variant": variant_metadata(ap_variant),
+                 "score": score_audit,
+                 "allocation": allocation_audit,
++                "runtime_provenance": runtime_provenance,
+                 "compression_seed": int(compression_seed),
+                 "q_ap_multiplier": float(ap_cfg.get("q_ap_multiplier", 0.5)),
+                 "q_bg_multiplier": float(ap_cfg.get("q_bg_multiplier", 1.25)),
+                 "mask": mask_meta,
++                "real_row_mask": real_mask_meta,
++                "padding_row_mask": padding_mask_meta,
++                "active_row_mask": active_mask_meta,
+                 "score_copy": {
+                     "path": os.path.basename(score_copy_path),
+                     "bytes": len(score_copy_payload),
+                     "sha256": hashlib.sha256(score_copy_payload).hexdigest(),
+                 },
+-                "plas_permutation": {
+-                    "path": os.path.basename(permutation_path),
+-                    "count": int(sort_indices.numel()),
+-                    "bytes": len(permutation_payload),
+-                    "sha256": hashlib.sha256(permutation_payload).hexdigest(),
+-                },
+-                "canonical_ids": {
+-                    "path": os.path.basename(ids_path),
+-                    "count": int(canonical_ids.shape[0]),
+-                    "bytes": len(ids_payload),
+-                    "sha256": hashlib.sha256(ids_payload).hexdigest(),
+-                },
++                "plas_permutation": permutation_meta,
++                "canonical_ids": ids_meta,
++                "retained_canonical_ids": retained_ids_meta,
+             }
+ 
+         with open(os.path.join(compress_dir, "meta.json"), "w") as f:
+@@ -383,7 +457,23 @@ class GIFStreamEnd2endCompression:
+         ap_meta = meta.get("__ap__")
+         if ap_meta is not None and ap_meta.get("schema") != AP_META_SCHEMA:
+             raise ValueError("unsupported AP-GIFStream metadata schema")
++        ap_sidecars = ap_masks = None
+         if ap_meta is not None:
++            ap_cfg = dict(self.ap_config or {})
++            provenance_required = {
++                "provenance_manifest_path",
++                "provenance_manifest_sha256",
++                "repo_root",
++            }
++            missing = sorted(provenance_required - set(ap_cfg))
++            if missing:
++                raise ValueError(f"AP decoder lacks runtime provenance fields: {missing}")
++            verify_runtime_provenance(
++                Path(str(ap_cfg["provenance_manifest_path"])),
++                Path(str(ap_cfg["repo_root"])),
++                str(ap_cfg["provenance_manifest_sha256"]),
++                expected_container_receipt=ap_meta["runtime_provenance"],
++            )
+             score_copy_meta = ap_meta["score_copy"]
+             score_copy_path = os.path.join(compress_dir, score_copy_meta["path"])
+             score_copy_payload = Path(score_copy_path).read_bytes()
+@@ -393,25 +483,38 @@ class GIFStreamEnd2endCompression:
+                 raise ValueError("counted AP score artifact SHA-256 mismatch")
+             if score_copy_meta["sha256"] != ap_meta["score"]["score_artifact_sha256"]:
+                 raise ValueError("counted AP score artifact differs from codec allocation source")
+-            for sidecar_name in ("plas_permutation", "canonical_ids"):
+-                sidecar_meta = ap_meta[sidecar_name]
+-                sidecar_path = os.path.join(compress_dir, sidecar_meta["path"])
+-                payload = Path(sidecar_path).read_bytes()
+-                if len(payload) != int(sidecar_meta["bytes"]):
+-                    raise ValueError(f"{sidecar_name} byte count mismatch")
+-                if hashlib.sha256(payload).hexdigest() != sidecar_meta["sha256"]:
+-                    raise ValueError(f"{sidecar_name} SHA-256 mismatch")
+-                array = np.load(sidecar_path, allow_pickle=False)
+-                if array.shape[0] != int(sidecar_meta["count"]):
+-                    raise ValueError(f"{sidecar_name} count mismatch")
+-                if sidecar_name == "plas_permutation":
+-                    expected = np.arange(array.shape[0], dtype=np.int64)
+-                    if array.dtype != np.int64 or not np.array_equal(np.sort(array), expected):
+-                        raise ValueError("recorded PLAS permutation is invalid")
+-                elif array.shape != (int(sidecar_meta["count"]), 3) or np.unique(
+-                    array, axis=0
+-                ).shape[0] != array.shape[0]:
+-                    raise ValueError("recorded canonical IDs are malformed or duplicated")
++            ap_sidecars = {
++                name: read_numpy_sidecar(compress_dir, ap_meta[name])
++                for name in (
++                    "plas_permutation",
++                    "canonical_ids",
++                    "retained_canonical_ids",
++                )
++            }
++            permutation = ap_sidecars["plas_permutation"]
++            encoded_ids = ap_sidecars["canonical_ids"]
++            retained_ids = ap_sidecars["retained_canonical_ids"]
++            expected = np.arange(permutation.shape[0], dtype=np.int64)
++            if permutation.dtype != np.int64 or not np.array_equal(
++                np.sort(permutation), expected
++            ):
++                raise ValueError("recorded PLAS permutation is invalid")
++            for label, array in (("encoded", encoded_ids), ("retained", retained_ids)):
++                if array.dtype != np.int64 or array.ndim != 2 or array.shape[1] != 3:
++                    raise ValueError(f"recorded {label} canonical IDs are malformed")
++                if np.unique(array, axis=0).shape[0] != array.shape[0]:
++                    raise ValueError(f"recorded {label} canonical IDs are duplicated")
++            if encoded_ids.shape[0] != permutation.shape[0]:
++                raise ValueError("encoded canonical IDs/PLAS permutation counts disagree")
++            ap_masks = {
++                name: read_ap_mask(compress_dir, ap_meta[name], device=device)
++                for name in (
++                    "mask",
++                    "real_row_mask",
++                    "padding_row_mask",
++                    "active_row_mask",
++                )
++            }
+ 
+         splats = {}
+         decompress_fn = self._get_decompress_fn("anchor_features")
+@@ -429,6 +532,21 @@ class GIFStreamEnd2endCompression:
+                 entropy_model=entropy_models["factors"],
+                 device=device,
+             )
++        if ap_meta is not None:
++            encoded_count = int(splats["factors"].shape[0])
++            if any(mask.shape != (encoded_count,) for mask in ap_masks.values()):
++                raise ValueError("counted AP masks do not match encoded factor rows")
++            if not torch.equal(ap_masks["real_row_mask"], ~ap_masks["padding_row_mask"]):
++                raise ValueError("counted real/padding row masks are not complements")
++            if not torch.equal(
++                splats["factors"][:, 3] > 0, ap_masks["real_row_mask"]
++            ):
++                raise ValueError("decoded factor-3 whole mask differs from counted real rows")
++            factor_active = ap_masks["real_row_mask"] & (splats["factors"][:, 0] > 0)
++            if not torch.equal(factor_active, ap_masks["active_row_mask"]):
++                raise ValueError("decoded factor active mask differs from counted active rows")
++            if torch.any(ap_masks["mask"] & ~ap_masks["real_row_mask"]):
++                raise ValueError("decoded AP class includes padding rows")
+         for param_name, param_meta in meta.items():
+             if param_name in {"anchor_features", "factors", "__ap__"}: continue
+             decompress_fn = self._get_decompress_fn(param_name)
+@@ -440,8 +558,7 @@ class GIFStreamEnd2endCompression:
+             if param_name == "time_features" and param_meta.get("ap_two_class", False):
+                 if ap_meta is None:
+                     raise ValueError("two-class temporal stream is missing AP metadata")
+-                full_class_mask = read_ap_mask(compress_dir, ap_meta["mask"], device=device)
+-                active_class_mask = full_class_mask[splats["factors"][:, 0] > 0]
++                active_class_mask = ap_masks["mask"][ap_masks["active_row_mask"]]
+                 splats[param_name] = _decompress_ap_time_features_ar(
+                     compress_dir,
+                     param_name,
+@@ -456,16 +573,33 @@ class GIFStreamEnd2endCompression:
+         # splats["anchors"] = inverse_log_transform(splats["anchors"])
+         #* re-voxelize
+         mask = (splats["quats"].any(dim=1) != 0)
++        if ap_meta is not None and not torch.equal(mask, ap_masks["real_row_mask"]):
++            raise ValueError("decoded quaternion real rows differ from explicit real/padding masks")
+         for k,v in splats.items():
+             if k != "time_features":
+                 splats[k] = v[mask]
+         voxel_size = meta["anchors"]["voxel_size"]
+         splats["anchors"] = torch.round(splats["anchors"]/voxel_size)*voxel_size
+ 
+-        canonical_voxel_ids(splats["anchors"], voxel_size)
++        decoded_ids = canonical_voxel_ids(splats["anchors"], voxel_size)
++        if ap_meta is not None:
++            retained_ids = torch.from_numpy(
++                ap_sidecars["retained_canonical_ids"].copy()
++            ).to(device=device, dtype=torch.int64)
++            encoded_ids = torch.from_numpy(ap_sidecars["canonical_ids"].copy()).to(
++                device=device, dtype=torch.int64
++            )
++            if not torch.equal(encoded_ids[ap_masks["real_row_mask"]], retained_ids):
++                raise ValueError("counted encoded/retained canonical-ID order disagrees")
++            if not torch.equal(decoded_ids, retained_ids):
++                raise ValueError("decoded retained canonical ID set/count/order mismatch")
+ 
+         #* recover time features
+         choose_idx = splats["factors"][:,0] > 0
++        if ap_meta is not None and int(choose_idx.sum().item()) != int(
++            ap_masks["active_row_mask"].sum().item()
++        ):
++            raise ValueError("decoded active-row count changed after padding removal")
+         time_features = torch.zeros((len(splats["anchors"]),meta["time_features"]["shape"][1], meta["time_features"]["shape"][2]),device=device)
+         time_features[choose_idx] = splats["time_features"]
+         splats["time_features"] = time_features
+diff --git a/gsplat/compression/h007_clean_runtime.py b/gsplat/compression/h007_clean_runtime.py
+new file mode 100644
+index 0000000..d072aba
+--- /dev/null
++++ b/gsplat/compression/h007_clean_runtime.py
+@@ -0,0 +1,480 @@
++"""Counted-model construction and camera-metadata render smoke for H007."""
++
++from __future__ import annotations
++
++import math
++import time
++from typing import Any, Dict, Mapping, Optional, Tuple
++
++import numpy as np
++import torch
++from sklearn.neighbors import KDTree
++from torch import Tensor
++
++from gsplat.compression_simulation.ops import fake_quantize_factors
++from gsplat.rendering import rasterization, view_to_visible_anchors
++
++
++DECODER_NAMES = ("mlp_opacity", "mlp_cov", "mlp_color", "mlp_motion")
++
++
++class CountedCameraEmbedding(torch.nn.Module):
++    def __init__(self, count: int, embed_dim: int) -> None:
++        super().__init__()
++        if count <= 0 or embed_dim <= 0:
++            raise ValueError("appearance embedding count/dimension must be positive")
++        self.embed_dim = int(embed_dim)
++        self.embeds = torch.nn.Embedding(int(count), int(embed_dim))
++
++    def forward(self, ids: Tensor) -> Tensor:
++        if ids.ndim != 1:
++            raise ValueError("appearance camera IDs must be one-dimensional")
++        if torch.any(ids < 0):
++            if not torch.all(ids < 0):
++                raise ValueError("mixed negative/nonnegative appearance IDs are forbidden")
++            return torch.zeros((ids.shape[0], self.embed_dim), device=ids.device)
++        return self.embeds(ids)
++
++
++def build_decoder_modules(config: Mapping[str, Any], device: torch.device) -> torch.nn.ModuleDict:
++    feature_dim = int(config["anchor_feature_dim"])
++    c_perframe = int(config["c_perframe"])
++    n_offsets = int(config["n_offsets"])
++    time_dim = int(config["time_dim"])
++    view_dim = 3 if bool(config["view_adaptive"]) else 0
++    app_dim = int(config["app_embed_dim"]) if bool(config["app_opt"]) else 0
++    opacity_dist_dim = 1 if bool(config["add_opacity_dist"]) else 0
++    cov_dist_dim = 1 if bool(config["add_cov_dist"]) else 0
++    color_dist_dim = 1 if bool(config["add_color_dist"]) else 0
++    if feature_dim <= 0 or c_perframe <= 0 or n_offsets <= 0 or time_dim <= 0:
++        raise ValueError("decoder dimensions must be positive")
++    if time_dim % 2:
++        raise ValueError("time positional-embedding dimension must be even")
++
++    modules = torch.nn.ModuleDict(
++        {
++            "mlp_opacity": torch.nn.Sequential(
++                torch.nn.Linear(
++                    feature_dim + view_dim + opacity_dist_dim + c_perframe,
++                    feature_dim,
++                ),
++                torch.nn.ReLU(True),
++                torch.nn.Linear(feature_dim, n_offsets),
++                torch.nn.Tanh(),
++            ),
++            "mlp_cov": torch.nn.Sequential(
++                torch.nn.Linear(
++                    feature_dim + view_dim + cov_dist_dim + c_perframe,
++                    feature_dim,
++                ),
++                torch.nn.ReLU(True),
++                torch.nn.Linear(feature_dim, 7 * n_offsets),
++            ),
++            "mlp_color": torch.nn.Sequential(
++                torch.nn.Linear(
++                    feature_dim + view_dim + color_dist_dim + app_dim + c_perframe,
++                    feature_dim,
++                ),
++                torch.nn.ReLU(True),
++                torch.nn.Linear(feature_dim, 3 * n_offsets),
++                torch.nn.Sigmoid(),
++            ),
++            "mlp_motion": torch.nn.Sequential(
++                torch.nn.Linear(feature_dim + time_dim + c_perframe, feature_dim),
++                torch.nn.ReLU(True),
++                torch.nn.Linear(feature_dim, 7),
++            ),
++        }
++    ).to(device)
++    return modules
++
++
++def _validate_finite_state(state: Mapping[str, Any], label: str) -> None:
++    if not isinstance(state, Mapping) or not state:
++        raise ValueError(f"{label} state is empty or malformed")
++    for name, value in state.items():
++        if not isinstance(value, Tensor):
++            raise ValueError(f"{label} state contains non-tensor member: {name}")
++        if not torch.isfinite(value).all():
++            raise ValueError(f"{label} state contains nonfinite tensor: {name}")
++
++
++def instantiate_counted_models(
++    nets: Mapping[str, Any], config: Mapping[str, Any], device: torch.device
++) -> Tuple[torch.nn.ModuleDict, Optional[CountedCameraEmbedding], Dict[str, Any]]:
++    required = {"decoders", "scaling"}
++    missing = sorted(required - set(nets))
++    if missing:
++        raise ValueError(f"counted nets.pt missing members: {missing}")
++    scaling = nets["scaling"]
++    expected_scaling = {
++        "anchors",
++        "quats",
++        "scales",
++        "opacities",
++        "anchor_features",
++        "offsets",
++        "factors",
++        "time_features",
++    }
++    if not isinstance(scaling, Mapping) or set(scaling) != expected_scaling:
++        raise ValueError("counted scaling keys are incomplete or unexpected")
++    for name, value in scaling.items():
++        if value is not None and (not math.isfinite(float(value)) or float(value) <= 0):
++            raise ValueError(f"counted scaling is invalid: {name}")
++    _validate_finite_state(nets["decoders"], "decoder")
++    decoders = build_decoder_modules(config, device)
++    decoders.load_state_dict(nets["decoders"], strict=True)
++    decoders.eval()
++
++    app_module: Optional[CountedCameraEmbedding] = None
++    if bool(config["app_opt"]):
++        if "app_module" not in nets:
++            raise ValueError("app_opt container is missing counted appearance state")
++        _validate_finite_state(nets["app_module"], "appearance")
++        app_module = CountedCameraEmbedding(
++            int(config["appearance_embedding_count"]), int(config["app_embed_dim"])
++        ).to(device)
++        app_module.load_state_dict(nets["app_module"], strict=True)
++        app_module.eval()
++    elif "app_module" in nets:
++        raise ValueError("non-app_opt container unexpectedly contains appearance state")
++
++    for name, module in decoders.items():
++        for parameter in module.parameters():
++            if not torch.isfinite(parameter).all():
++                raise ValueError(f"strict-loaded decoder is nonfinite: {name}")
++    return decoders, app_module, {
++        "decoder_names": list(decoders.keys()),
++        "decoder_parameter_count": int(
++            sum(parameter.numel() for parameter in decoders.parameters())
++        ),
++        "app_module_loaded": app_module is not None,
++        "app_parameter_count": int(
++            sum(parameter.numel() for parameter in app_module.parameters())
++        )
++        if app_module is not None
++        else 0,
++        "strict_load": True,
++    }
++
++
++def _knn_indices(anchors: Tensor, count: int) -> Tensor:
++    if count <= 0 or anchors.shape[0] <= count:
++        raise ValueError("counted KNN request exceeds decoded anchor population")
++    points = anchors.detach().cpu().numpy().astype(np.float64, copy=False)
++    _, indices = KDTree(points).query(points, k=count + 1)
++    return torch.from_numpy(indices[:, 1:].astype(np.int64, copy=False)).to(anchors.device)
++
++
++def _quaternion_to_rotation_matrix(quaternion: Tensor) -> Tensor:
++    quaternion = torch.nn.functional.normalize(quaternion, dim=-1)
++    w, x, y, z = quaternion.unbind(dim=-1)
++    return torch.stack(
++        [
++            1 - 2 * (y * y + z * z),
++            2 * (x * y - z * w),
++            2 * (x * z + y * w),
++            2 * (x * y + z * w),
++            1 - 2 * (x * x + z * z),
++            2 * (y * z - x * w),
++            2 * (x * z - y * w),
++            2 * (y * z + x * w),
++            1 - 2 * (x * x + y * y),
++        ],
++        dim=-1,
++    ).view(-1, 3, 3)
++
++
++def _validate_render_splats(
++    splats: Mapping[str, Tensor], config: Mapping[str, Any]
++) -> int:
++    required = {
++        "anchors",
++        "quats",
++        "scales",
++        "opacities",
++        "anchor_features",
++        "offsets",
++        "factors",
++        "time_features",
++    }
++    if set(splats) != required:
++        raise ValueError("decoded clean-render splat fields are incomplete or unexpected")
++    count = int(splats["anchors"].shape[0])
++    expected = {
++        "anchors": (count, 3),
++        "quats": (count, 4),
++        "scales": (count, 6),
++        "opacities": (count, 1),
++        "anchor_features": (count, int(config["anchor_feature_dim"])),
++        "offsets": (count, int(config["n_offsets"]), 3),
++        "factors": (count, 4),
++        "time_features": (
++            count,
++            int(config["GOP_size"]),
++            int(config["c_perframe"]),
++        ),
++    }
++    if count <= 0 or int(config["GOP_size"]) <= 1:
++        raise ValueError("decoded clean-render population/GOP is invalid")
++    for name, shape in expected.items():
++        value = splats[name]
++        if not isinstance(value, Tensor) or tuple(value.shape) != shape:
++            raise ValueError(f"decoded clean-render tensor shape is invalid: {name}")
++        if not torch.isfinite(value).all():
++            raise ValueError(f"decoded clean-render tensor is nonfinite: {name}")
++    return count
++
++
++def _render_once(
++    splats: Mapping[str, Tensor],
++    decoders: torch.nn.ModuleDict,
++    app_module: Optional[CountedCameraEmbedding],
++    config: Mapping[str, Any],
++    camtoworlds: Tensor,
++    intrinsics: Tensor,
++    width: int,
++    height: int,
++    frame_index: int,
++    knn_indices: Optional[Tensor],
++) -> Tuple[Tensor, Tensor, Dict[str, int]]:
++    packed = bool(config["packed"])
++    rasterize_mode = "antialiased" if bool(config["antialiased"]) else "classic"
++    visible = view_to_visible_anchors(
++        means=splats["anchors"],
++        quats=splats["quats"],
++        scales=torch.exp(splats["scales"][:, :3]),
++        viewmats=torch.linalg.inv(camtoworlds),
++        Ks=intrinsics,
++        width=int(width),
++        height=int(height),
++        packed=packed,
++        rasterize_mode=rasterize_mode,
++        camera_model=str(config["camera_model"]),
++    )
++    if visible.shape != (splats["anchors"].shape[0],) or not visible.any():
++        raise ValueError("counted camera sees no decoded anchors")
++
++    feature = splats["anchor_features"]
++    time_feature = splats["time_features"][:, int(frame_index)]
++    factors = fake_quantize_factors(splats["factors"], q_aware=False)
++    selected_feature = feature[visible]
++    selected_anchor = splats["anchors"][visible]
++    selected_offset = splats["offsets"][visible]
++    selected_scale = torch.exp(splats["scales"][visible])
++    selected_time = time_feature[visible]
++    selected_factor = factors[visible]
++
++    cam_pos = camtoworlds[:, :3, 3]
++    view = selected_anchor - cam_pos
++    view = view / view.norm(dim=1, keepdim=True).clamp_min(1e-12)
++    view_feature = (
++        torch.cat([selected_feature, view], dim=1)
++        if bool(config["view_adaptive"])
++        else selected_feature
++    )
++    time_input = torch.cat(
++        [view_feature, selected_time * selected_factor[:, 0, None]], dim=1
++    )
++
++    if bool(config["knn"]):
++        if knn_indices is None:
++            raise ValueError("counted KNN indices were not constructed")
++        selected_neighbors = knn_indices[visible].reshape(-1)
++        k = int(config["n_knn"])
++        knn_feature = feature[selected_neighbors].reshape(-1, k, feature.shape[-1]).mean(1)
++        knn_time = (
++            time_feature * factors[:, 0, None]
++        )[selected_neighbors].reshape(-1, k, time_feature.shape[-1]).mean(1)
++        adaptive = selected_factor[:, 2, None] * torch.cat(
++            [selected_feature, selected_time * selected_factor[:, 0, None]], dim=1
++        ) + (1.0 - selected_factor[:, 2, None]) * torch.cat(
++            [knn_feature, knn_time], dim=1
++        )
++    else:
++        adaptive = torch.cat(
++            [selected_feature, selected_time * selected_factor[:, 0, None]], dim=1
++        )
++    time_value = float(frame_index) / float(int(config["GOP_size"]) - 1)
++    unit = torch.ones((1,), dtype=torch.float32, device=selected_anchor.device)
++    embedding = torch.cat(
++        [
++            torch.sin(float(config["phi"]) ** n * torch.pi * unit * time_value)
++            for n in range(int(config["time_dim"]) // 2)
++        ]
++        + [
++            torch.cos(float(config["phi"]) ** n * torch.pi * unit * time_value)
++            for n in range(int(config["time_dim"]) // 2)
++        ]
++    )
++    motion_input = torch.cat(
++        [adaptive, embedding[None].expand(adaptive.shape[0], -1)], dim=1
++    )
++    pruning_factor = selected_factor[:, 3, None]
++    selected_scale = torch.cat(
++        [selected_scale[:, :3], selected_scale[:, 3:] * pruning_factor], dim=1
++    )
++    opacity = decoders["mlp_opacity"](time_input).reshape(-1, 1)
++    opacity = opacity * pruning_factor.expand(-1, int(config["n_offsets"])).reshape(-1, 1)
++    color_input = time_input
++    if app_module is not None:
++        app_ids = torch.full((1,), -1, dtype=torch.long, device=selected_anchor.device)
++        app = app_module(app_ids).expand(time_input.shape[0], -1)
++        color_input = torch.cat([time_input, app], dim=1)
++    colors = decoders["mlp_color"](color_input).reshape(-1, 3)
++    scale_rot = decoders["mlp_cov"](time_input).reshape(-1, 7)
++    motion = decoders["mlp_motion"](motion_input) * selected_factor[:, 1, None]
++    tensors = {"opacity": opacity, "colors": colors, "scale_rot": scale_rot, "motion": motion}
++    for name, value in tensors.items():
++        if not torch.isfinite(value).all():
++            raise ValueError(f"clean render decoder output is nonfinite: {name}")
++
++    selected_anchor = selected_anchor + motion[:, -7:-4]
++    anchor_quat = torch.nn.functional.normalize(
++        0.1 * motion[:, -4:] + motion.new_tensor([[1.0, 0.0, 0.0, 0.0]]), dim=-1
++    )
++    rotation = _quaternion_to_rotation_matrix(anchor_quat)
++    offset = torch.bmm(
++        selected_offset * selected_scale[:, None, :3], rotation.transpose(1, 2)
++    ).reshape(-1, 3)
++    repeated_scale = selected_scale[:, None, :].expand(
++        -1, int(config["n_offsets"]), -1
++    ).reshape(-1, 6)
++    repeated_anchor = selected_anchor[:, None, :].expand(
++        -1, int(config["n_offsets"]), -1
++    ).reshape(-1, 3)
++    keep = opacity.reshape(-1) > 0
++    if not keep.any():
++        raise ValueError("counted camera render produced no positive-opacity children")
++    means = repeated_anchor[keep] + offset[keep]
++    scales = repeated_scale[keep, 3:] * torch.sigmoid(scale_rot[keep, :3])
++    quats = torch.nn.functional.normalize(scale_rot[keep, 3:7], dim=-1)
++    colors = colors[keep]
++    opacities = opacity[keep, 0]
++    render, alpha, _ = rasterization(
++        means=means,
++        quats=quats,
++        scales=scales,
++        opacities=opacities,
++        colors=colors,
++        viewmats=torch.linalg.inv(camtoworlds),
++        Ks=intrinsics,
++        width=int(width),
++        height=int(height),
++        packed=packed,
++        absgrad=False,
++        sparse_grad=False,
++        rasterize_mode=rasterize_mode,
++        distributed=False,
++        camera_model=str(config["camera_model"]),
++    )
++    if render.shape != (1, int(height), int(width), 3):
++        raise ValueError("counted camera render has an unexpected shape")
++    if alpha.shape[:3] != (1, int(height), int(width)):
++        raise ValueError("counted camera alpha has an unexpected shape")
++    if not torch.isfinite(render).all() or not torch.isfinite(alpha).all():
++        raise ValueError("counted camera render/alpha is nonfinite")
++    return render, alpha, {
++        "visible_anchor_count": int(visible.sum().item()),
++        "rendered_child_count": int(keep.sum().item()),
++    }
++
++
++@torch.no_grad()
++def counted_camera_render_benchmark(
++    splats: Mapping[str, Tensor],
++    decoders: torch.nn.ModuleDict,
++    app_module: Optional[CountedCameraEmbedding],
++    config: Mapping[str, Any],
++    camera_arrays: Mapping[str, np.ndarray],
++    warmup_renders: int,
++    timed_renders: int,
++) -> Dict[str, Any]:
++    if warmup_renders <= 0 or timed_renders <= 0:
++        raise ValueError("clean-process warm/timed render counts must be positive")
++    anchor_count = _validate_render_splats(splats, config)
++    if bool(config["knn"]) and anchor_count <= int(config["n_knn"]):
++        raise ValueError("decoded anchor population is too small for counted KNN")
++    pose_index = int(config["warm_camera_pose_index"])
++    frame_index = int(config["warm_frame_index"])
++    poses = camera_arrays["camtoworlds"]
++    camera_ids = camera_arrays["camera_ids"]
++    keys = camera_arrays["camera_keys"]
++    if pose_index < 0 or pose_index >= poses.shape[0]:
++        raise ValueError("counted warm camera pose index is out of range")
++    if frame_index < 0 or frame_index >= int(config["GOP_size"]):
++        raise ValueError("counted warm frame index is out of range")
++    key = int(camera_ids[pose_index])
++    locations = np.flatnonzero(keys == key)
++    if locations.size != 1:
++        raise ValueError("counted warm camera key is absent or duplicated")
++    meta_index = int(locations[0])
++    width, height = [int(v) for v in camera_arrays["image_sizes"][meta_index]]
++    device = splats["anchors"].device
++    pose = torch.from_numpy(np.asarray(poses[pose_index], dtype=np.float32)).to(device)
++    if pose.shape == (3, 4):
++        pose = torch.cat([pose, pose.new_tensor([[0.0, 0.0, 0.0, 1.0]])], dim=0)
++    pose = pose[None]
++    intrinsic = torch.from_numpy(
++        np.asarray(camera_arrays["intrinsics"][meta_index], dtype=np.float32)
++    ).to(device)[None]
++    knn_indices = (
++        _knn_indices(splats["anchors"], int(config["n_knn"]))
++        if bool(config["knn"])
++        else None
++    )
++
++    last_render = last_alpha = None
++    shape_audit: Dict[str, int] = {}
++    for _ in range(int(warmup_renders)):
++        last_render, last_alpha, shape_audit = _render_once(
++            splats,
++            decoders,
++            app_module,
++            config,
++            pose,
++            intrinsic,
++            width,
++            height,
++            frame_index,
++            knn_indices,
++        )
++    if device.type == "cuda":
++        torch.cuda.synchronize(device)
++    started = time.perf_counter()
++    for _ in range(int(timed_renders)):
++        last_render, last_alpha, shape_audit = _render_once(
++            splats,
++            decoders,
++            app_module,
++            config,
++            pose,
++            intrinsic,
++            width,
++            height,
++            frame_index,
++            knn_indices,
++        )
++    if device.type == "cuda":
++        torch.cuda.synchronize(device)
++    seconds = time.perf_counter() - started
++    if not math.isfinite(seconds) or seconds <= 0 or last_render is None or last_alpha is None:
++        raise ValueError("clean-process render benchmark timing failed")
++    return {
++        "schema": "h007.clean_counted_camera_render.v1",
++        "warmup_renders": int(warmup_renders),
++        "timed_renders": int(timed_renders),
++        "seconds": float(seconds),
++        "fps": float(timed_renders / seconds),
++        "camera_pose_index": pose_index,
++        "camera_key": key,
++        "frame_index": frame_index,
++        "width": width,
++        "height": height,
++        "source_pixels_read": 0,
++        "camera_metadata_source": "counted_archive_only",
++        "render_shape": list(last_render.shape),
++        "alpha_shape": list(last_alpha.shape),
++        **shape_audit,
++    }
+diff --git a/gsplat/compression/h007_runtime_provenance.py b/gsplat/compression/h007_runtime_provenance.py
+new file mode 100644
+index 0000000..fc5eb46
+--- /dev/null
++++ b/gsplat/compression/h007_runtime_provenance.py
+@@ -0,0 +1,208 @@
++"""Fail-closed runtime provenance for the H007 AP-GIFStream experiment.
++
++The preregistration manifest deliberately lives outside the patched GIFStream
++tree.  It binds the three patch payloads and a normalized post-apply source-tree
++digest without making a source file contain its own hash.
++"""
++
++from __future__ import annotations
++
++import hashlib
++import json
++import subprocess
++from pathlib import Path
++from typing import Any, Dict, Iterable, Mapping, Optional, Tuple
++
++
++MANIFEST_SCHEMA = "h007.ap_gifstream.patch_chain_manifest.v1"
++TREE_SCHEMA = "h007.normalized_code_tree.v1"
++OFFICIAL_COMMIT = "c98486632e7dafd830740b1a1692bd08c48b96e3"
++PATCH1_SHA256 = "65ecd8f1fe30fac5d5bce3aed295cfe04f0b0582f106efaf37489b005d2e431b"
++PATCH2_SHA256 = "347e3fbb59cdab49160a0c5291ecbd375e2de37d6bf3dea3e927d07f0ed8a253"
++PATCH_STAGES = ("patch1", "patch2", "patch2b")
++TREE_ROOTS = ("examples", "gsplat", "third_party")
++TREE_ROOT_FILES: Tuple[str, ...] = ("setup.py",)
++TREE_SUFFIXES = (".c", ".cc", ".cpp", ".cu", ".cuh", ".h", ".hpp", ".py")
++TREE_SPECIAL_NAMES = ("CMakeLists.txt",)
++
++
++def _sha256_bytes(payload: bytes) -> str:
++    return hashlib.sha256(payload).hexdigest()
++
++
++def _require_hex_sha256(value: Any, name: str) -> str:
++    text = str(value)
++    if len(text) != 64 or any(ch not in "0123456789abcdef" for ch in text):
++        raise ValueError(f"{name} is not a lowercase SHA-256")
++    return text
++
++
++def _iter_code_files(repo_root: Path) -> Iterable[Path]:
++    for relative in TREE_ROOT_FILES:
++        path = repo_root / relative
++        if not path.is_file() or path.is_symlink():
++            raise ValueError(f"required normalized-tree source is unavailable: {relative}")
++        yield path
++    for relative in TREE_ROOTS:
++        root = repo_root / relative
++        if not root.is_dir() or root.is_symlink():
++            raise ValueError(f"required normalized-tree root is unavailable: {relative}")
++        for path in root.rglob("*"):
++            if path.is_symlink():
++                raise ValueError(f"symlink forbidden in normalized code tree: {path}")
++            if not path.is_file():
++                continue
++            if path.suffix in TREE_SUFFIXES or path.name in TREE_SPECIAL_NAMES:
++                yield path
++
++
++def normalized_code_tree(repo_root: Path) -> Dict[str, Any]:
++    """Hash normalized source paths and LF-normalized bytes in stable order."""
++
++    repo_root = repo_root.resolve()
++    rows = []
++    for path in sorted(set(_iter_code_files(repo_root))):
++        relative = path.relative_to(repo_root).as_posix()
++        payload = path.read_bytes().replace(b"\r\n", b"\n").replace(b"\r", b"\n")
++        rows.append((relative, payload))
++    digest = hashlib.sha256()
++    for relative, payload in rows:
++        name = relative.encode("utf-8")
++        digest.update(len(name).to_bytes(8, "little"))
++        digest.update(name)
++        digest.update(len(payload).to_bytes(8, "little"))
++        digest.update(payload)
++    return {
++        "schema": TREE_SCHEMA,
++        "normalization": "sorted-posix-path+lf-bytes+uint64le-lengths",
++        "roots": list(TREE_ROOTS),
++        "root_files": list(TREE_ROOT_FILES),
++        "suffixes": list(TREE_SUFFIXES),
++        "special_names": list(TREE_SPECIAL_NAMES),
++        "file_count": len(rows),
++        "sha256": digest.hexdigest(),
++    }
++
++
++def _resolve_patch_path(manifest_path: Path, declared: str) -> Path:
++    candidate = Path(declared)
++    if candidate.is_absolute():
++        raise ValueError("patch-chain manifest paths must be relative")
++    unresolved = manifest_path.parent / candidate
++    if unresolved.is_symlink():
++        raise ValueError(f"registered patch payload symlink is forbidden: {declared}")
++    resolved = unresolved.resolve()
++    if not resolved.is_file():
++        raise ValueError(f"registered patch payload is unavailable: {declared}")
++    return resolved
++
++
++def _git_head(repo_root: Path) -> str:
++    result = subprocess.run(
++        ["git", "-C", str(repo_root), "rev-parse", "HEAD"],
++        check=True,
++        capture_output=True,
++        text=True,
++    )
++    return result.stdout.strip()
++
++
++def verify_runtime_provenance(
++    manifest_path: Path,
++    repo_root: Path,
++    expected_manifest_sha256: str,
++    expected_container_receipt: Optional[Mapping[str, Any]] = None,
++) -> Dict[str, Any]:
++    """Verify preregistration, patch payloads, git base and active source tree.
++
++    ``expected_manifest_sha256`` is mandatory and comes from the frozen run
++    configuration (or clean-decoder invocation), never from the container.
++    """
++
++    if manifest_path.is_symlink():
++        raise ValueError("preregistered patch-chain manifest symlink is forbidden")
++    manifest_path = manifest_path.resolve()
++    repo_root = repo_root.resolve()
++    expected_manifest_sha256 = _require_hex_sha256(
++        expected_manifest_sha256, "expected manifest SHA-256"
++    )
++    if not manifest_path.is_file():
++        raise ValueError("preregistered patch-chain manifest is unavailable")
++    raw = manifest_path.read_bytes()
++    manifest_sha256 = _sha256_bytes(raw)
++    if manifest_sha256 != expected_manifest_sha256:
++        raise ValueError("preregistered patch-chain manifest SHA-256 mismatch")
++    manifest = json.loads(raw.decode("utf-8"))
++    if not isinstance(manifest, dict) or set(manifest) != {
++        "schema",
++        "official_commit",
++        "patches",
++        "normalized_code_tree",
++    }:
++        raise ValueError("patch-chain manifest fields are incomplete or unexpected")
++    if manifest.get("schema") != MANIFEST_SCHEMA:
++        raise ValueError("unsupported patch-chain manifest schema")
++    if manifest.get("official_commit") != OFFICIAL_COMMIT:
++        raise ValueError("patch-chain manifest official commit mismatch")
++    if _git_head(repo_root) != OFFICIAL_COMMIT:
++        raise ValueError("active GIFStream checkout is not at the registered official commit")
++
++    patches = manifest.get("patches")
++    if not isinstance(patches, list) or [row.get("stage") for row in patches] != list(
++        PATCH_STAGES
++    ):
++        raise ValueError("patch-chain manifest stages/order mismatch")
++    patch_hashes = []
++    for index, row in enumerate(patches):
++        if set(row) != {"stage", "path", "sha256"}:
++            raise ValueError("patch-chain manifest patch row has unexpected fields")
++        declared_sha = _require_hex_sha256(row["sha256"], f"{row['stage']} SHA-256")
++        patch_path = _resolve_patch_path(manifest_path, str(row["path"]))
++        actual_sha = _sha256_bytes(patch_path.read_bytes())
++        if actual_sha != declared_sha:
++            raise ValueError(f"registered {row['stage']} payload SHA-256 mismatch")
++        patch_hashes.append(actual_sha)
++        if index == 0 and actual_sha != PATCH1_SHA256:
++            raise ValueError("registered Patch1 is not the frozen Patch1 payload")
++        if index == 1 and actual_sha != PATCH2_SHA256:
++            raise ValueError("registered Patch2 is not the frozen Patch2 payload")
++
++    declared_tree = manifest.get("normalized_code_tree")
++    actual_tree = normalized_code_tree(repo_root)
++    if declared_tree != actual_tree:
++        raise ValueError("active normalized post-apply code tree is not preregistered")
++    receipt = {
++        "schema": "h007.ap_gifstream.runtime_provenance.v1",
++        "manifest_sha256": manifest_sha256,
++        "official_commit": OFFICIAL_COMMIT,
++        "patch_sha256": patch_hashes,
++        "normalized_code_tree": actual_tree,
++    }
++    if expected_container_receipt is not None and dict(expected_container_receipt) != receipt:
++        raise ValueError("container/runtime provenance receipt mismatch")
++    return receipt
++
++
++def provenance_manifest_template(
++    patch_paths_and_hashes: Iterable[Tuple[str, str]], repo_root: Path
++) -> Dict[str, Any]:
++    """Build an external manifest payload after the final patch is archived."""
++
++    patch_paths_and_hashes = list(patch_paths_and_hashes)
++    if len(patch_paths_and_hashes) != len(PATCH_STAGES):
++        raise ValueError("manifest template requires exactly three patch payloads")
++    rows = []
++    for stage, (path, digest) in zip(PATCH_STAGES, patch_paths_and_hashes):
++        rows.append(
++            {
++                "stage": stage,
++                "path": str(path),
++                "sha256": _require_hex_sha256(digest, f"{stage} SHA-256"),
++            }
++        )
++    return {
++        "schema": MANIFEST_SCHEMA,
++        "official_commit": OFFICIAL_COMMIT,
++        "patches": rows,
++        "normalized_code_tree": normalized_code_tree(repo_root),
++    }
+diff --git a/tests/test_ap_gifstream_core.py b/tests/test_ap_gifstream_core.py
+index 6864893..27297ad 100644
+--- a/tests/test_ap_gifstream_core.py
++++ b/tests/test_ap_gifstream_core.py
+@@ -1,6 +1,7 @@
+ import json
+ import tempfile
+ import unittest
++from unittest import mock
+ from pathlib import Path
+ 
+ import numpy as np
+@@ -15,9 +16,15 @@ from gsplat.compression.ap_gifstream import (
+     deterministic_zip_directory,
+     load_aligned_score_artifact,
+     pack_bool_mask,
++    recompute_sorted_codec_invariants,
+     tensor_mapping_sha256,
+     unpack_bool_mask,
+ )
++from gsplat.compression.h007_clean_runtime import (
++    build_decoder_modules,
++    instantiate_counted_models,
++)
++from gsplat.compression import h007_runtime_provenance as provenance
+ from gsplat.compression.gifstream_end2end_compression import (
+     _compress_ap_time_features_ar,
+     _decompress_ap_time_features_ar,
+@@ -35,6 +42,16 @@ class _RoundEntropy:
+ 
+ 
+ class APGIFStreamCoreTest(unittest.TestCase):
++    @staticmethod
++    def _runtime_receipt():
++        return {
++            "schema": "h007.ap_gifstream.runtime_provenance.v1",
++            "manifest_sha256": "1" * 64,
++            "official_commit": provenance.OFFICIAL_COMMIT,
++            "patch_sha256": ["2" * 64, "3" * 64, "4" * 64],
++            "normalized_code_tree": {"sha256": "5" * 64},
++        }
++
+     def test_variant_matrix_is_frozen(self):
+         self.assertEqual(
+             set(AP_VARIANTS),
+@@ -86,9 +103,18 @@ class APGIFStreamCoreTest(unittest.TestCase):
+                 time_entropy_model_sha256=np.asarray("0" * 64),
+                 time_feature_scaling=np.asarray(1.0),
+                 time_entropy_model_frozen_after_freeze=np.asarray(True),
++                runtime_manifest_sha256=np.asarray("1" * 64),
++                normalized_code_tree_sha256=np.asarray("5" * 64),
++                patch_chain_sha256=np.asarray(["2" * 64, "3" * 64, "4" * 64]),
+             )
+             score, eligible, estimated_bytes, allocation, audit = load_aligned_score_artifact(
+-                str(artifact), anchors, 0.1, "path", 11, expected_variant="path-swap"
++                str(artifact),
++                anchors,
++                0.1,
++                "path",
++                11,
++                self._runtime_receipt(),
++                expected_variant="path-swap",
+             )
+         torch.testing.assert_close(score, torch.tensor([0.0, -torch.inf, 20.0], dtype=torch.float64))
+         self.assertEqual(eligible.tolist(), [True, False, True])
+@@ -231,6 +257,144 @@ class APGIFStreamCoreTest(unittest.TestCase):
+             self.assertEqual(first["bytes"], second["bytes"])
+             self.assertEqual(first["sha256"], second["sha256"])
+ 
++    def test_post_plas_recomputation_and_fault_injection(self):
++        ids = torch.tensor([[0, 0, 0], [2, 0, 0]], dtype=torch.int64)
++        source_bytes = torch.tensor([5, 7, 5, 9], dtype=torch.int64)
++        retained_bytes = torch.tensor([5, 5], dtype=torch.int64)
++        permutation = torch.tensor([2, 0, 3, 1], dtype=torch.int64)
++        sentinel = torch.tensor(
++            [[torch.iinfo(torch.int64).min, 0, 0], [torch.iinfo(torch.int64).min + 1, 0, 0]],
++            dtype=torch.int64,
++        )
++        pre_ids = torch.cat([ids, sentinel], dim=0)
++        pre_bytes = torch.tensor([5, 5, 0, 0], dtype=torch.int64)
++        pre_real = torch.tensor([True, True, False, False])
++        pre_active = torch.tensor([False, True, False, False])
++        pre_class = torch.tensor([False, True, False, False])
++        factors = torch.zeros((4, 4))
++        factors[pre_real, 3] = 1.0
++        factors[pre_active, 0] = 1.0
++        kwargs = {
++            "official_retain_mask": torch.tensor([True, True, False, False]),
++            "official_active_mask": torch.tensor([True, False, False, False]),
++            "ap_retain_mask": torch.tensor([True, False, True, False]),
++            "expected_ap_active_mask": torch.tensor([False, False, True, False]),
++            "expected_ap_class_mask": torch.tensor([False, False, True, False]),
++            "source_estimated_bytes": source_bytes,
++            "pre_sort_retained_ids": ids,
++            "pre_sort_estimated_bytes": retained_bytes,
++            "sort_indices": permutation,
++            "encoded_ids": pre_ids[permutation],
++            "encoded_estimated_bytes": pre_bytes[permutation],
++            "encoded_factors": factors[permutation],
++            "real_mask": pre_real[permutation],
++            "padding_mask": ~pre_real[permutation],
++            "ap_class_mask": pre_class[permutation],
++        }
++        audit = recompute_sorted_codec_invariants(**kwargs)
++        self.assertEqual(audit["whole_promoted_count"], audit["whole_demoted_count"])
++        self.assertEqual(audit["official_estimated_time_bytes"], 5)
++        self.assertEqual(audit["ap_estimated_time_bytes"], 5)
++        for field, bad, message in (
++            ("encoded_ids", pre_ids, "canonical IDs"),
++            ("encoded_estimated_bytes", pre_bytes, "estimated-byte rows"),
++            ("real_mask", pre_real, "real/padding mask"),
++        ):
++            corrupted = dict(kwargs)
++            corrupted[field] = bad
++            with self.assertRaisesRegex(ValueError, message):
++                recompute_sorted_codec_invariants(**corrupted)
++
++    def test_runtime_provenance_rejects_patch_and_tree_tampering(self):
++        with tempfile.TemporaryDirectory() as tmp:
++            base = Path(tmp)
++            repo = base / "repo"
++            manifest_dir = base / "registration"
++            for root in provenance.TREE_ROOTS:
++                (repo / root).mkdir(parents=True)
++                (repo / root / "source.py").write_text(f"ROOT={root!r}\n", encoding="utf-8")
++            (repo / "setup.py").write_text("NAME='fixture'\n", encoding="utf-8")
++            manifest_dir.mkdir()
++            hashes = []
++            rows = []
++            for stage in provenance.PATCH_STAGES:
++                path = manifest_dir / f"{stage}.patch"
++                path.write_text(f"{stage}\n", encoding="utf-8")
++                digest = __import__("hashlib").sha256(path.read_bytes()).hexdigest()
++                hashes.append(digest)
++                rows.append({"stage": stage, "path": path.name, "sha256": digest})
++            manifest = {
++                "schema": provenance.MANIFEST_SCHEMA,
++                "official_commit": provenance.OFFICIAL_COMMIT,
++                "patches": rows,
++                "normalized_code_tree": provenance.normalized_code_tree(repo),
++            }
++            path = manifest_dir / "manifest.json"
++            path.write_text(json.dumps(manifest, sort_keys=True), encoding="utf-8")
++            digest = __import__("hashlib").sha256(path.read_bytes()).hexdigest()
++            with mock.patch.object(provenance, "PATCH1_SHA256", hashes[0]), mock.patch.object(
++                provenance, "PATCH2_SHA256", hashes[1]
++            ), mock.patch.object(provenance, "_git_head", return_value=provenance.OFFICIAL_COMMIT):
++                receipt = provenance.verify_runtime_provenance(path, repo, digest)
++                self.assertEqual(receipt["patch_sha256"], hashes)
++                rows[2]["sha256"] = "f" * 64
++                path.write_text(json.dumps(manifest, sort_keys=True), encoding="utf-8")
++                bad_digest = __import__("hashlib").sha256(path.read_bytes()).hexdigest()
++                with self.assertRaisesRegex(ValueError, "payload SHA-256 mismatch"):
++                    provenance.verify_runtime_provenance(path, repo, bad_digest)
++                rows[2]["sha256"] = hashes[2]
++                path.write_text(json.dumps(manifest, sort_keys=True), encoding="utf-8")
++                (repo / "examples" / "source.py").write_text("TAMPERED=True\n", encoding="utf-8")
++                bad_digest = __import__("hashlib").sha256(path.read_bytes()).hexdigest()
++                with self.assertRaisesRegex(ValueError, "code tree"):
++                    provenance.verify_runtime_provenance(path, repo, bad_digest)
++
++    def test_clean_models_strict_load_and_nonfinite_faults(self):
++        config = {
++            "anchor_feature_dim": 8,
++            "c_perframe": 2,
++            "n_offsets": 3,
++            "time_dim": 4,
++            "view_adaptive": False,
++            "app_opt": True,
++            "app_embed_dim": 2,
++            "appearance_embedding_count": 4,
++            "add_opacity_dist": False,
++            "add_cov_dist": False,
++            "add_color_dist": False,
++        }
++        decoders = build_decoder_modules(config, torch.device("cpu"))
++        app = torch.nn.Module()
++        app.embeds = torch.nn.Embedding(4, 2)
++        nets = {
++            "decoders": decoders.state_dict(),
++            "app_module": app.state_dict(),
++            "scaling": {
++                "anchors": None,
++                "quats": None,
++                "scales": 0.1,
++                "opacities": None,
++                "anchor_features": 1.0,
++                "offsets": 0.1,
++                "factors": 0.0625,
++                "time_features": 1.0,
++            },
++        }
++        _, loaded_app, audit = instantiate_counted_models(nets, config, torch.device("cpu"))
++        self.assertIsNotNone(loaded_app)
++        self.assertTrue(audit["strict_load"])
++        missing = dict(nets)
++        missing["decoders"] = dict(nets["decoders"])
++        missing["decoders"].pop(next(iter(missing["decoders"])))
++        with self.assertRaises(RuntimeError):
++            instantiate_counted_models(missing, config, torch.device("cpu"))
++        nonfinite = dict(nets)
++        nonfinite["decoders"] = {name: value.clone() for name, value in nets["decoders"].items()}
++        first = next(iter(nonfinite["decoders"]))
++        nonfinite["decoders"][first].reshape(-1)[0] = float("nan")
++        with self.assertRaisesRegex(ValueError, "nonfinite"):
++            instantiate_counted_models(nonfinite, config, torch.device("cpu"))
++
+ 
+ if __name__ == "__main__":
+     unittest.main()

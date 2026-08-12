@@ -1,0 +1,1056 @@
+
+--- a/GIFStream_APRD/examples/h007_clean_decode_gifstream.py	2026-08-03 16:58:29
++++ b/GIFStream_APRD/examples/h007_clean_decode_gifstream.py	2026-07-26 00:28:38
+@@ -463,7 +463,6 @@
+             else None,
+             "provenance_manifest_sha256": provenance_manifest_sha256,
+             "repo_root": str(repo_root),
+-            "n_knn": int(config["n_knn"]),
+         }
+     )
+     splats = codec.decompress(container.as_posix(), simulation.entropy_models, target_device)
+@@ -494,12 +493,9 @@
+         raise ValueError("decoded temporal tensor shape disagrees with configuration")
+     decoded_ids_path = None
+     decoded_ids_sha256 = None
+-    decoded_knn_indices = None
+     if receipt is not None:
+         if codec.decoded_canonical_ids is None:
+             raise ValueError("AP decoder did not restore counted canonical identities")
+-        if codec.decoded_knn_indices is None:
+-            raise ValueError("AP decoder did not restore the counted KNN graph")
+         decoded_ids = codec.decoded_canonical_ids.detach().cpu()
+         _validate_counted_retained_identity(
+             decoded_ids, splats["anchors"].shape[0]
+@@ -511,7 +507,6 @@
+             allow_pickle=False,
+         )
+         decoded_ids_sha256 = _sha256(decoded_ids_path)
+-        decoded_knn_indices = codec.decoded_knn_indices.to(device=render_device)
+ 
+     clean_render = counted_camera_render_benchmark(
+         splats,
+@@ -521,7 +516,6 @@
+         camera_arrays,
+         int(config["warmup_renders"] if warmup_renders is None else warmup_renders),
+         int(config["timed_renders"] if timed_renders is None else timed_renders),
+-        knn_indices=decoded_knn_indices,
+     )
+ 
+     decoded_path = output_dir / "decoded_splats.pt"
+
+--- a/GIFStream_APRD/examples/simple_trainer_GIFStream.py	2026-08-03 16:58:29
++++ b/GIFStream_APRD/examples/simple_trainer_GIFStream.py	2026-07-26 00:28:38
+@@ -923,13 +923,7 @@
+             raise ValueError("persistent path decoder received malformed splats")
+         if self.cfg.knn:
+             path_indices = (
+-                deterministic_knn_indices(
+-                    anchors,
+-                    int(self.cfg.n_knn),
+-                    canonical_ids=canonical_voxel_ids(
+-                        anchors, self.cfg.voxel_size
+-                    ),
+-                )
++                deterministic_knn_indices(anchors, int(self.cfg.n_knn))
+                 if knn_indices is None
+                 else knn_indices
+             )
+@@ -989,15 +983,8 @@
+             torch.cuda.synchronize()
+         freeze_start = time.perf_counter()
+         ids = canonical_voxel_ids(self.splats["anchors"], self.cfg.voxel_size)
+-        reference_knn = deterministic_knn_indices(
+-            self.splats["anchors"],
+-            int(self.cfg.n_knn),
+-            canonical_ids=ids,
+-        )
+         reference_paths = self.decode_persistent_anchor_paths(
+-            self.splats,
+-            factors_are_logits=True,
+-            knn_indices=reference_knn,
++            self.splats, factors_are_logits=True
+         ).detach()
+         path_score = torch.linalg.vector_norm(
+             reference_paths[:, 1:] - reference_paths[:, :-1], dim=-1
+@@ -1241,11 +1228,7 @@
+         if self.ap_codec_knn_indices is None:
+             raise ValueError("AP codec KNN graph is unavailable")
+         reference_knn = deterministic_knn_indices(
+-            self.splats["anchors"],
+-            int(self.cfg.n_knn),
+-            canonical_ids=self.ap_state["canonical_ids"].to(
+-                self.splats["anchors"].device
+-            ),
++            self.splats["anchors"], int(self.cfg.n_knn)
+         )
+         decoded_paths = self.decode_persistent_anchor_paths(
+             self.comp_sim_splats,
+@@ -1688,13 +1671,7 @@
+             selected_factors = factors[visible_anchor_mask]
+             if self.cfg.knn:
+                 if self.indices is None or self.indices.shape[0] != self.splats["anchors"].shape[0]:
+-                    _, self.indices = find_k_neighbors(
+-                        self.splats["anchors"],
+-                        self.cfg.n_knn,
+-                        canonical_ids=canonical_voxel_ids(
+-                            self.splats["anchors"], self.cfg.voxel_size
+-                        ),
+-                    )
++                    _, self.indices = find_k_neighbors(self.splats["anchors"], self.cfg.n_knn)
+                 selected_indices = self.indices[visible_anchor_mask].reshape(-1)
+                 knn_features = self.splats["anchor_features"][selected_indices].reshape(-1,self.cfg.n_knn,self.cfg.anchor_feature_dim).mean(dim=1)
+                 knn_time_features = (
+@@ -1710,13 +1687,7 @@
+ 
+             if self.cfg.knn:
+                 if self.indices is None:
+-                    _, self.indices = find_k_neighbors(
+-                        self.splats["anchors"],
+-                        self.cfg.n_knn,
+-                        canonical_ids=canonical_voxel_ids(
+-                            self.splats["anchors"], self.cfg.voxel_size
+-                        ),
+-                    )
++                    _, self.indices = find_k_neighbors(self.splats["anchors"], self.cfg.n_knn)
+                 if self.ap_state is not None:
+                     if self.ap_codec_knn_indices is None:
+                         raise ValueError(
+@@ -2440,13 +2411,7 @@
+                     and step % self.cfg.strategy.refine_every == 0
+                     and self.cfg.knn
+                 ):
+-                    _, self.indices = find_k_neighbors(
+-                        self.splats["anchors"],
+-                        self.cfg.n_knn,
+-                        canonical_ids=canonical_voxel_ids(
+-                            self.splats["anchors"], self.cfg.voxel_size
+-                        ),
+-                    )
++                    _, self.indices = find_k_neighbors(self.splats["anchors"], self.cfg.n_knn)
+ 
+                 if save_after_update:
+                     self._save_training_checkpoint_after_update(step, global_tic)
+@@ -2991,27 +2956,7 @@
+         for k in splats_c.keys():
+             self.splats[k].data = splats_c[k].to(self.device)
+         if self.cfg.knn:
+-            if (
+-                isinstance(
+-                    self.compression_method, GIFStreamEnd2endCompression
+-                )
+-                and self.cfg.ap_variant != "official"
+-            ):
+-                if self.compression_method.decoded_knn_indices is None:
+-                    raise ValueError(
+-                        "AP-v6 decode did not expose its counted KNN graph"
+-                    )
+-                self.indices = self.compression_method.decoded_knn_indices.to(
+-                    device=self.device
+-                )
+-            else:
+-                _, self.indices = find_k_neighbors(
+-                    self.splats["anchors"],
+-                    self.cfg.n_knn,
+-                    canonical_ids=canonical_voxel_ids(
+-                        self.splats["anchors"], self.cfg.voxel_size
+-                    ),
+-                )
++            _, self.indices = find_k_neighbors(self.splats["anchors"], self.cfg.n_knn)
+         # Render the actual archive reconstruction. Re-running base-Q
+         # compression simulation here would erase q_ap < 1 precision and no
+         # longer evaluate the decoded container.
+@@ -3168,19 +3113,7 @@
+                     self.entropy_models[attr_name].load_state_dict(value)
+         self.compression_sim_method.scaling = ckpt["scaling"]
+         self.scaling = ckpt["scaling"]
+-        self.comp_sim_splats, self.esti_bits_dict = (
+-            self.compression_sim_method.simulate_compression(
+-                self.splats,
+-                self.cfg.max_steps,
+-                0,
+-                self.cfg.entropy_channel,
+-                ap_state=(
+-                    self.ap_state
+-                    if self.cfg.ap_variant != "official"
+-                    else None
+-                ),
+-            )
+-        )
++        self.comp_sim_splats, self.esti_bits_dict = self.compression_sim_method.simulate_compression(self.splats, self.cfg.max_steps, 0, self.cfg.entropy_channel)
+ 
+     def load_models_from_compressed_dir(self, compress_dir, entropy_model_type: str):
+         self.entropy_models = {}
+@@ -3275,13 +3208,7 @@
+             if runner.cfg.compression_sim:
+                 runner.load_entropy_model_from_ckpt(ckpts[0], cfg.entropy_model_type)
+             if cfg.knn:
+-                _, runner.indices = find_k_neighbors(
+-                    runner.splats["anchors"],
+-                    cfg.n_knn,
+-                    canonical_ids=canonical_voxel_ids(
+-                        runner.splats["anchors"], cfg.voxel_size
+-                    ),
+-                )
++                _, runner.indices = find_k_neighbors(runner.splats["anchors"], cfg.n_knn)
+             runner.eval(step=step)
+             runner.render_traj(step=step)
+             if cfg.compression is not None:
+
+--- a/GIFStream_APRD/examples/utils.py	2026-08-03 16:58:29
++++ b/GIFStream_APRD/examples/utils.py	2026-07-26 00:28:38
+@@ -319,23 +319,19 @@
+     
+     return splats
+ 
+-def find_k_neighbors(input, k, *, canonical_ids=None):
++def find_k_neighbors(input, k):
+     """
+     Find the deterministic, row-order-invariant path-contract neighbors.
+ 
+     Args:
+-        input: point cloud data with shape (n, 3)
++        points: point cloud data with shape (n, 3)
+         k: int, number of nearest neighbors to find
+-        canonical_ids: optional int64 voxel identities used as both distance
+-            and tie authority
+ 
+     Returns:
+         distances: distances from each point to its k nearest neighbors
+         indices: indices of the k nearest neighbors for each point
+     """
+-    indices = deterministic_knn_indices(
+-        input, int(k), canonical_ids=canonical_ids
+-    )
++    indices = deterministic_knn_indices(input, int(k))
+     neighbors = input[indices]
+     distances = torch.linalg.vector_norm(input[:, None, :] - neighbors, dim=-1)
+     return distances.to(dtype=input.dtype), indices
+
+--- a/GIFStream_APRD/gsplat/compression/ap_gifstream.py	2026-08-03 16:58:29
++++ b/GIFStream_APRD/gsplat/compression/ap_gifstream.py	2026-07-26 00:28:38
+@@ -862,18 +862,13 @@
+     source_estimated_bytes: Tensor,
+     pre_sort_retained_ids: Tensor,
+     pre_sort_estimated_bytes: Tensor,
+-    pre_sort_path_input_mask: Tensor,
+-    pre_sort_encoded_factors: Tensor,
+-    pre_sort_raw_factor_logits: Tensor,
+     sort_indices: Tensor,
+     encoded_ids: Tensor,
+     encoded_estimated_bytes: Tensor,
+     encoded_factors: Tensor,
+-    encoded_raw_factor_logits: Tensor,
+     real_mask: Tensor,
+     padding_mask: Tensor,
+     ap_class_mask: Tensor,
+-    ap_path_input_mask: Tensor,
+ ) -> Dict[str, Any]:
+     """Recompute codec allocation after retention, padding and PLAS ordering."""
+ 
+@@ -883,7 +878,6 @@
+         "real_mask": real_mask,
+         "padding_mask": padding_mask,
+         "ap_class_mask": ap_class_mask,
+-        "ap_path_input_mask": ap_path_input_mask,
+         "sort_indices": sort_indices,
+     }
+     for name, value in one_dimensional.items():
+@@ -892,7 +886,7 @@
+     if encoded_ids.shape != (encoded_count, 3) or encoded_factors.shape != (
+         encoded_count,
+         4,
+-    ) or encoded_raw_factor_logits.shape != (encoded_count, 4):
++    ):
+         raise ValueError("post-PLAS ID/factor shapes are malformed")
+     if not torch.equal(real_mask, ~padding_mask):
+         raise ValueError("explicit real/padding masks are not complements")
+@@ -903,14 +897,7 @@
+         raise ValueError("PLAS permutation is not a complete encoded-row permutation")
+ 
+     pad = encoded_count - int(pre_sort_retained_ids.shape[0])
+-    retained_count = int(pre_sort_retained_ids.shape[0])
+-    if (
+-        pad < 0
+-        or pre_sort_estimated_bytes.shape != (retained_count,)
+-        or pre_sort_path_input_mask.shape != (retained_count,)
+-        or pre_sort_encoded_factors.shape != (retained_count, 4)
+-        or pre_sort_raw_factor_logits.shape != (retained_count, 4)
+-    ):
++    if pad < 0 or pre_sort_estimated_bytes.shape != (pre_sort_retained_ids.shape[0],):
+         raise ValueError("pre-sort retained ID/estimated-byte shapes disagree")
+     sentinel = torch.zeros((pad, 3), dtype=torch.int64, device=encoded_ids.device)
+     if pad:
+@@ -924,53 +911,12 @@
+         ],
+         dim=0,
+     )
+-    expected_pre_sort_path = torch.cat(
+-        [
+-            pre_sort_path_input_mask,
+-            torch.zeros(pad, dtype=torch.bool, device=real_mask.device),
+-        ],
+-        dim=0,
+-    )
+-    expected_pre_sort_factors = torch.cat(
+-        [
+-            pre_sort_encoded_factors,
+-            torch.zeros(
+-                (pad, 4),
+-                dtype=pre_sort_encoded_factors.dtype,
+-                device=pre_sort_encoded_factors.device,
+-            ),
+-        ],
+-        dim=0,
+-    )
+-    expected_pre_sort_raw_factors = torch.cat(
+-        [
+-            pre_sort_raw_factor_logits,
+-            torch.zeros(
+-                (pad, 4),
+-                dtype=pre_sort_raw_factor_logits.dtype,
+-                device=pre_sort_raw_factor_logits.device,
+-            ),
+-        ],
+-        dim=0,
+-    )
+     if not torch.equal(encoded_ids, expected_pre_sort_ids[sort_indices]):
+         raise ValueError("canonical IDs were not transformed by the counted PLAS permutation")
+     if not torch.equal(
+         encoded_estimated_bytes, expected_pre_sort_bytes[sort_indices]
+     ):
+         raise ValueError("estimated-byte rows were not transformed by the counted PLAS permutation")
+-    if not torch.equal(
+-        ap_path_input_mask, expected_pre_sort_path[sort_indices]
+-    ):
+-        raise ValueError("path-input rows were not transformed by the counted PLAS permutation")
+-    if not torch.equal(
+-        encoded_factors, expected_pre_sort_factors[sort_indices]
+-    ):
+-        raise ValueError("activated factor rows were not transformed by the counted PLAS permutation")
+-    if not torch.equal(
+-        encoded_raw_factor_logits, expected_pre_sort_raw_factors[sort_indices]
+-    ):
+-        raise ValueError("raw factor rows were not transformed by the counted PLAS permutation")
+     expected_real = torch.arange(encoded_count, device=real_mask.device) < int(
+         pre_sort_retained_ids.shape[0]
+     )
+@@ -982,12 +928,6 @@
+         raise ValueError("post-PLAS factor-3 whole mask differs from explicit real mask")
+     if torch.any(ap_class_mask & ~real_mask):
+         raise ValueError("post-PLAS AP class marks padding rows")
+-    if torch.any(ap_class_mask & ~factor_active):
+-        raise ValueError("post-PLAS AP class contains an inactive row")
+-    if torch.any(ap_class_mask & ~ap_path_input_mask):
+-        raise ValueError("post-PLAS path-input closure lost an AP class row")
+-    if torch.any(ap_path_input_mask & ~real_mask):
+-        raise ValueError("post-PLAS path-input closure includes padding")
+ 
+     whole_promoted = ap_retain_mask & ~official_retain_mask
+     whole_demoted = official_retain_mask & ~ap_retain_mask
+
+--- a/GIFStream_APRD/gsplat/compression/gifstream_end2end_compression.py	2026-08-03 16:58:29
++++ b/GIFStream_APRD/gsplat/compression/gifstream_end2end_compression.py	2026-07-26 00:28:38
+@@ -127,7 +127,6 @@
+     verbose: bool = True
+     ap_config: Optional[Dict[str, Any]] = None
+     decoded_canonical_ids: Optional[Tensor] = None
+-    decoded_knn_indices: Optional[Tensor] = None
+ 
+     def _get_compress_fn(self, param_name: str) -> Callable:
+         compress_fn_map = {
+@@ -228,20 +227,17 @@
+             if ap_enabled and ap_spec.quant:
+                 splats["time_features"] = raw_time_features.detach().clone()
+         raw_factor_logits = None
+-        if ap_enabled:
+-            if raw_factors is None:
+-                raise ValueError("AP-v6 compression requires raw factor logits")
+-            if raw_factors.shape != splats["factors"].shape:
+-                raise ValueError("raw_factors shape mismatch")
+-            raw_factor_logits = raw_factors.detach().clone()
+         if ap_enabled and ap_spec.quant:
+-            if raw_anchor_features is None:
++            if raw_anchor_features is None or raw_factors is None:
+                 raise ValueError(
+                     "AP-v6 compression requires raw anchor features and raw factor logits"
+                 )
+             if raw_anchor_features.shape != splats["anchor_features"].shape:
+                 raise ValueError("raw_anchor_features shape mismatch")
++            if raw_factors.shape != splats["factors"].shape:
++                raise ValueError("raw_factors shape mismatch")
+             splats["anchor_features"] = raw_anchor_features.detach().clone()
++            raw_factor_logits = raw_factors.detach().clone()
+         compression_seed = ap_cfg.get("compression_seed")
+         if ap_enabled and compression_seed is None:
+             raise ValueError("AP-GIFStream requires a frozen compression_seed")
+@@ -270,14 +266,6 @@
+                 if float(ap_cfg.get(config_name, default)) != float(score_audit[frozen_name]):
+                     raise ValueError(f"codec {config_name} differs from frozen score artifact")
+             canonical_ids = canonical_voxel_ids(splats["anchors"], voxel_size)
+-            # AP-v6 makes the counted voxel identity the coordinate authority
+-            # in simulation, encoding, and decoding.  Canonicalize before
+-            # pruning/PLAS so every downstream consumer sees the same base
+-            # anchor coordinates, not a pre-codec float ULP variant.
+-            splats["anchors"] = canonical_ids.to(
+-                device=splats["anchors"].device,
+-                dtype=splats["anchors"].dtype,
+-            ) * float(voxel_size)
+             if tensor_mapping_sha256(
+                 entropy_models["time_features"].state_dict()
+             ) != score_audit["time_entropy_model_sha256"]:
+@@ -365,9 +353,6 @@
+             canonical_ids = canonical_ids[pruning_mask]
+             pre_sort_retained_ids = canonical_ids.clone()
+             pre_sort_estimated_bytes = estimated_bytes.clone()
+-            pre_sort_path_input_mask = ap_path_input.clone()
+-            pre_sort_encoded_factors = splats["factors"].clone()
+-            pre_sort_raw_factor_logits = raw_factor_logits.clone()
+             real_mask = torch.ones(
+                 canonical_ids.shape[0], dtype=torch.bool, device=canonical_ids.device
+             )
+@@ -471,18 +456,13 @@
+                     source_estimated_bytes=source_estimated_bytes,
+                     pre_sort_retained_ids=pre_sort_retained_ids,
+                     pre_sort_estimated_bytes=pre_sort_estimated_bytes,
+-                    pre_sort_path_input_mask=pre_sort_path_input_mask,
+-                    pre_sort_encoded_factors=pre_sort_encoded_factors,
+-                    pre_sort_raw_factor_logits=pre_sort_raw_factor_logits,
+                     sort_indices=sort_indices,
+                     encoded_ids=canonical_ids,
+                     encoded_estimated_bytes=estimated_bytes,
+                     encoded_factors=splats["factors"],
+-                    encoded_raw_factor_logits=raw_factor_logits,
+                     real_mask=real_mask,
+                     padding_mask=padding_mask,
+                     ap_class_mask=ap_class,
+-                    ap_path_input_mask=ap_path_input,
+                 )
+             )
+ 
+@@ -668,7 +648,6 @@
+             return -torch.log(1/(x.clamp(1e-7,1-1e-7)) - 1)
+         
+         self.decoded_canonical_ids = None
+-        self.decoded_knn_indices = None
+         with open(os.path.join(compress_dir, "meta.json"), "r") as f:
+             meta = json.load(f)
+ 
+@@ -685,7 +664,6 @@
+                 "provenance_manifest_path",
+                 "provenance_manifest_sha256",
+                 "repo_root",
+-                "n_knn",
+             }
+             missing = sorted(provenance_required - set(ap_cfg))
+             if missing:
+@@ -720,8 +698,6 @@
+             if (
+                 not isinstance(path_contract, dict)
+                 or path_contract.get("schema") != PATH_CONTRACT_SCHEMA
+-                or int(path_contract.get("knn_count", -1))
+-                != int(ap_cfg["n_knn"])
+                 or path_contract.get("dependency_rule")
+                 != "protected-plus-one-hop-retained-knn"
+                 or not isinstance(
+@@ -898,7 +874,6 @@
+                 int(path_contract["knn_count"]),
+                 canonical_ids=retained_ids,
+             )
+-            self.decoded_knn_indices = retained_knn.detach().clone()
+             decoded_graph_sha256 = retained_knn_graph_sha256(
+                 retained_ids, retained_knn
+             )
+@@ -920,9 +895,7 @@
+                 int(path_contract["knn_count"]),
+                 canonical_ids=retained_ids,
+             )
+-            if not _tensor_equal_device_agnostic(
+-                expected_knn, retained_knn
+-            ) or not _tensor_equal_device_agnostic(
++            if not torch.equal(expected_knn, retained_knn) or not torch.equal(
+                 expected_path_mask, decoded_path_mask
+             ):
+                 raise ValueError(
+@@ -1614,17 +1587,11 @@
+     for family, family_mask in (("path", precision_mask), ("bg", ~precision_mask)):
+         family_meta = meta["families"][family]
+         row_count = int(family_meta["rows"])
+-        expected_path = f"{param_name}_{family}.bin"
+-        if family_meta.get("path") != expected_path:
+-            raise ValueError(f"{family} protected factor path is noncanonical")
+         if int(family_mask.sum().item()) != row_count:
+             raise ValueError(f"{family} factor row count mismatch")
+         if not row_count:
+-            if (
+-                int(family_meta["bytes"]) != 0
+-                or family_meta["sha256"] != hashlib.sha256(b"").hexdigest()
+-            ):
+-                raise ValueError("empty factor family binding is invalid")
++            if int(family_meta["bytes"]) != 0:
++                raise ValueError("empty factor family has nonzero counted bytes")
+             continue
+         output_path = os.path.join(compress_dir, str(family_meta["path"]))
+         if not os.path.isfile(output_path):
+
+--- a/GIFStream_APRD/gsplat/compression/h007_clean_runtime.py	2026-08-03 16:58:29
++++ b/GIFStream_APRD/gsplat/compression/h007_clean_runtime.py	2026-07-26 00:28:38
+@@ -10,7 +10,6 @@
+ import torch
+ from torch import Tensor
+ 
+-from gsplat.compression.ap_gifstream import canonical_voxel_ids
+ from gsplat.compression.h007_path_contract import deterministic_knn_indices
+ from gsplat.compression.h007_sequence_container import (
+     expected_gifstream_nets_keys,
+@@ -171,39 +170,20 @@
+     }
+ 
+ 
+-def _knn_indices(
+-    anchors: Tensor,
+-    count: int,
+-    *,
+-    canonical_ids: Optional[Tensor] = None,
+-) -> Tensor:
++def _knn_indices(anchors: Tensor, count: int) -> Tensor:
+     if count <= 0 or anchors.shape[0] <= count:
+         raise ValueError("counted KNN request exceeds decoded anchor population")
+-    return deterministic_knn_indices(
+-        anchors, int(count), canonical_ids=canonical_ids
+-    )
++    return deterministic_knn_indices(anchors, int(count))
+ 
+ 
+ def counted_knn_indices(
+-    splats: Mapping[str, Tensor],
+-    config: Mapping[str, Any],
+-    *,
+-    canonical_ids: Optional[Tensor] = None,
++    splats: Mapping[str, Tensor], config: Mapping[str, Any]
+ ) -> Optional[Tensor]:
+     """Build the deterministic counted KNN set once for a render/evaluation run."""
+ 
+     if not bool(config["knn"]):
+         return None
+-    ids = (
+-        canonical_voxel_ids(splats["anchors"], float(config["voxel_size"]))
+-        if canonical_ids is None
+-        else canonical_ids
+-    )
+-    return _knn_indices(
+-        splats["anchors"],
+-        int(config["n_knn"]),
+-        canonical_ids=ids,
+-    )
++    return _knn_indices(splats["anchors"], int(config["n_knn"]))
+ 
+ 
+ def _quaternion_to_rotation_matrix(quaternion: Tensor) -> Tensor:
+@@ -670,7 +650,6 @@
+     camera_arrays: Mapping[str, np.ndarray],
+     warmup_renders: int,
+     timed_renders: int,
+-    knn_indices: Optional[Tensor] = None,
+ ) -> Dict[str, Any]:
+     if warmup_renders <= 0 or timed_renders <= 0:
+         raise ValueError("clean-process warm/timed render counts must be positive")
+@@ -700,18 +679,11 @@
+     intrinsic = torch.from_numpy(
+         np.asarray(camera_arrays["intrinsics"][meta_index], dtype=np.float32)
+     ).to(device)[None]
+-    if bool(config["knn"]):
+-        if knn_indices is None:
+-            knn_indices = counted_knn_indices(splats, config)
+-        if (
+-            knn_indices.dtype != torch.int64
+-            or knn_indices.shape
+-            != (anchor_count, int(config["n_knn"]))
+-        ):
+-            raise ValueError("counted render KNN graph has an invalid contract")
+-        knn_indices = knn_indices.to(device=device)
+-    elif knn_indices is not None:
+-        raise ValueError("non-KNN counted render unexpectedly received a graph")
++    knn_indices = (
++        _knn_indices(splats["anchors"], int(config["n_knn"]))
++        if bool(config["knn"])
++        else None
++    )
+ 
+     last_render = last_alpha = None
+     shape_audit: Dict[str, int] = {}
+
+--- a/GIFStream_APRD/gsplat/compression/h007_path_contract.py	2026-08-03 16:58:29
++++ b/GIFStream_APRD/gsplat/compression/h007_path_contract.py	2026-07-26 00:28:38
+@@ -81,11 +81,7 @@
+         if int(torch.unique(canonical_ids, dim=0).shape[0]) != row_count:
+             raise ValueError("canonical KNN identities are not unique")
+         identity = canonical_ids.detach().cpu().numpy().astype(np.int64, copy=False)
+-        # Integer voxel identities are also the distance authority.  A uniform
+-        # voxel scale preserves every distance ordering, while avoiding a
+-        # float32 ULP/tie disagreement between pre-codec anchors and the
+-        # decoder's exact ``canonical_id * voxel_size`` reconstruction.
+-        points64 = identity.astype(np.float64, copy=False)
++        points64 = anchors.detach().to(torch.float64).cpu().numpy()
+ 
+     order = np.lexsort((identity[:, 2], identity[:, 1], identity[:, 0]))
+     sorted_points = points64[order]
+@@ -354,27 +350,17 @@
+     if not math.isfinite(activation) or activation < 0.1 or activation > 1.0:
+         raise ValueError("factor0 activation value must be in [0.1,1]")
+ 
+-    continuous = torch.where(
+-        activated[:, :3] < 0.1,
+-        torch.zeros_like(activated[:, :3]),
+-        activated[:, :3],
+-    )
+-    factor0 = torch.where(
++    output = activated.clone()
++    output[:, :3] = torch.where(output[:, :3] < 0.1, 0.0, output[:, :3])
++    output[:, 0] = torch.where(
+         active,
+         torch.maximum(
+-            continuous[:, 0],
+-            torch.full_like(continuous[:, 0], activation),
++            output[:, 0],
++            torch.full_like(output[:, 0], activation),
+         ),
+-        torch.zeros_like(continuous[:, 0]),
++        torch.zeros_like(output[:, 0]),
+     )
+-    output = torch.cat(
+-        [
+-            factor0[:, None],
+-            continuous[:, 1:3],
+-            real.to(dtype=activated.dtype)[:, None],
+-        ],
+-        dim=1,
+-    )
++    output[:, 3] = real.to(dtype=output.dtype)
+     if not torch.equal(output[:, 0] > 0, active):
+         raise AssertionError("factor0 reconstruction disagrees with active mask")
+     if not torch.equal(output[:, 3] > 0, real):
+
+--- a/GIFStream_APRD/gsplat/compression/h007_sequence_container.py	2026-08-03 16:58:29
++++ b/GIFStream_APRD/gsplat/compression/h007_sequence_container.py	2026-07-26 00:28:38
+@@ -2491,18 +2491,6 @@
+             _finite_number(family_row["multiplier"], f"AP {family} factor multiplier", positive=True)
+             _nonnegative_int(family_row["bytes"], f"AP {family} factor bytes")
+             _require_sha256(family_row["sha256"], f"AP {family} factor SHA-256")
+-            if int(family_row["rows"]) == 0:
+-                if (
+-                    int(family_row["bytes"]) != 0
+-                    or family_row["sha256"] != sha256_bytes(b"")
+-                ):
+-                    raise ValueError(
+-                        f"empty AP {family} factor family binding is invalid"
+-                    )
+-            elif int(family_row["bytes"]) <= 0:
+-                raise ValueError(
+-                    f"nonempty AP {family} factor family lacks a payload"
+-                )
+             expected_path = f"factors_{family}.bin"
+             if family_row["path"] != expected_path:
+                 raise ValueError(f"AP {family} factor stream path is noncanonical")
+@@ -3075,12 +3063,6 @@
+         ap_meta = meta["__ap__"]
+         if ap_meta.get("runtime_provenance") != runtime_provenance:
+             raise ValueError("AP codec metadata runtime provenance differs from the GOP")
+-        if int(ap_meta["path_contract"]["knn_count"]) != int(
+-            config["n_knn"]
+-        ):
+-            raise ValueError(
+-                "AP path-contract KNN count differs from decoder config"
+-            )
+         for key in (
+             "mask",
+             "path_input_mask",
+@@ -3113,24 +3095,6 @@
+                 _identity_correction_payload_contract(
+                     sidecar_payload, record, "AP identity corrections"
+                 )
+-        if method in QUANTIZED_AP_VARIANTS:
+-            for family in ("path", "bg"):
+-                factor_record = meta["factors"]["families"][family]
+-                if int(factor_record["rows"]) == 0:
+-                    if int(factor_record["bytes"]) != 0:
+-                        raise ValueError(
+-                            f"empty AP {family} factor family has counted bytes"
+-                        )
+-                    continue
+-                factor_payload = handle.read(factor_record["path"])
+-                if (
+-                    len(factor_payload) != int(factor_record["bytes"])
+-                    or sha256_bytes(factor_payload)
+-                    != factor_record["sha256"]
+-                ):
+-                    raise ValueError(
+-                        f"AP {family} factor metadata/stream binding mismatch"
+-                    )
+     payload_manifest_payload = handle.read("gifstream_payload_manifest.json")
+     payload_manifest = _strict_canonical_json(
+         payload_manifest_payload, "counted GIFStream payload manifest"
+
+--- a/GIFStream_APRD/gsplat/compression_simulation/simulation.py	2026-08-03 16:58:29
++++ b/GIFStream_APRD/gsplat/compression_simulation/simulation.py	2026-07-26 00:28:38
+@@ -677,39 +677,19 @@
+     @staticmethod
+     def _apply_factor_mask(
+         factors: Tensor, column: int, target: Tensor, activation_value: float
+-    ) -> Tensor:
+-        if factors.ndim != 2 or column < 0 or column >= factors.shape[1]:
+-            raise ValueError("factor tensor/column is malformed")
+-        target = target.to(device=factors.device, dtype=torch.bool)
+-        if target.shape != (factors.shape[0],):
+-            raise ValueError("factor target mask has an invalid shape")
++    ) -> None:
+         current = factors[:, column] > 0
++        promoted = target & ~current
++        demoted = ~target & current
+         if not torch.isfinite(torch.tensor(activation_value)) or activation_value <= 0:
+             raise ValueError(f"invalid frozen activation value for factor column {column}")
+-        replacement = torch.where(
+-            target,
+-            torch.where(
+-                current,
+-                factors[:, column],
+-                torch.full_like(factors[:, column], float(activation_value)),
+-            ),
+-            torch.zeros_like(factors[:, column]),
+-        )
+-        output = torch.cat(
+-            [
+-                factors[:, :column],
+-                replacement[:, None],
+-                factors[:, column + 1 :],
+-            ],
+-            dim=1,
+-        )
+-        if not torch.equal(output[:, column] > 0, target):
++        if promoted.any():
++            factors[promoted, column] = float(activation_value)
++        factors[demoted, column] = 0.0
++        if not torch.equal(factors[:, column] > 0, target):
+             raise AssertionError(f"factor column {column} does not match frozen AP mask")
+-        return output
+ 
+-    def _apply_ap_state(
+-        self, splats: Dict[str, Tensor], factors: Tensor, ap_state: Dict
+-    ) -> Tuple[Tensor, Dict]:
++    def _apply_ap_state(self, splats: Dict[str, Tensor], factors: Tensor, ap_state: Dict) -> Dict:
+         spec = variant_spec(str(ap_state["variant"]))
+         ids = canonical_voxel_ids(splats["anchors"], float(ap_state["voxel_size"]))
+         if not torch.equal(ids, ap_state["canonical_ids"].to(ids.device)):
+@@ -732,19 +712,19 @@
+             temporal_class & ~path_input_mask
+         ):
+             raise ValueError("AP path-input precision mask is not a retained closure")
+-        factors = self._apply_factor_mask(
++        self._apply_factor_mask(
+             factors,
+             3,
+             ap_retain,
+             float(ap_state["factor3_activation_value"]),
+         )
+-        factors = self._apply_factor_mask(
++        self._apply_factor_mask(
+             factors,
+             0,
+             ap_active,
+             float(ap_state["factor0_activation_value"]),
+         )
+-        return factors, {
++        return {
+             "class_mask": temporal_class,
+             "path_input_mask": path_input_mask,
+             "active_mask": ap_active,
+@@ -772,18 +752,6 @@
+             "factor0_activation_value": float(
+                 ap_state["factor0_activation_value"]
+             ),
+-            # Straight-through canonicalization: exact AP-v6 forward
+-            # coordinates with the original anchor gradient.  This mirrors the
+-            # encoder/decoder's canonical-id * voxel-size reconstruction.
+-            "canonical_anchors": splats["anchors"]
+-            + (
+-                ids.to(
+-                    device=splats["anchors"].device,
+-                    dtype=splats["anchors"].dtype,
+-                )
+-                * float(ap_state["voxel_size"])
+-                - splats["anchors"]
+-            ).detach(),
+         }
+ 
+     def simulate_compression(self, splats: Dict[str, Tensor], step: int, frame_idx: int = 0, c_channel: int = 0, ap_state: Optional[Dict] = None) -> Dict[str, Tensor]:
+@@ -816,9 +784,7 @@
+         self.last_ap_audit = None
+         ap_context = None
+         if ap_state is not None:
+-            factors, ap_context = self._apply_ap_state(
+-                splats, factors, ap_state
+-            )
++            ap_context = self._apply_ap_state(splats, factors, ap_state)
+             self.last_ap_audit = {
+                 key: value
+                 for key, value in ap_context.items()
+@@ -828,7 +794,6 @@
+                     "path_input_mask",
+                     "active_mask",
+                     "retain_mask",
+-                    "canonical_anchors",
+                 }
+             }
+             kwargs.update(
+@@ -866,9 +831,6 @@
+ 
+         new_splats["factors"] = factors
+         esti_bits_dict["factors"] = factor_bits
+-        if ap_context is not None:
+-            new_splats["anchors"] = ap_context["canonical_anchors"]
+-            esti_bits_dict["anchors"] = None
+         kwargs["factors"] = factors
+         kwargs["ap_active_mask"] = (
+             ap_context["active_mask"]
+@@ -878,8 +840,6 @@
+         for param_name in splats.keys():
+             if param_name == "factors" or (
+                 param_name == "anchor_features" and anchor_features_precomputed
+-            ) or (
+-                param_name == "anchors" and ap_context is not None
+             ):
+                 continue
+             # Check which params need to be simulate
+
+--- a/GIFStream_APRD/tests/test_ap_gifstream_core.py	2026-08-03 16:58:29
++++ b/GIFStream_APRD/tests/test_ap_gifstream_core.py	2026-07-26 00:28:38
+@@ -24,7 +24,6 @@
+ )
+ from gsplat.compression.h007_clean_runtime import (
+     build_decoder_modules,
+-    counted_knn_indices,
+     instantiate_counted_models,
+ )
+ from gsplat.compression import h007_runtime_provenance as provenance
+@@ -47,7 +46,6 @@
+     retained_knn_graph_sha256,
+     ste_row_quantize,
+ )
+-from gsplat.compression_simulation.simulation import GIFStreamCompressionSimulation
+ 
+ 
+ class _RoundEntropy:
+@@ -159,110 +157,6 @@
+             canonical_edges(ids[permutation], second),
+         )
+ 
+-    def test_canonical_knn_ignores_predecode_float_ulp_drift(self):
+-        ids = torch.tensor(
+-            [
+-                [0, 0, 0],
+-                [1, 0, 0],
+-                [-1, 0, 0],
+-                [0, 1, 0],
+-                [0, -1, 0],
+-            ],
+-            dtype=torch.int64,
+-        )
+-        decoded = ids.to(torch.float32) * 0.1
+-        predecode = decoded.clone()
+-        predecode[:, 0] += torch.tensor(
+-            [0.0, 2e-8, -2e-8, 1e-8, -1e-8], dtype=torch.float32
+-        )
+-        expected = deterministic_knn_indices(
+-            decoded, 2, canonical_ids=ids
+-        )
+-        actual = deterministic_knn_indices(
+-            predecode, 2, canonical_ids=ids
+-        )
+-        self.assertTrue(torch.equal(actual, expected))
+-
+-    def test_counted_runtime_knn_uses_canonical_distance_authority(self):
+-        ids = torch.tensor(
+-            [
+-                [0, 0, 0],
+-                [1, 0, 0],
+-                [-1, 0, 0],
+-                [0, 1, 0],
+-                [0, -1, 0],
+-            ],
+-            dtype=torch.int64,
+-        )
+-        decoded = ids.to(torch.float32) * 0.1
+-        predecode = decoded.clone()
+-        predecode[:, 0] += torch.tensor(
+-            [0.0, 2e-8, -2e-8, 1e-8, -1e-8], dtype=torch.float32
+-        )
+-        config = {"knn": True, "n_knn": 2, "voxel_size": 0.1}
+-        expected = counted_knn_indices({"anchors": decoded}, config)
+-        actual = counted_knn_indices({"anchors": predecode}, config)
+-        self.assertTrue(torch.equal(actual, expected))
+-
+-    def test_ap_simulation_uses_exact_canonical_anchor_forward_with_gradient(self):
+-        ids = torch.tensor(
+-            [
+-                [0, 0, 0],
+-                [1, 0, 0],
+-                [-1, 0, 0],
+-                [0, 1, 0],
+-                [0, -1, 0],
+-            ],
+-            dtype=torch.int64,
+-        )
+-        anchors = ids.to(torch.float32) * 0.1
+-        anchors[:, 0] += torch.tensor(
+-            [0.0, 2e-8, -2e-8, 1e-8, -1e-8], dtype=torch.float32
+-        )
+-        anchors.requires_grad_(True)
+-        all_rows = torch.ones(5, dtype=torch.bool)
+-        protected = torch.tensor([True, False, False, False, False])
+-        state = {
+-            "variant": "path-swap",
+-            "voxel_size": 0.1,
+-            "canonical_ids": ids,
+-            "ap_retain_mask": all_rows,
+-            "ap_active_mask": all_rows,
+-            "ap_class_mask": protected,
+-            "ap_path_input_mask": all_rows,
+-            "path_contract_schema": "h007.ap_gifstream.path_contract.v1",
+-            "factor3_activation_value": 0.5,
+-            "factor0_activation_value": 0.5,
+-            "official_retain_mask": all_rows,
+-            "official_active_mask": all_rows,
+-            "whole_allocation_audit": {},
+-            "temporal_allocation_audit": {},
+-            "q_ap_multiplier": 0.5,
+-            "q_bg_multiplier": 1.25,
+-        }
+-        simulator = object.__new__(GIFStreamCompressionSimulation)
+-        factor_input = torch.ones(
+-            (5, 4), dtype=torch.float32, requires_grad=True
+-        )
+-        masked_factors, context = simulator._apply_ap_state(
+-            {"anchors": anchors},
+-            factor_input,
+-            state,
+-        )
+-        expected = ids.to(torch.float32) * 0.1
+-        self.assertTrue(torch.equal(context["canonical_anchors"], expected))
+-        (
+-            context["canonical_anchors"].sum()
+-            + masked_factors[:, 1:3].sum()
+-        ).backward()
+-        self.assertTrue(torch.equal(anchors.grad, torch.ones_like(anchors)))
+-        self.assertTrue(
+-            torch.equal(
+-                factor_input.grad[:, 1:3],
+-                torch.ones_like(factor_input[:, 1:3]),
+-            )
+-        )
+-
+     def test_path_input_closure_and_codec_graph_exclude_dropped_rows(self):
+         anchors = torch.tensor(
+             [[float(index), 0.0, 0.0] for index in range(7)],
+@@ -495,7 +389,6 @@
+                         "8" * 64,
+                         "9" * 64,
+                         "a" * 64,
+-                        "b" * 64,
+                     ]
+                 ),
+             )
+@@ -697,10 +590,6 @@
+         factors = torch.zeros((4, 4))
+         factors[pre_real, 3] = 1.0
+         factors[pre_active, 0] = 1.0
+-        raw_factors = torch.tensor(
+-            [[0.1, 0.2, 0.3, 0.4], [0.5, 0.6, 0.7, 0.8]]
+-        )
+-        padded_raw_factors = torch.cat([raw_factors, torch.zeros((2, 4))])
+         kwargs = {
+             "official_retain_mask": torch.tensor([True, True, False, False]),
+             "official_active_mask": torch.tensor([True, False, False, False]),
+@@ -710,18 +599,13 @@
+             "source_estimated_bytes": source_bytes,
+             "pre_sort_retained_ids": ids,
+             "pre_sort_estimated_bytes": retained_bytes,
+-            "pre_sort_path_input_mask": pre_class[:2],
+-            "pre_sort_encoded_factors": factors[:2],
+-            "pre_sort_raw_factor_logits": raw_factors,
+             "sort_indices": permutation,
+             "encoded_ids": pre_ids[permutation],
+             "encoded_estimated_bytes": pre_bytes[permutation],
+             "encoded_factors": factors[permutation],
+-            "encoded_raw_factor_logits": padded_raw_factors[permutation],
+             "real_mask": pre_real[permutation],
+             "padding_mask": ~pre_real[permutation],
+             "ap_class_mask": pre_class[permutation],
+-            "ap_path_input_mask": pre_class[permutation],
+         }
+         audit = recompute_sorted_codec_invariants(**kwargs)
+         self.assertEqual(audit["whole_promoted_count"], audit["whole_demoted_count"])
+@@ -731,16 +615,6 @@
+             ("encoded_ids", pre_ids, "canonical IDs"),
+             ("encoded_estimated_bytes", pre_bytes, "estimated-byte rows"),
+             ("real_mask", pre_real, "real/padding mask"),
+-            (
+-                "encoded_raw_factor_logits",
+-                padded_raw_factors,
+-                "raw factor rows",
+-            ),
+-            (
+-                "ap_path_input_mask",
+-                pre_class,
+-                "path-input rows",
+-            ),
+         ):
+             corrupted = dict(kwargs)
+             corrupted[field] = bad
+
+--- a/GIFStream_APRD/tests/test_h007_certification_stdlib.py	2026-08-03 16:58:29
++++ b/GIFStream_APRD/tests/test_h007_certification_stdlib.py	2026-07-26 00:28:38
+@@ -324,44 +324,6 @@
+         self.assertLess(entropy, post_backward)
+         self.assertLess(post_backward, save_call)
+ 
+-    def test_checkpoint_only_ap_producer_reapplies_frozen_simulation_state(self):
+-        trainer = MODULE_PATH.parents[2] / "examples/simple_trainer_GIFStream.py"
+-        source = trainer.read_text(encoding="utf-8")
+-        loader = source[
+-            source.index("    def load_entropy_model_from_ckpt(") :
+-            source.index("    def load_models_from_compressed_dir(")
+-        ]
+-        self.assertIn("ap_state=(", loader)
+-        self.assertIn('self.cfg.ap_variant != "official"', loader)
+-        eval_only = source[
+-            source.index("            # run eval only") :
+-            source.index("        else:", source.index("            # run eval only"))
+-        ]
+-        self.assertLess(
+-            eval_only.index("runner.restore_ap_training_state("),
+-            eval_only.index("runner.load_entropy_model_from_ckpt("),
+-        )
+-        freeze = source[
+-            source.index("    def freeze_ap_reference_state(") :
+-            source.index("    def compute_ap_path_loss(")
+-        ]
+-        self.assertIn("canonical_ids=ids", freeze)
+-        self.assertIn("knn_indices=reference_knn", freeze)
+-        compression_eval = source[
+-            source.index("        # evaluate compression") :
+-            source.index("        # Render the actual archive reconstruction.")
+-        ]
+-        self.assertIn("decoded_knn_indices", compression_eval)
+-        self.assertNotIn(
+-            'find_k_neighbors(self.splats["anchors"], self.cfg.n_knn)',
+-            source,
+-        )
+-        self.assertNotIn(
+-            'find_k_neighbors(runner.splats["anchors"], cfg.n_knn)',
+-            source,
+-        )
+-        self.assertGreaterEqual(source.count("canonical_ids=canonical_voxel_ids("), 5)
+-
+     def test_exclusive_write_does_not_follow_dangling_symlink(self):
+         with tempfile.TemporaryDirectory() as temporary:
+             root = Path(temporary).resolve()

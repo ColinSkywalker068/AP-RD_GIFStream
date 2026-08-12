@@ -1,0 +1,3908 @@
+diff --git a/examples/h007_clean_decode_gifstream.py b/examples/h007_clean_decode_gifstream.py
+index fc64ae8..3f2e8e0 100644
+--- a/examples/h007_clean_decode_gifstream.py
++++ b/examples/h007_clean_decode_gifstream.py
+@@ -247,8 +247,8 @@ def clean_decode(
+         repo_root,
+         provenance_manifest_sha256,
+     )
+-    if len(runtime_provenance.get("patch_sha256", [])) != 8:
+-        raise ValueError("clean decoder is not bound to the registered eight-stage patch chain")
++    if len(runtime_provenance.get("patch_sha256", [])) != 9:
++        raise ValueError("clean decoder is not bound to the registered nine-stage patch chain")
+     counted_manifest = container / "preregistered_patch_chain_manifest.json"
+     external_payload = provenance_manifest.resolve().read_bytes()
+     if counted_manifest.read_bytes() != external_payload:
+@@ -334,7 +334,7 @@ def clean_decode(
+         if not receipt_path.is_file():
+             raise ValueError("AP container lacks its counted training receipt")
+         receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+-        if receipt.get("schema") != "h007.ap_training_receipt.v1" or receipt.get(
++        if receipt.get("schema") != "h007.ap_training_receipt.v2" or receipt.get(
+             "variant"
+         ) != config["variant"]:
+             raise ValueError("counted AP training receipt is incompatible")
+@@ -347,6 +347,13 @@ def clean_decode(
+             raise ValueError("counted AP receipt lacks entropy-estimator freeze evidence")
+         if receipt.get("factor_membership_columns_frozen") != [0, 3]:
+             raise ValueError("counted AP receipt lacks factor-membership freeze evidence")
++        if (
++            receipt.get("path_contract_schema")
++            != "h007.ap_gifstream.path_contract.v1"
++            or receipt.get("path_dependency_rule")
++            != "protected-plus-one-hop-retained-knn"
++        ):
++            raise ValueError("counted AP receipt lacks the Patch8 path contract")
+         if receipt.get("runtime_provenance") != runtime_provenance:
+             raise ValueError("counted AP receipt runtime provenance mismatch")
+         if spec.action_loss and (
+@@ -358,6 +365,14 @@ def clean_decode(
+         if (
+             receipt.get("score_sha256")
+             != codec_meta["__ap__"]["score"]["score_artifact_sha256"]
++            or receipt.get("path_contract_schema")
++            != codec_meta["__ap__"]["path_contract"]["schema"]
++            or int(receipt.get("path_knn_count", -1))
++            != int(codec_meta["__ap__"]["path_contract"]["knn_count"])
++            or receipt.get("path_knn_graph_sha256")
++            != codec_meta["__ap__"]["path_contract"][
++                "retained_knn_graph_sha256"
++            ]
+         ):
+             raise ValueError("AP receipt and counted score artifact disagree")
+ 
+@@ -448,6 +463,7 @@ def clean_decode(
+             else None,
+             "provenance_manifest_sha256": provenance_manifest_sha256,
+             "repo_root": str(repo_root),
++            "n_knn": int(config["n_knn"]),
+         }
+     )
+     splats = codec.decompress(container.as_posix(), simulation.entropy_models, target_device)
+@@ -478,9 +494,12 @@ def clean_decode(
+         raise ValueError("decoded temporal tensor shape disagrees with configuration")
+     decoded_ids_path = None
+     decoded_ids_sha256 = None
++    decoded_knn_indices = None
+     if receipt is not None:
+         if codec.decoded_canonical_ids is None:
+             raise ValueError("AP decoder did not restore counted canonical identities")
++        if codec.decoded_knn_indices is None:
++            raise ValueError("AP decoder did not restore the counted KNN graph")
+         decoded_ids = codec.decoded_canonical_ids.detach().cpu()
+         _validate_counted_retained_identity(
+             decoded_ids, splats["anchors"].shape[0]
+@@ -492,6 +511,7 @@ def clean_decode(
+             allow_pickle=False,
+         )
+         decoded_ids_sha256 = _sha256(decoded_ids_path)
++        decoded_knn_indices = codec.decoded_knn_indices.to(device=render_device)
+ 
+     clean_render = counted_camera_render_benchmark(
+         splats,
+@@ -501,6 +521,7 @@ def clean_decode(
+         camera_arrays,
+         int(config["warmup_renders"] if warmup_renders is None else warmup_renders),
+         int(config["timed_renders"] if timed_renders is None else timed_renders),
++        knn_indices=decoded_knn_indices,
+     )
+ 
+     decoded_path = output_dir / "decoded_splats.pt"
+diff --git a/examples/simple_trainer_GIFStream.py b/examples/simple_trainer_GIFStream.py
+index 62d99ec..f599c6d 100644
+--- a/examples/simple_trainer_GIFStream.py
++++ b/examples/simple_trainer_GIFStream.py
+@@ -49,6 +49,17 @@ from gsplat.compression.ap_gifstream import (
+     variant_spec,
+ )
+ from gsplat.compression.h007_runtime_provenance import verify_runtime_provenance
++from gsplat.compression.h007_path_contract import (
++    ANCHOR_FEATURE_BACKGROUND_MULTIPLIER,
++    ANCHOR_FEATURE_PROTECTED_MULTIPLIER,
++    FACTOR_BACKGROUND_MULTIPLIER,
++    FACTOR_PROTECTED_MULTIPLIER,
++    PATH_CONTRACT_SCHEMA,
++    build_codec_knn_indices,
++    build_path_input_precision_mask,
++    deterministic_knn_indices,
++    retained_knn_graph_sha256,
++)
+ from gsplat.compression.h007_sequence_container import (
+     DECODER_CONFIG_SCHEMA,
+     FROZEN_RATE_LAMBDAS,
+@@ -766,6 +777,7 @@ class Runner:
+                         "random_seed": cfg.ap_random_seed,
+                         "q_ap_multiplier": cfg.ap_q_ap_multiplier,
+                         "q_bg_multiplier": cfg.ap_q_bg_multiplier,
++                        "n_knn": int(cfg.n_knn),
+                         "compression_seed": cfg.ap_compression_seed,
+                         "provenance_manifest_path": cfg.ap_provenance_manifest,
+                         "provenance_manifest_sha256": cfg.ap_provenance_manifest_sha256,
+@@ -800,6 +812,8 @@ class Runner:
+                 selected_key = min((k for k, v in cfg.entropy_steps.items() if v > 0), key=lambda k: cfg.entropy_steps[k])
+                 self.entropy_min_step = cfg.entropy_steps[selected_key]
+         if cfg.ap_variant != "official":
++            if not cfg.knn:
++                raise ValueError("Patch8 AP path contract requires KNN decoding")
+             last_topology_boundary = max(
+                 int(cfg.strategy.refine_stop_iter), int(2 * cfg.max_steps / 3)
+             )
+@@ -815,6 +829,7 @@ class Runner:
+         self.ap_training_receipt = None
+         self.ap_loss_applications = 0
+         self.ap_loss_steps: List[int] = []
++        self.ap_codec_knn_indices = None
+         self._ap_factor_gradient_hook = None
+         self._ap_edit_cache_signature = None
+         self._ap_edit_anchor_mask = None
+@@ -887,7 +902,10 @@ class Runner:
+         self.splats["factors"].data[:,1] = grads_norm
+ 
+     def decode_persistent_anchor_paths(
+-        self, splats: Dict[str, Tensor], factors_are_logits: bool
++        self,
++        splats: Dict[str, Tensor],
++        factors_are_logits: bool,
++        knn_indices: Optional[Tensor] = None,
+     ) -> Tensor:
+         """Decode view-independent persistent anchor centers for all GOP frames."""
+         anchors = splats["anchors"]
+@@ -904,7 +922,19 @@ class Runner:
+         ):
+             raise ValueError("persistent path decoder received malformed splats")
+         if self.cfg.knn:
+-            _, path_indices = find_k_neighbors(anchors, self.cfg.n_knn)
++            path_indices = (
++                deterministic_knn_indices(
++                    anchors,
++                    int(self.cfg.n_knn),
++                    canonical_ids=canonical_voxel_ids(
++                        anchors, self.cfg.voxel_size
++                    ),
++                )
++                if knn_indices is None
++                else knn_indices
++            )
++            if path_indices.shape != (anchors.shape[0], int(self.cfg.n_knn)):
++                raise ValueError("persistent path KNN contract has an invalid shape")
+             flat_indices = path_indices.reshape(-1)
+             knn_features = features[flat_indices].reshape(
+                 -1, self.cfg.n_knn, features.shape[-1]
+@@ -959,8 +989,15 @@ class Runner:
+             torch.cuda.synchronize()
+         freeze_start = time.perf_counter()
+         ids = canonical_voxel_ids(self.splats["anchors"], self.cfg.voxel_size)
++        reference_knn = deterministic_knn_indices(
++            self.splats["anchors"],
++            int(self.cfg.n_knn),
++            canonical_ids=ids,
++        )
+         reference_paths = self.decode_persistent_anchor_paths(
+-            self.splats, factors_are_logits=True
++            self.splats,
++            factors_are_logits=True,
++            knn_indices=reference_knn,
+         ).detach()
+         path_score = torch.linalg.vector_norm(
+             reference_paths[:, 1:] - reference_paths[:, :-1], dim=-1
+@@ -1036,6 +1073,30 @@ class Runner:
+             raise AssertionError("frozen whole and temporal AP classes disagree")
+         if torch.any(ap_active & ~ap_retain):
+             raise AssertionError("frozen temporal allocation escaped whole-retain mask")
++        path_input_mask, retained_knn = build_path_input_precision_mask(
++            self.splats["anchors"],
++            ap_class,
++            ap_retain,
++            int(self.cfg.n_knn),
++            canonical_ids=ids,
++        )
++        (
++            self.ap_codec_knn_indices,
++            retained_rows,
++            codec_retained_knn,
++        ) = build_codec_knn_indices(
++            self.splats["anchors"],
++            ap_retain,
++            int(self.cfg.n_knn),
++            canonical_ids=ids,
++        )
++        if not torch.equal(retained_knn, codec_retained_knn):
++            raise AssertionError("path closure and codec KNN graph disagree")
++        path_knn_graph_sha256 = retained_knn_graph_sha256(
++            ids[retained_rows], retained_knn
++        )
++        if torch.any(ap_class & ~ap_active):
++            raise AssertionError("protected AP class contains a temporally inactive row")
+         positive0 = quantized_factors[quantized_factors[:, 0] > 0, 0]
+         positive3 = quantized_factors[quantized_factors[:, 3] > 0, 3]
+         if positive0.numel() == 0 or positive3.numel() == 0:
+@@ -1044,7 +1105,7 @@ class Runner:
+         factor3_value = float(positive3.min().item())
+ 
+         self.ap_state = {
+-            "schema": "h007.ap_training_state.v1",
++            "schema": "h007.ap_training_state.v2",
+             "scene": os.path.basename(os.path.normpath(self.cfg.data_dir)),
+             "variant": self.cfg.ap_variant,
+             "voxel_size": float(self.cfg.voxel_size),
+@@ -1061,6 +1122,9 @@ class Runner:
+             "ap_retain_mask": ap_retain.detach(),
+             "ap_active_mask": ap_active.detach(),
+             "ap_class_mask": ap_class.detach(),
++            "ap_path_input_mask": path_input_mask.detach(),
++            "path_contract_schema": PATH_CONTRACT_SCHEMA,
++            "path_knn_graph_sha256": path_knn_graph_sha256,
+             "factor0_activation_value": factor0_value,
+             "factor3_activation_value": factor3_value,
+             "whole_allocation_audit": whole_audit,
+@@ -1174,17 +1238,32 @@ class Runner:
+     def compute_ap_path_loss(self) -> Tensor:
+         if self.ap_state is None:
+             raise ValueError("AP path loss requested before score freeze")
++        if self.ap_codec_knn_indices is None:
++            raise ValueError("AP codec KNN graph is unavailable")
++        reference_knn = deterministic_knn_indices(
++            self.splats["anchors"],
++            int(self.cfg.n_knn),
++            canonical_ids=self.ap_state["canonical_ids"].to(
++                self.splats["anchors"].device
++            ),
++        )
+         decoded_paths = self.decode_persistent_anchor_paths(
+-            self.comp_sim_splats, factors_are_logits=False
++            self.comp_sim_splats,
++            factors_are_logits=False,
++            knn_indices=self.ap_codec_knn_indices,
+         )
+-        # Compare against the current raw model at the same optimization step.
+-        # Only the action weights/universe are frozen at ap_freeze_step.
++        # Match the real codec: retained rows consume only retained KNN
++        # context, while the target remains the current uncompressed full-graph
++        # path on those same retained identities.
+         with torch.no_grad():
+             reference_paths = self.decode_persistent_anchor_paths(
+-                self.splats, factors_are_logits=True
++                self.splats,
++                factors_are_logits=True,
++                knn_indices=reference_knn,
+             ).detach()
+         weights = self.ap_state["path_score"].to(decoded_paths.device).clamp_min(0)
+         weights = weights * self.ap_state["eligible"].to(decoded_paths.device)
++        weights = weights * self.ap_state["ap_retain_mask"].to(decoded_paths.device)
+         if float(weights.sum().detach().item()) <= 0:
+             raise ValueError("AP path loss has zero reference action mass")
+         weights = weights / weights.sum()
+@@ -1201,9 +1280,9 @@ class Runner:
+             raise ValueError("AP checkpoint is missing frozen state or training receipt")
+         state = checkpoint["ap_state"]
+         receipt = checkpoint["ap_training_receipt"]
+-        if state.get("schema") != "h007.ap_training_state.v1":
++        if state.get("schema") != "h007.ap_training_state.v2":
+             raise ValueError("unsupported AP training-state schema")
+-        if receipt.get("schema") != "h007.ap_training_receipt.v1":
++        if receipt.get("schema") != "h007.ap_training_receipt.v2":
+             raise ValueError("unsupported AP training-receipt schema")
+         if state["variant"] != self.cfg.ap_variant or receipt["variant"] != self.cfg.ap_variant:
+             raise ValueError("checkpoint AP variant differs from requested variant")
+@@ -1220,6 +1299,32 @@ class Runner:
+         ids = canonical_voxel_ids(self.splats["anchors"], self.cfg.voxel_size)
+         if not torch.equal(ids, restored["canonical_ids"]):
+             raise ValueError("restored AP state no longer matches checkpoint anchors")
++        if restored.get("path_contract_schema") != PATH_CONTRACT_SCHEMA:
++            raise ValueError("restored AP state lacks the Patch8 path contract")
++        expected_path_mask, retained_knn = build_path_input_precision_mask(
++            self.splats["anchors"],
++            restored["ap_class_mask"],
++            restored["ap_retain_mask"],
++            int(self.cfg.n_knn),
++            canonical_ids=ids,
++        )
++        if not torch.equal(expected_path_mask, restored["ap_path_input_mask"]):
++            raise ValueError("restored AP path-input closure is not reproducible")
++        (
++            self.ap_codec_knn_indices,
++            retained_rows,
++            codec_retained_knn,
++        ) = build_codec_knn_indices(
++            self.splats["anchors"],
++            restored["ap_retain_mask"],
++            int(self.cfg.n_knn),
++            canonical_ids=ids,
++        )
++        if not torch.equal(retained_knn, codec_retained_knn):
++            raise ValueError("restored path closure and codec KNN graph disagree")
++        graph_sha256 = retained_knn_graph_sha256(ids[retained_rows], retained_knn)
++        if restored.get("path_knn_graph_sha256") != graph_sha256:
++            raise ValueError("restored AP retained-KNN graph hash mismatch")
+         self.ap_state = restored
+         self.ap_training_receipt = receipt
+         self.ap_loss_applications = int(receipt["path_loss_applications"])
+@@ -1243,7 +1348,7 @@ class Runner:
+         receipt = dict(self.ap_training_receipt)
+         state = self.ap_state
+         spec = variant_spec(self.cfg.ap_variant)
+-        if receipt.get("schema") != "h007.ap_training_receipt.v1":
++        if receipt.get("schema") != "h007.ap_training_receipt.v2":
+             raise ValueError("unsupported AP training receipt")
+         if receipt.get("variant") != self.cfg.ap_variant or state.get(
+             "variant"
+@@ -1273,6 +1378,41 @@ class Runner:
+             "runtime_provenance"
+         ) != self.ap_runtime_provenance:
+             raise ValueError("AP runtime provenance changed before compression")
++        ids = canonical_voxel_ids(self.splats["anchors"], self.cfg.voxel_size)
++        (
++            self.ap_codec_knn_indices,
++            retained_rows,
++            retained_knn,
++        ) = build_codec_knn_indices(
++            self.splats["anchors"],
++            state["ap_retain_mask"],
++            int(self.cfg.n_knn),
++            canonical_ids=ids,
++        )
++        graph_sha256 = retained_knn_graph_sha256(
++            ids[retained_rows], retained_knn
++        )
++        if state.get("path_knn_graph_sha256") != graph_sha256:
++            raise ValueError("AP retained-KNN graph changed before compression")
++        expected_path_fields = {
++            "path_contract_schema": PATH_CONTRACT_SCHEMA,
++            "path_dependency_rule": "protected-plus-one-hop-retained-knn",
++            "path_knn_count": int(self.cfg.n_knn),
++            "path_knn_graph_sha256": graph_sha256,
++            "factor_protected_multiplier": FACTOR_PROTECTED_MULTIPLIER,
++            "factor_background_multiplier": FACTOR_BACKGROUND_MULTIPLIER,
++            "anchor_feature_protected_multiplier": (
++                ANCHOR_FEATURE_PROTECTED_MULTIPLIER
++            ),
++            "anchor_feature_background_multiplier": (
++                ANCHOR_FEATURE_BACKGROUND_MULTIPLIER
++            ),
++        }
++        for name, expected in expected_path_fields.items():
++            if receipt.get(name) != expected or state.get(
++                "path_contract_schema"
++            ) != PATH_CONTRACT_SCHEMA:
++                raise ValueError(f"AP path-contract receipt mismatch: {name}")
+         for name in (
+             "estimator_version",
+             "time_entropy_model_sha256",
+@@ -1314,7 +1454,7 @@ class Runner:
+             ) != float(self.cfg.ap_path_loss_lambda):
+                 raise ValueError("full AP variant path-loss hyperparameters changed")
+             if receipt.get("path_loss_reference") != (
+-                "current_raw_stop_gradient_with_frozen_action_weights"
++                "current_raw_full_graph_vs_simulated_retained_graph_on_retained_rows"
+             ):
+                 raise ValueError("full AP variant path-loss reference rule is unsupported")
+             first = (
+@@ -1341,6 +1481,7 @@ class Runner:
+             "ap_retain_mask",
+             "ap_active_mask",
+             "ap_class_mask",
++            "ap_path_input_mask",
+             "estimated_time_bytes",
+         ):
+             if int(state[key].shape[0]) != n:
+@@ -1547,7 +1688,13 @@ class Runner:
+             selected_factors = factors[visible_anchor_mask]
+             if self.cfg.knn:
+                 if self.indices is None or self.indices.shape[0] != self.splats["anchors"].shape[0]:
+-                    _, self.indices = find_k_neighbors(self.splats["anchors"], self.cfg.n_knn)
++                    _, self.indices = find_k_neighbors(
++                        self.splats["anchors"],
++                        self.cfg.n_knn,
++                        canonical_ids=canonical_voxel_ids(
++                            self.splats["anchors"], self.cfg.voxel_size
++                        ),
++                    )
+                 selected_indices = self.indices[visible_anchor_mask].reshape(-1)
+                 knn_features = self.splats["anchor_features"][selected_indices].reshape(-1,self.cfg.n_knn,self.cfg.anchor_feature_dim).mean(dim=1)
+                 knn_time_features = (
+@@ -1563,8 +1710,22 @@ class Runner:
+ 
+             if self.cfg.knn:
+                 if self.indices is None:
+-                    _, self.indices = find_k_neighbors(self.splats["anchors"], self.cfg.n_knn)
+-                selected_indices = self.indices[visible_anchor_mask].reshape(-1)
++                    _, self.indices = find_k_neighbors(
++                        self.splats["anchors"],
++                        self.cfg.n_knn,
++                        canonical_ids=canonical_voxel_ids(
++                            self.splats["anchors"], self.cfg.voxel_size
++                        ),
++                    )
++                if self.ap_state is not None:
++                    if self.ap_codec_knn_indices is None:
++                        raise ValueError(
++                            "AP compression simulation lacks the retained codec KNN graph"
++                        )
++                    knn_indices = self.ap_codec_knn_indices
++                else:
++                    knn_indices = self.indices
++                selected_indices = knn_indices[visible_anchor_mask].reshape(-1)
+                 knn_features = self.comp_sim_splats["anchor_features"][selected_indices].reshape(-1,self.cfg.n_knn,selected_features.shape[-1]).mean(dim=1)
+                 knn_time_features = (
+                     self.comp_sim_splats["time_features"][:,feat_start] * (
+@@ -1933,7 +2094,7 @@ class Runner:
+             }
+             data["ap_state"] = serializable_ap_state
+             self.ap_training_receipt = {
+-                "schema": "h007.ap_training_receipt.v1",
++                "schema": "h007.ap_training_receipt.v2",
+                 "scene": os.path.basename(os.path.normpath(cfg.data_dir)),
+                 "variant": cfg.ap_variant,
+                 "freeze_step": int(cfg.ap_freeze_step),
+@@ -1952,6 +2113,20 @@ class Runner:
+                 ),
+                 "time_entropy_model_frozen_after_freeze": True,
+                 "factor_membership_columns_frozen": [0, 3],
++                "path_contract_schema": PATH_CONTRACT_SCHEMA,
++                "path_dependency_rule": "protected-plus-one-hop-retained-knn",
++                "path_knn_count": int(cfg.n_knn),
++                "path_knn_graph_sha256": self.ap_state[
++                    "path_knn_graph_sha256"
++                ],
++                "factor_protected_multiplier": FACTOR_PROTECTED_MULTIPLIER,
++                "factor_background_multiplier": FACTOR_BACKGROUND_MULTIPLIER,
++                "anchor_feature_protected_multiplier": (
++                    ANCHOR_FEATURE_PROTECTED_MULTIPLIER
++                ),
++                "anchor_feature_background_multiplier": (
++                    ANCHOR_FEATURE_BACKGROUND_MULTIPLIER
++                ),
+                 "path_loss_required": variant_spec(cfg.ap_variant).action_loss,
+                 "path_loss_lambda": float(cfg.ap_path_loss_lambda),
+                 "path_loss_every": int(cfg.ap_path_loss_every),
+@@ -1959,7 +2134,9 @@ class Runner:
+                 "path_loss_steps": list(self.ap_loss_steps),
+                 "simulation_mask_rule": "quantized_factor3_gt0_and_factor0_gt0",
+                 "estimated_byte_rule": "exact_frozen_integer_subset_sum",
+-                "path_loss_reference": "current_raw_stop_gradient_with_frozen_action_weights",
++                "path_loss_reference": (
++                    "current_raw_full_graph_vs_simulated_retained_graph_on_retained_rows"
++                ),
+                 "runtime_provenance": dict(self.ap_runtime_provenance),
+             }
+             data["ap_training_receipt"] = self.ap_training_receipt
+@@ -2263,7 +2440,13 @@ class Runner:
+                     and step % self.cfg.strategy.refine_every == 0
+                     and self.cfg.knn
+                 ):
+-                    _, self.indices = find_k_neighbors(self.splats["anchors"], self.cfg.n_knn)
++                    _, self.indices = find_k_neighbors(
++                        self.splats["anchors"],
++                        self.cfg.n_knn,
++                        canonical_ids=canonical_voxel_ids(
++                            self.splats["anchors"], self.cfg.voxel_size
++                        ),
++                    )
+ 
+                 if save_after_update:
+                     self._save_training_checkpoint_after_update(step, global_tic)
+@@ -2578,8 +2761,8 @@ class Runner:
+         if self.ap_runtime_provenance is None:
+             raise ValueError("official/AP compression lacks runtime provenance")
+         patch_chain = list(self.ap_runtime_provenance["patch_sha256"])
+-        if len(patch_chain) != 8:
+-            raise ValueError("official/AP compression lacks the registered eight-stage runtime chain")
++        if len(patch_chain) != 9:
++            raise ValueError("official/AP compression lacks the registered nine-stage runtime chain")
+         decoder_config = {
+             "schema": DECODER_CONFIG_SCHEMA,
+             "codec_family": "GIFStream",
+@@ -2740,6 +2923,8 @@ class Runner:
+                 self.scaling,
+                 self.cfg.voxel_size,
+                 raw_time_features=self.splats["time_features"],
++                raw_anchor_features=self.splats["anchor_features"],
++                raw_factors=self.splats["factors"],
+             )
+             nets = {}
+             nets["decoders"] = self.decoders.state_dict()
+@@ -2806,7 +2991,27 @@ class Runner:
+         for k in splats_c.keys():
+             self.splats[k].data = splats_c[k].to(self.device)
+         if self.cfg.knn:
+-            _, self.indices = find_k_neighbors(self.splats["anchors"], self.cfg.n_knn)
++            if (
++                isinstance(
++                    self.compression_method, GIFStreamEnd2endCompression
++                )
++                and self.cfg.ap_variant != "official"
++            ):
++                if self.compression_method.decoded_knn_indices is None:
++                    raise ValueError(
++                        "AP-v6 decode did not expose its counted KNN graph"
++                    )
++                self.indices = self.compression_method.decoded_knn_indices.to(
++                    device=self.device
++                )
++            else:
++                _, self.indices = find_k_neighbors(
++                    self.splats["anchors"],
++                    self.cfg.n_knn,
++                    canonical_ids=canonical_voxel_ids(
++                        self.splats["anchors"], self.cfg.voxel_size
++                    ),
++                )
+         # Render the actual archive reconstruction. Re-running base-Q
+         # compression simulation here would erase q_ap < 1 precision and no
+         # longer evaluate the decoded container.
+@@ -2963,7 +3168,19 @@ class Runner:
+                     self.entropy_models[attr_name].load_state_dict(value)
+         self.compression_sim_method.scaling = ckpt["scaling"]
+         self.scaling = ckpt["scaling"]
+-        self.comp_sim_splats, self.esti_bits_dict = self.compression_sim_method.simulate_compression(self.splats, self.cfg.max_steps, 0, self.cfg.entropy_channel)
++        self.comp_sim_splats, self.esti_bits_dict = (
++            self.compression_sim_method.simulate_compression(
++                self.splats,
++                self.cfg.max_steps,
++                0,
++                self.cfg.entropy_channel,
++                ap_state=(
++                    self.ap_state
++                    if self.cfg.ap_variant != "official"
++                    else None
++                ),
++            )
++        )
+ 
+     def load_models_from_compressed_dir(self, compress_dir, entropy_model_type: str):
+         self.entropy_models = {}
+@@ -3058,7 +3275,13 @@ def main(local_rank: int, world_rank, world_size: int, cfg: Config):
+             if runner.cfg.compression_sim:
+                 runner.load_entropy_model_from_ckpt(ckpts[0], cfg.entropy_model_type)
+             if cfg.knn:
+-                _, runner.indices = find_k_neighbors(runner.splats["anchors"], cfg.n_knn)
++                _, runner.indices = find_k_neighbors(
++                    runner.splats["anchors"],
++                    cfg.n_knn,
++                    canonical_ids=canonical_voxel_ids(
++                        runner.splats["anchors"], cfg.voxel_size
++                    ),
++                )
+             runner.eval(step=step)
+             runner.render_traj(step=step)
+             if cfg.compression is not None:
+diff --git a/examples/utils.py b/examples/utils.py
+index a2b4daa..be44f97 100644
+--- a/examples/utils.py
++++ b/examples/utils.py
+@@ -9,6 +9,7 @@ import matplotlib.pyplot as plt
+ from matplotlib import colormaps
+ from plyfile import PlyData
+ from sklearn.neighbors import KDTree
++from gsplat.compression.h007_path_contract import deterministic_knn_indices
+ 
+ 
+ class CameraOptModule(torch.nn.Module):
+@@ -318,30 +319,26 @@ def load_ply(path: str) -> torch.nn.ParameterDict:
+     
+     return splats
+ 
+-def find_k_neighbors(input, k):
++def find_k_neighbors(input, k, *, canonical_ids=None):
+     """
+-    Find k nearest neighbors for each point in a point cloud. During training, randomly shuffle the order of points to simulate the effect of reordering during encoding.
++    Find the deterministic, row-order-invariant path-contract neighbors.
+ 
+     Args:
+-        points: point cloud data with shape (n, 3)
++        input: point cloud data with shape (n, 3)
+         k: int, number of nearest neighbors to find
++        canonical_ids: optional int64 voxel identities used as both distance
++            and tie authority
+ 
+     Returns:
+         distances: distances from each point to its k nearest neighbors
+         indices: indices of the k nearest neighbors for each point
+     """
+-    shuffled_indices = torch.randperm(
+-        input.shape[0], device=input.device
++    indices = deterministic_knn_indices(
++        input, int(k), canonical_ids=canonical_ids
+     )
+-    points = input[shuffled_indices].detach().cpu().numpy()
+-    q_points = input.detach().cpu().numpy()
+-    
+-    tree = KDTree(points)
+-    
+-    distances, indices = tree.query(q_points, k=k+1)
+-    indices = shuffled_indices[indices.squeeze().flatten()].reshape(indices.shape)
+-    
+-    return torch.tensor(distances[:, 1:],device=input.device,dtype=input.dtype), indices[:, 1:]
++    neighbors = input[indices]
++    distances = torch.linalg.vector_norm(input[:, None, :] - neighbors, dim=-1)
++    return distances.to(dtype=input.dtype), indices
+ 
+ from typing import Dict
+ import math
+diff --git a/gsplat/compression/ap_gifstream.py b/gsplat/compression/ap_gifstream.py
+index db8111f..80b19bb 100644
+--- a/gsplat/compression/ap_gifstream.py
++++ b/gsplat/compression/ap_gifstream.py
+@@ -24,7 +24,8 @@ from torch import Tensor
+ 
+ 
+ AP_SCORE_SCHEMA = "h007.ap_scores.v2"
+-AP_META_SCHEMA = "h007.ap_gifstream.codec.v5"
++AP_META_SCHEMA_V5 = "h007.ap_gifstream.codec.v5"
++AP_META_SCHEMA = "h007.ap_gifstream.codec.v6"
+ AP_IDENTITY_CORRECTION_SCHEMA = "h007.ap_identity_corrections.v1"
+ DETERMINISTIC_ZIP_EPOCH = (1980, 1, 1, 0, 0, 0)
+ 
+@@ -339,6 +340,11 @@ def load_aligned_score_artifact(
+         & ~frozen_allocation["ap_retain_mask"]
+     ):
+         raise ValueError("frozen AP active mask escapes AP retain mask")
++    if torch.any(
++        frozen_allocation["ap_class_mask"]
++        & ~frozen_allocation["ap_active_mask"]
++    ):
++        raise ValueError("frozen AP class contains a temporally inactive row")
+     if not torch.equal(
+         frozen_allocation["official_active_mask"],
+         frozen_allocation["official_retain_mask"]
+@@ -856,13 +862,18 @@ def recompute_sorted_codec_invariants(
+     source_estimated_bytes: Tensor,
+     pre_sort_retained_ids: Tensor,
+     pre_sort_estimated_bytes: Tensor,
++    pre_sort_path_input_mask: Tensor,
++    pre_sort_encoded_factors: Tensor,
++    pre_sort_raw_factor_logits: Tensor,
+     sort_indices: Tensor,
+     encoded_ids: Tensor,
+     encoded_estimated_bytes: Tensor,
+     encoded_factors: Tensor,
++    encoded_raw_factor_logits: Tensor,
+     real_mask: Tensor,
+     padding_mask: Tensor,
+     ap_class_mask: Tensor,
++    ap_path_input_mask: Tensor,
+ ) -> Dict[str, Any]:
+     """Recompute codec allocation after retention, padding and PLAS ordering."""
+ 
+@@ -872,6 +883,7 @@ def recompute_sorted_codec_invariants(
+         "real_mask": real_mask,
+         "padding_mask": padding_mask,
+         "ap_class_mask": ap_class_mask,
++        "ap_path_input_mask": ap_path_input_mask,
+         "sort_indices": sort_indices,
+     }
+     for name, value in one_dimensional.items():
+@@ -880,7 +892,7 @@ def recompute_sorted_codec_invariants(
+     if encoded_ids.shape != (encoded_count, 3) or encoded_factors.shape != (
+         encoded_count,
+         4,
+-    ):
++    ) or encoded_raw_factor_logits.shape != (encoded_count, 4):
+         raise ValueError("post-PLAS ID/factor shapes are malformed")
+     if not torch.equal(real_mask, ~padding_mask):
+         raise ValueError("explicit real/padding masks are not complements")
+@@ -891,7 +903,14 @@ def recompute_sorted_codec_invariants(
+         raise ValueError("PLAS permutation is not a complete encoded-row permutation")
+ 
+     pad = encoded_count - int(pre_sort_retained_ids.shape[0])
+-    if pad < 0 or pre_sort_estimated_bytes.shape != (pre_sort_retained_ids.shape[0],):
++    retained_count = int(pre_sort_retained_ids.shape[0])
++    if (
++        pad < 0
++        or pre_sort_estimated_bytes.shape != (retained_count,)
++        or pre_sort_path_input_mask.shape != (retained_count,)
++        or pre_sort_encoded_factors.shape != (retained_count, 4)
++        or pre_sort_raw_factor_logits.shape != (retained_count, 4)
++    ):
+         raise ValueError("pre-sort retained ID/estimated-byte shapes disagree")
+     sentinel = torch.zeros((pad, 3), dtype=torch.int64, device=encoded_ids.device)
+     if pad:
+@@ -905,12 +924,53 @@ def recompute_sorted_codec_invariants(
+         ],
+         dim=0,
+     )
++    expected_pre_sort_path = torch.cat(
++        [
++            pre_sort_path_input_mask,
++            torch.zeros(pad, dtype=torch.bool, device=real_mask.device),
++        ],
++        dim=0,
++    )
++    expected_pre_sort_factors = torch.cat(
++        [
++            pre_sort_encoded_factors,
++            torch.zeros(
++                (pad, 4),
++                dtype=pre_sort_encoded_factors.dtype,
++                device=pre_sort_encoded_factors.device,
++            ),
++        ],
++        dim=0,
++    )
++    expected_pre_sort_raw_factors = torch.cat(
++        [
++            pre_sort_raw_factor_logits,
++            torch.zeros(
++                (pad, 4),
++                dtype=pre_sort_raw_factor_logits.dtype,
++                device=pre_sort_raw_factor_logits.device,
++            ),
++        ],
++        dim=0,
++    )
+     if not torch.equal(encoded_ids, expected_pre_sort_ids[sort_indices]):
+         raise ValueError("canonical IDs were not transformed by the counted PLAS permutation")
+     if not torch.equal(
+         encoded_estimated_bytes, expected_pre_sort_bytes[sort_indices]
+     ):
+         raise ValueError("estimated-byte rows were not transformed by the counted PLAS permutation")
++    if not torch.equal(
++        ap_path_input_mask, expected_pre_sort_path[sort_indices]
++    ):
++        raise ValueError("path-input rows were not transformed by the counted PLAS permutation")
++    if not torch.equal(
++        encoded_factors, expected_pre_sort_factors[sort_indices]
++    ):
++        raise ValueError("activated factor rows were not transformed by the counted PLAS permutation")
++    if not torch.equal(
++        encoded_raw_factor_logits, expected_pre_sort_raw_factors[sort_indices]
++    ):
++        raise ValueError("raw factor rows were not transformed by the counted PLAS permutation")
+     expected_real = torch.arange(encoded_count, device=real_mask.device) < int(
+         pre_sort_retained_ids.shape[0]
+     )
+@@ -922,6 +982,12 @@ def recompute_sorted_codec_invariants(
+         raise ValueError("post-PLAS factor-3 whole mask differs from explicit real mask")
+     if torch.any(ap_class_mask & ~real_mask):
+         raise ValueError("post-PLAS AP class marks padding rows")
++    if torch.any(ap_class_mask & ~factor_active):
++        raise ValueError("post-PLAS AP class contains an inactive row")
++    if torch.any(ap_class_mask & ~ap_path_input_mask):
++        raise ValueError("post-PLAS path-input closure lost an AP class row")
++    if torch.any(ap_path_input_mask & ~real_mask):
++        raise ValueError("post-PLAS path-input closure includes padding")
+ 
+     whole_promoted = ap_retain_mask & ~official_retain_mask
+     whole_demoted = official_retain_mask & ~ap_retain_mask
+diff --git a/gsplat/compression/gifstream_end2end_compression.py b/gsplat/compression/gifstream_end2end_compression.py
+index df5fdd9..3c22e23 100644
+--- a/gsplat/compression/gifstream_end2end_compression.py
++++ b/gsplat/compression/gifstream_end2end_compression.py
+@@ -28,6 +28,19 @@ from gsplat.compression.ap_gifstream import (
+     write_identity_corrections,
+ )
+ from gsplat.compression.h007_runtime_provenance import verify_runtime_provenance
++from gsplat.compression.h007_path_contract import (
++    ANCHOR_FEATURE_BACKGROUND_MULTIPLIER,
++    ANCHOR_FEATURE_PROTECTED_MULTIPLIER,
++    FACTOR_BACKGROUND_MULTIPLIER,
++    FACTOR_PROTECTED_MULTIPLIER,
++    PATH_CONTRACT_SCHEMA,
++    build_path_input_precision_mask,
++    normalize_factor_semantics,
++    reconstruct_ap_factors,
++    retained_knn_graph_sha256,
++    deterministic_knn_indices,
++    ste_row_quantize,
++)
+ from gsplat.utils import inverse_log_transform, log_transform
+ import math
+ 
+@@ -114,6 +127,7 @@ class GIFStreamEnd2endCompression:
+     verbose: bool = True
+     ap_config: Optional[Dict[str, Any]] = None
+     decoded_canonical_ids: Optional[Tensor] = None
++    decoded_knn_indices: Optional[Tensor] = None
+ 
+     def _get_compress_fn(self, param_name: str) -> Callable:
+         compress_fn_map = {
+@@ -143,7 +157,19 @@ class GIFStreamEnd2endCompression:
+         else:
+             return _decompress_npz
+ 
+-    def compress(self, compress_dir: str, splats: Dict[str, Tensor], entropy_models: Dict[str, Module] = None, c_channel: int = 0, p_channel: int = 0, scaling = None, voxel_size = 0.01, raw_time_features: Optional[Tensor] = None) -> None:
++    def compress(
++        self,
++        compress_dir: str,
++        splats: Dict[str, Tensor],
++        entropy_models: Dict[str, Module] = None,
++        c_channel: int = 0,
++        p_channel: int = 0,
++        scaling = None,
++        voxel_size = 0.01,
++        raw_time_features: Optional[Tensor] = None,
++        raw_anchor_features: Optional[Tensor] = None,
++        raw_factors: Optional[Tensor] = None,
++    ) -> None:
+         """Run compression
+ 
+         Args:
+@@ -182,6 +208,7 @@ class GIFStreamEnd2endCompression:
+                 "repo_root",
+                 "runtime_provenance",
+                 "scene",
++                "n_knn",
+             }
+             missing = sorted(provenance_required - set(ap_cfg))
+             if missing:
+@@ -200,6 +227,21 @@ class GIFStreamEnd2endCompression:
+             # consume the official already-simulated tensor byte-for-byte.
+             if ap_enabled and ap_spec.quant:
+                 splats["time_features"] = raw_time_features.detach().clone()
++        raw_factor_logits = None
++        if ap_enabled:
++            if raw_factors is None:
++                raise ValueError("AP-v6 compression requires raw factor logits")
++            if raw_factors.shape != splats["factors"].shape:
++                raise ValueError("raw_factors shape mismatch")
++            raw_factor_logits = raw_factors.detach().clone()
++        if ap_enabled and ap_spec.quant:
++            if raw_anchor_features is None:
++                raise ValueError(
++                    "AP-v6 compression requires raw anchor features and raw factor logits"
++                )
++            if raw_anchor_features.shape != splats["anchor_features"].shape:
++                raise ValueError("raw_anchor_features shape mismatch")
++            splats["anchor_features"] = raw_anchor_features.detach().clone()
+         compression_seed = ap_cfg.get("compression_seed")
+         if ap_enabled and compression_seed is None:
+             raise ValueError("AP-GIFStream requires a frozen compression_seed")
+@@ -228,6 +270,14 @@ class GIFStreamEnd2endCompression:
+                 if float(ap_cfg.get(config_name, default)) != float(score_audit[frozen_name]):
+                     raise ValueError(f"codec {config_name} differs from frozen score artifact")
+             canonical_ids = canonical_voxel_ids(splats["anchors"], voxel_size)
++            # AP-v6 makes the counted voxel identity the coordinate authority
++            # in simulation, encoding, and decoding.  Canonicalize before
++            # pruning/PLAS so every downstream consumer sees the same base
++            # anchor coordinates, not a pre-codec float ULP variant.
++            splats["anchors"] = canonical_ids.to(
++                device=splats["anchors"].device,
++                dtype=splats["anchors"].dtype,
++            ) * float(voxel_size)
+             if tensor_mapping_sha256(
+                 entropy_models["time_features"].state_dict()
+             ) != score_audit["time_entropy_model_sha256"]:
+@@ -243,7 +293,7 @@ class GIFStreamEnd2endCompression:
+         # splats["anchors"] = log_transform(splats["anchors"])
+         splats["quats"] = F.normalize(splats["quats"], dim=-1)
+         pruning_mask = splats["factors"][:,-1] > 0
+-        ap_active = ap_class = None
++        ap_active = ap_class = ap_path_input = None
+         if ap_enabled:
+             current_retain = pruning_mask.clone()
+             current_active = current_retain & (splats["factors"][:, 0] > 0)
+@@ -265,6 +315,21 @@ class GIFStreamEnd2endCompression:
+                 ap_active,
+                 float(frozen_allocation["factor0_activation_value"]),
+             )
++            if torch.any(ap_class & ~ap_active):
++                raise ValueError("frozen protected class contains an inactive row")
++            ap_path_input, retained_knn = build_path_input_precision_mask(
++                splats["anchors"],
++                ap_class,
++                ap_retain,
++                int(ap_cfg["n_knn"]),
++                canonical_ids=canonical_ids,
++            )
++            retained_rows = torch.nonzero(
++                ap_retain, as_tuple=False
++            ).flatten()
++            path_knn_graph_sha256 = retained_knn_graph_sha256(
++                canonical_ids[retained_rows], retained_knn
++            )
+             allocation_audit = {
+                 "budget_source": "frozen_score_artifact",
+                 "official_retain_count": int(
+@@ -288,15 +353,21 @@ class GIFStreamEnd2endCompression:
+             }
+         for k,v in splats.items():
+             splats[k] = v[pruning_mask]
++        if raw_factor_logits is not None:
++            raw_factor_logits = raw_factor_logits[pruning_mask]
+         if ap_enabled:
+             ap_active = ap_active[pruning_mask]
+             ap_class = ap_class[pruning_mask]
++            ap_path_input = ap_path_input[pruning_mask]
+             score = score[pruning_mask]
+             eligible = eligible[pruning_mask]
+             estimated_bytes = estimated_bytes[pruning_mask]
+             canonical_ids = canonical_ids[pruning_mask]
+             pre_sort_retained_ids = canonical_ids.clone()
+             pre_sort_estimated_bytes = estimated_bytes.clone()
++            pre_sort_path_input_mask = ap_path_input.clone()
++            pre_sort_encoded_factors = splats["factors"].clone()
++            pre_sort_raw_factor_logits = raw_factor_logits.clone()
+             real_mask = torch.ones(
+                 canonical_ids.shape[0], dtype=torch.bool, device=canonical_ids.device
+             )
+@@ -318,6 +389,26 @@ class GIFStreamEnd2endCompression:
+                 ap_class = torch.cat(
+                     [ap_class, torch.zeros(pad, dtype=torch.bool, device=ap_class.device)]
+                 )
++                ap_path_input = torch.cat(
++                    [
++                        ap_path_input,
++                        torch.zeros(
++                            pad, dtype=torch.bool, device=ap_path_input.device
++                        ),
++                    ]
++                )
++                if raw_factor_logits is not None:
++                    raw_factor_logits = torch.cat(
++                        [
++                            raw_factor_logits,
++                            torch.zeros(
++                                (pad, raw_factor_logits.shape[1]),
++                                dtype=raw_factor_logits.dtype,
++                                device=raw_factor_logits.device,
++                            ),
++                        ],
++                        dim=0,
++                    )
+                 score = torch.cat(
+                     [score, torch.full((pad,), -torch.inf, dtype=score.dtype, device=score.device)]
+                 )
+@@ -348,6 +439,9 @@ class GIFStreamEnd2endCompression:
+                 )
+                 ap_active = ap_active[sort_indices]
+                 ap_class = ap_class[sort_indices]
++                ap_path_input = ap_path_input[sort_indices]
++                if raw_factor_logits is not None:
++                    raw_factor_logits = raw_factor_logits[sort_indices]
+                 score = score[sort_indices]
+                 eligible = eligible[sort_indices]
+                 estimated_bytes = estimated_bytes[sort_indices]
+@@ -363,6 +457,10 @@ class GIFStreamEnd2endCompression:
+         if ap_enabled:
+             if not torch.equal(splats["factors"][:, 0] > 0, ap_active):
+                 raise AssertionError("sorted factor activation disagrees with frozen AP allocation")
++            if torch.any(ap_class & ~ap_path_input):
++                raise AssertionError("sorted path-input mask lost a protected row")
++            if torch.any(ap_path_input & ~real_mask):
++                raise AssertionError("sorted path-input mask includes padding")
+             allocation_audit.update(
+                 recompute_sorted_codec_invariants(
+                     official_retain_mask=frozen_allocation["official_retain_mask"],
+@@ -373,18 +471,47 @@ class GIFStreamEnd2endCompression:
+                     source_estimated_bytes=source_estimated_bytes,
+                     pre_sort_retained_ids=pre_sort_retained_ids,
+                     pre_sort_estimated_bytes=pre_sort_estimated_bytes,
++                    pre_sort_path_input_mask=pre_sort_path_input_mask,
++                    pre_sort_encoded_factors=pre_sort_encoded_factors,
++                    pre_sort_raw_factor_logits=pre_sort_raw_factor_logits,
+                     sort_indices=sort_indices,
+                     encoded_ids=canonical_ids,
+                     encoded_estimated_bytes=estimated_bytes,
+                     encoded_factors=splats["factors"],
++                    encoded_raw_factor_logits=raw_factor_logits,
+                     real_mask=real_mask,
+                     padding_mask=padding_mask,
+                     ap_class_mask=ap_class,
++                    ap_path_input_mask=ap_path_input,
+                 )
+             )
+ 
+         choose_idx = splats["factors"][:,0] > 0
+         splats["time_features"] = splats["time_features"][choose_idx]
++        encoded_anchor_features = torch.round(
++            splats["anchor_features"] / scaling["anchor_features"]
++        ) * scaling["anchor_features"]
++        encoded_factor_reconstruction = None
++        if ap_enabled and ap_spec.quant:
++            encoded_anchor_features = ste_row_quantize(
++                splats["anchor_features"],
++                ap_path_input,
++                float(scaling["anchor_features"]),
++                ANCHOR_FEATURE_PROTECTED_MULTIPLIER,
++                ANCHOR_FEATURE_BACKGROUND_MULTIPLIER,
++            )
++            encoded_factor_reconstruction, _ = reconstruct_ap_factors(
++                raw_factor_logits,
++                encoded_anchor_features,
++                entropy_models["factors"],
++                float(scaling["factors"]),
++                ap_path_input,
++                FACTOR_PROTECTED_MULTIPLIER,
++                FACTOR_BACKGROUND_MULTIPLIER,
++                real_mask & ap_active,
++                real_mask,
++                float(frozen_allocation["factor0_activation_value"]),
++            )
+ 
+         meta = {}
+         print(entropy_models.keys())
+@@ -393,7 +520,7 @@ class GIFStreamEnd2endCompression:
+             kwargs = {
+                 "n_sidelen": n_sidelen,
+                 "verbose": self.verbose,
+-                "anchor_features": torch.round(splats["anchor_features"]/scaling["anchor_features"]) * scaling["anchor_features"],
++                "anchor_features": encoded_anchor_features,
+                 "c_channel": c_channel,
+                 "p_channel": p_channel,
+                 "scaling": scaling[param_name],
+@@ -401,12 +528,43 @@ class GIFStreamEnd2endCompression:
+                 "voxel_size": voxel_size
+             }
+ 
+-            if param_name == "time_features" and ap_enabled and ap_spec.quant:
++            if (
++                param_name == "anchor_features"
++                and ap_enabled
++                and ap_spec.quant
++            ):
++                meta[param_name] = _compress_ap_anchor_features_ar(
++                    compress_dir,
++                    param_name,
++                    splats[param_name],
++                    precision_mask=ap_path_input,
++                    protected_multiplier=ANCHOR_FEATURE_PROTECTED_MULTIPLIER,
++                    background_multiplier=ANCHOR_FEATURE_BACKGROUND_MULTIPLIER,
++                    expected_reconstruction=encoded_anchor_features,
++                    **kwargs,
++                )
++            elif param_name == "factors" and ap_enabled and ap_spec.quant:
++                meta[param_name] = _compress_ap_factors(
++                    compress_dir,
++                    param_name,
++                    raw_factor_logits,
++                    precision_mask=ap_path_input,
++                    active_mask=real_mask & ap_active,
++                    real_mask=real_mask,
++                    factor0_activation_value=float(
++                        frozen_allocation["factor0_activation_value"]
++                    ),
++                    protected_multiplier=FACTOR_PROTECTED_MULTIPLIER,
++                    background_multiplier=FACTOR_BACKGROUND_MULTIPLIER,
++                    expected_reconstruction=encoded_factor_reconstruction,
++                    **kwargs,
++                )
++            elif param_name == "time_features" and ap_enabled and ap_spec.quant:
+                 meta[param_name] = _compress_ap_time_features_ar(
+                     compress_dir,
+                     param_name,
+                     splats[param_name],
+-                    class_mask=ap_class[choose_idx],
++                    class_mask=ap_path_input[choose_idx],
+                     q_ap_multiplier=float(ap_cfg.get("q_ap_multiplier", 0.5)),
+                     q_bg_multiplier=float(ap_cfg.get("q_bg_multiplier", 1.25)),
+                     **kwargs,
+@@ -418,6 +576,10 @@ class GIFStreamEnd2endCompression:
+ 
+         if ap_enabled:
+             mask_meta = write_ap_mask(os.path.join(compress_dir, "ap_class_mask.bin"), ap_class)
++            path_input_mask_meta = write_ap_mask(
++                os.path.join(compress_dir, "ap_path_input_mask.bin"),
++                ap_path_input,
++            )
+             real_mask_meta = write_ap_mask(
+                 os.path.join(compress_dir, "ap_real_row_mask.bin"), real_mask
+             )
+@@ -465,6 +627,25 @@ class GIFStreamEnd2endCompression:
+                 "q_ap_multiplier": float(ap_cfg.get("q_ap_multiplier", 0.5)),
+                 "q_bg_multiplier": float(ap_cfg.get("q_bg_multiplier", 1.25)),
+                 "mask": mask_meta,
++                "path_input_mask": path_input_mask_meta,
++                "path_contract": {
++                    "schema": PATH_CONTRACT_SCHEMA,
++                    "knn_count": int(ap_cfg["n_knn"]),
++                    "knn_rule": (
++                        "retained-canonical-radius-complete-distance+lexicographic-id"
++                    ),
++                    "dependency_rule": "protected-plus-one-hop-retained-knn",
++                    "retained_knn_graph_sha256": path_knn_graph_sha256,
++                    "canonical_anchor_reconstruction": True,
++                    "factor_protected_multiplier": FACTOR_PROTECTED_MULTIPLIER,
++                    "factor_background_multiplier": FACTOR_BACKGROUND_MULTIPLIER,
++                    "anchor_feature_protected_multiplier": (
++                        ANCHOR_FEATURE_PROTECTED_MULTIPLIER
++                    ),
++                    "anchor_feature_background_multiplier": (
++                        ANCHOR_FEATURE_BACKGROUND_MULTIPLIER
++                    ),
++                },
+                 "real_row_mask": real_mask_meta,
+                 "padding_row_mask": padding_mask_meta,
+                 "active_row_mask": active_mask_meta,
+@@ -487,12 +668,16 @@ class GIFStreamEnd2endCompression:
+             return -torch.log(1/(x.clamp(1e-7,1-1e-7)) - 1)
+         
+         self.decoded_canonical_ids = None
++        self.decoded_knn_indices = None
+         with open(os.path.join(compress_dir, "meta.json"), "r") as f:
+             meta = json.load(f)
+ 
+         ap_meta = meta.get("__ap__")
+         if ap_meta is not None and ap_meta.get("schema") != AP_META_SCHEMA:
+-            raise ValueError("unsupported AP-GIFStream metadata schema")
++            raise ValueError(
++                "unsupported AP-GIFStream metadata schema; v5 remains bound "
++                "to the frozen Patch7 runtime"
++            )
+         ap_masks = None
+         if ap_meta is not None:
+             ap_cfg = dict(self.ap_config or {})
+@@ -500,6 +685,7 @@ class GIFStreamEnd2endCompression:
+                 "provenance_manifest_path",
+                 "provenance_manifest_sha256",
+                 "repo_root",
++                "n_knn",
+             }
+             missing = sorted(provenance_required - set(ap_cfg))
+             if missing:
+@@ -524,28 +710,92 @@ class GIFStreamEnd2endCompression:
+                 name: read_ap_mask(compress_dir, ap_meta[name], device=device)
+                 for name in (
+                     "mask",
++                    "path_input_mask",
+                     "real_row_mask",
+                     "padding_row_mask",
+                     "active_row_mask",
+                 )
+             }
++            path_contract = ap_meta.get("path_contract")
++            if (
++                not isinstance(path_contract, dict)
++                or path_contract.get("schema") != PATH_CONTRACT_SCHEMA
++                or int(path_contract.get("knn_count", -1))
++                != int(ap_cfg["n_knn"])
++                or path_contract.get("dependency_rule")
++                != "protected-plus-one-hop-retained-knn"
++                or not isinstance(
++                    path_contract.get("retained_knn_graph_sha256"), str
++                )
++                or len(path_contract["retained_knn_graph_sha256"]) != 64
++                or any(
++                    char not in "0123456789abcdef"
++                    for char in path_contract[
++                        "retained_knn_graph_sha256"
++                    ].lower()
++                )
++                or path_contract.get("canonical_anchor_reconstruction") is not True
++                or float(path_contract.get("factor_protected_multiplier", -1))
++                != FACTOR_PROTECTED_MULTIPLIER
++                or float(path_contract.get("factor_background_multiplier", -1))
++                != FACTOR_BACKGROUND_MULTIPLIER
++            ):
++                raise ValueError("counted AP-v6 path contract is incomplete")
+ 
+         splats = {}
+-        decompress_fn = self._get_decompress_fn("anchor_features")
++        ap_quantized = bool(
++            ap_meta is not None
++            and ap_meta.get("variant", {}).get("quant", False)
++        )
+         kwargs = {
+             "entropy_model": entropy_models["anchor_features"],
+             "device": device,
+         }
+-        splats["anchor_features"] = decompress_fn(compress_dir, "anchor_features", meta["anchor_features"], **kwargs)
+-        if "factors" in meta:
+-            splats["factors"] = _decompress_end2end(
++        if meta["anchor_features"].get("ap_two_class_anchor_features", False):
++            if ap_meta is None:
++                raise ValueError("protected anchor-feature stream lacks AP metadata")
++            splats["anchor_features"] = _decompress_ap_anchor_features_ar(
++                compress_dir,
++                "anchor_features",
++                meta["anchor_features"],
++                precision_mask=ap_masks["path_input_mask"],
++                **kwargs,
++            )
++        else:
++            if ap_quantized:
++                raise ValueError(
++                    "quantized AP-v6 container lacks protected anchor features"
++                )
++            splats["anchor_features"] = _decompress_end2end_ar(
+                 compress_dir,
+-                "factors",
+-                meta["factors"],
+-                anchor_features=splats["anchor_features"],
+-                entropy_model=entropy_models["factors"],
+-                device=device,
++                "anchor_features",
++                meta["anchor_features"],
++                **kwargs,
+             )
++        if "factors" in meta:
++            if meta["factors"].get("ap_two_class_factors", False):
++                if ap_meta is None:
++                    raise ValueError("protected factor stream lacks AP metadata")
++                splats["factors"] = _decompress_ap_factors(
++                    compress_dir,
++                    "factors",
++                    meta["factors"],
++                    anchor_features=splats["anchor_features"],
++                    precision_mask=ap_masks["path_input_mask"],
++                    active_mask=ap_masks["active_row_mask"],
++                    real_mask=ap_masks["real_row_mask"],
++                    entropy_model=entropy_models["factors"],
++                    device=device,
++                )
++            else:
++                splats["factors"] = _decompress_end2end(
++                    compress_dir,
++                    "factors",
++                    meta["factors"],
++                    anchor_features=splats["anchor_features"],
++                    entropy_model=entropy_models["factors"],
++                    device=device,
++                )
+         if ap_meta is not None:
+             encoded_count = int(splats["factors"].shape[0])
+             if any(mask.shape != (encoded_count,) for mask in ap_masks.values()):
+@@ -558,27 +808,33 @@ class GIFStreamEnd2endCompression:
+                 raise ValueError("decoded factor-3 whole mask differs from counted real rows")
+             if torch.any(ap_masks["active_row_mask"] & ~ap_masks["real_row_mask"]):
+                 raise ValueError("counted active rows escape the explicit real-row mask")
+-            # ``factors`` is an entropy-coded lossy stream.  A small positive
+-            # categorical factor can therefore quantize to exactly zero even
+-            # though the separately counted active-row sidecar says that the
+-            # corresponding temporal stream exists.  The sidecar is generated
+-            # before factor quantization, hash-bound into the container, and is
+-            # already checked against the frozen allocation.  Restore only the
+-            # categorical sign using the smallest positive factor quantization
+-            # step; keep all non-flipped decoded magnitudes unchanged.
+-            repaired_factor_rows = _apply_factor_mask(
+-                splats["factors"],
+-                0,
+-                ap_masks["active_row_mask"],
+-                float(meta["factors"]["scaling"]),
+-            )
+-            if repaired_factor_rows and self.verbose:
+-                print(
+-                    "Restored "
+-                    f"{repaired_factor_rows} factor-0 categorical rows from counted AP metadata."
++            if ap_quantized and not meta["factors"].get(
++                "ap_two_class_factors", False
++            ):
++                raise ValueError("AP-v6 container lacks the protected factor stream")
++            if not ap_quantized and meta["factors"].get(
++                "ap_two_class_factors", False
++            ):
++                raise ValueError(
++                    "non-quantized AP ablation unexpectedly uses protected factors"
++                )
++            if not ap_quantized:
++                _apply_factor_mask(
++                    splats["factors"],
++                    0,
++                    ap_masks["active_row_mask"],
++                    float(meta["factors"]["scaling"]),
+                 )
+             if torch.any(ap_masks["mask"] & ~ap_masks["real_row_mask"]):
+                 raise ValueError("decoded AP class includes padding rows")
++            if torch.any(ap_masks["mask"] & ~ap_masks["active_row_mask"]):
++                raise ValueError("decoded AP class contains an inactive row")
++            if torch.any(ap_masks["mask"] & ~ap_masks["path_input_mask"]):
++                raise ValueError("decoded AP path-input closure lost a protected row")
++            if torch.any(
++                ap_masks["path_input_mask"] & ~ap_masks["real_row_mask"]
++            ):
++                raise ValueError("decoded AP path-input closure includes padding")
+         for param_name, param_meta in meta.items():
+             if param_name in {"anchor_features", "factors", "__ap__"}: continue
+             decompress_fn = self._get_decompress_fn(param_name)
+@@ -590,7 +846,9 @@ class GIFStreamEnd2endCompression:
+             if param_name == "time_features" and param_meta.get("ap_two_class", False):
+                 if ap_meta is None:
+                     raise ValueError("two-class temporal stream is missing AP metadata")
+-                active_class_mask = ap_masks["mask"][ap_masks["active_row_mask"]]
++                active_class_mask = ap_masks["path_input_mask"][
++                    ap_masks["active_row_mask"]
++                ]
+                 splats[param_name] = _decompress_ap_time_features_ar(
+                     compress_dir,
+                     param_name,
+@@ -629,6 +887,47 @@ class GIFStreamEnd2endCompression:
+             ).to(device=device, dtype=torch.int64)
+             _validate_counted_retained_identity(retained_ids, len(splats["anchors"]))
+             self.decoded_canonical_ids = retained_ids.detach().clone()
++            # AP-v6 makes the counted identity authority the coordinate
++            # authority as well.  This removes lossy anchor-PNG drift and gives
++            # training, clean decode, and path evaluation the same KNN geometry.
++            splats["anchors"] = retained_ids.to(
++                dtype=splats["anchors"].dtype, device=splats["anchors"].device
++            ) * float(voxel_size)
++            retained_knn = deterministic_knn_indices(
++                splats["anchors"],
++                int(path_contract["knn_count"]),
++                canonical_ids=retained_ids,
++            )
++            self.decoded_knn_indices = retained_knn.detach().clone()
++            decoded_graph_sha256 = retained_knn_graph_sha256(
++                retained_ids, retained_knn
++            )
++            if (
++                decoded_graph_sha256
++                != path_contract["retained_knn_graph_sha256"]
++            ):
++                raise ValueError("decoded AP retained-KNN graph hash mismatch")
++            decoded_class_mask = ap_masks["mask"][
++                ap_masks["real_row_mask"]
++            ]
++            decoded_path_mask = ap_masks["path_input_mask"][
++                ap_masks["real_row_mask"]
++            ]
++            expected_path_mask, expected_knn = build_path_input_precision_mask(
++                splats["anchors"],
++                decoded_class_mask,
++                torch.ones_like(decoded_class_mask),
++                int(path_contract["knn_count"]),
++                canonical_ids=retained_ids,
++            )
++            if not _tensor_equal_device_agnostic(
++                expected_knn, retained_knn
++            ) or not _tensor_equal_device_agnostic(
++                expected_path_mask, decoded_path_mask
++            ):
++                raise ValueError(
++                    "decoded AP path-input mask is not the exact retained-KNN closure"
++                )
+ 
+         #* recover time features
+         choose_idx = splats["factors"][:,0] > 0
+@@ -1061,6 +1360,299 @@ def _decompress_end2end_ar(
+     return params
+ 
+ 
++def _compress_ap_anchor_features_ar(
++    compress_dir: str,
++    param_name: str,
++    params: Tensor,
++    n_sidelen: int,
++    precision_mask: Tensor,
++    protected_multiplier: float,
++    background_multiplier: float,
++    expected_reconstruction: Tensor,
++    **kwargs,
++) -> Dict[str, Any]:
++    if param_name != "anchor_features" or params.ndim != 2:
++        raise ValueError("protected anchor features must be a [N,C] tensor")
++    precision_mask = precision_mask.to(device=params.device, dtype=torch.bool)
++    if precision_mask.shape != (params.shape[0],):
++        raise ValueError("anchor-feature precision mask row mismatch")
++    base_scaling = float(kwargs["scaling"])
++    channel = int(kwargs["c_channel"])
++    if channel <= 0 or params.shape[1] % channel:
++        raise ValueError("invalid protected anchor-feature AR partition")
++    reconstruction = ste_row_quantize(
++        params,
++        precision_mask,
++        base_scaling,
++        protected_multiplier,
++        background_multiplier,
++    )
++    if not torch.equal(reconstruction.detach(), expected_reconstruction.detach()):
++        raise AssertionError("anchor-feature simulator/encoder reconstruction differs")
++    entropy_model = kwargs["entropy_model"]
++    families: Dict[str, Any] = {}
++    for family, family_mask, multiplier in (
++        ("path", precision_mask, float(protected_multiplier)),
++        ("bg", ~precision_mask, float(background_multiplier)),
++    ):
++        family_params = params[family_mask]
++        q_scaling = base_scaling * multiplier
++        scaled = torch.round(family_params / q_scaling)
++        row_count, feature_channels = scaled.shape
++        length = feature_channels // channel
++        if row_count:
++            condition = torch.cat(
++                [
++                    torch.zeros(
++                        (row_count, 3 * channel), device=params.device
++                    ),
++                    scaled,
++                ],
++                dim=-1,
++            )
++            condition = torch.cat(
++                [
++                    condition.view((row_count, -1, channel))[:, x : -3 + x]
++                    for x in range(3)
++                ],
++                dim=-1,
++            )
++            for index in range(length):
++                output_path = os.path.join(
++                    compress_dir, f"{param_name}_{family}_{index:05d}.bin"
++                )
++                entropy_model.compress(
++                    scaled[:, index * channel : (index + 1) * channel],
++                    condition[:, index],
++                    output_path,
++                )
++        families[family] = {
++            "rows": int(row_count),
++            "scaling": float(q_scaling),
++            "multiplier": float(multiplier),
++            "length": int(length),
++            "channel": int(channel),
++        }
++    return {
++        "shape": list(params.shape),
++        "dtype": str(params.dtype).split(".")[1],
++        "ap_two_class_anchor_features": True,
++        "base_scaling": base_scaling,
++        "families": families,
++    }
++
++
++def _decompress_ap_anchor_features_ar(
++    compress_dir: str,
++    param_name: str,
++    meta: Dict[str, Any],
++    precision_mask: Tensor,
++    **kwargs,
++) -> Tensor:
++    if not meta.get("ap_two_class_anchor_features", False):
++        raise ValueError("not a protected anchor-feature stream")
++    shape = tuple(int(value) for value in meta["shape"])
++    if len(shape) != 2:
++        raise ValueError("protected anchor-feature shape is malformed")
++    precision_mask = precision_mask.to(
++        device=kwargs["device"], dtype=torch.bool
++    )
++    if precision_mask.shape != (shape[0],):
++        raise ValueError("decoded anchor-feature precision mask mismatch")
++    output = torch.empty(shape, device=kwargs["device"])
++    entropy_model = kwargs["entropy_model"]
++    for family, family_mask in (("path", precision_mask), ("bg", ~precision_mask)):
++        family_meta = meta["families"][family]
++        row_count = int(family_meta["rows"])
++        if int(family_mask.sum().item()) != row_count:
++            raise ValueError(f"{family} anchor-feature row count mismatch")
++        channel = int(family_meta["channel"])
++        length = int(family_meta["length"])
++        if length * channel != shape[1]:
++            raise ValueError(f"{family} anchor-feature stream length mismatch")
++        if not row_count:
++            continue
++        condition = torch.zeros(
++            (row_count, 3 * channel), device=kwargs["device"]
++        )
++        chunks = []
++        for index in range(length):
++            output_path = os.path.join(
++                compress_dir, f"{param_name}_{family}_{index:05d}.bin"
++            )
++            if not os.path.isfile(output_path):
++                raise ValueError(f"missing protected anchor stream: {output_path}")
++            chunk = entropy_model.decompress(condition, output_path)
++            if chunk.shape != (row_count, channel):
++                raise ValueError("decoded protected anchor chunk shape mismatch")
++            condition = torch.cat([condition[:, channel:], chunk], dim=-1)
++            chunks.append(chunk)
++        output[family_mask] = torch.cat(chunks, dim=-1) * float(
++            family_meta["scaling"]
++        )
++    output = output.to(dtype=getattr(torch, meta["dtype"]))
++    if not torch.isfinite(output).all():
++        raise ValueError("nonfinite protected anchor-feature decode")
++    return output
++
++
++def _compress_ap_factors(
++    compress_dir: str,
++    param_name: str,
++    raw_factor_logits: Tensor,
++    n_sidelen: int,
++    precision_mask: Tensor,
++    active_mask: Tensor,
++    real_mask: Tensor,
++    factor0_activation_value: float,
++    protected_multiplier: float,
++    background_multiplier: float,
++    expected_reconstruction: Tensor,
++    **kwargs,
++) -> Dict[str, Any]:
++    if param_name != "factors" or raw_factor_logits.shape[1:] != (4,):
++        raise ValueError("protected factors must be [N,4]")
++    precision_mask = precision_mask.to(
++        device=raw_factor_logits.device, dtype=torch.bool
++    )
++    active_mask = active_mask.to(device=raw_factor_logits.device, dtype=torch.bool)
++    real_mask = real_mask.to(device=raw_factor_logits.device, dtype=torch.bool)
++    if any(
++        mask.shape != (raw_factor_logits.shape[0],)
++        for mask in (precision_mask, active_mask, real_mask)
++    ):
++        raise ValueError("protected factor masks do not align")
++    base_scaling = float(kwargs["scaling"])
++    reconstruction, _ = reconstruct_ap_factors(
++        raw_factor_logits,
++        kwargs["anchor_features"],
++        kwargs["entropy_model"],
++        base_scaling,
++        precision_mask,
++        protected_multiplier,
++        background_multiplier,
++        active_mask,
++        real_mask,
++        factor0_activation_value,
++    )
++    if not torch.allclose(
++        reconstruction.detach(),
++        expected_reconstruction.detach(),
++        rtol=0.0,
++        atol=1e-7,
++    ):
++        raise AssertionError("factor simulator/encoder reconstruction differs")
++    activated = normalize_factor_semantics(
++        torch.sigmoid(raw_factor_logits),
++        active_mask,
++        real_mask,
++        factor0_activation_value,
++    )
++    entropy_model = kwargs["entropy_model"]
++    families: Dict[str, Any] = {}
++    for family, family_mask, multiplier in (
++        ("path", precision_mask, float(protected_multiplier)),
++        ("bg", ~precision_mask, float(background_multiplier)),
++    ):
++        q_scaling = base_scaling * multiplier
++        row_count = int(family_mask.sum().item())
++        output_path = os.path.join(compress_dir, f"{param_name}_{family}.bin")
++        if row_count:
++            entropy_model.compress(
++                activated[family_mask] / q_scaling,
++                kwargs["anchor_features"][family_mask],
++                output_path,
++                adaptive=True,
++            )
++            payload = Path(output_path).read_bytes()
++            stream_bytes = len(payload)
++            stream_sha256 = hashlib.sha256(payload).hexdigest()
++        else:
++            stream_bytes = 0
++            stream_sha256 = hashlib.sha256(b"").hexdigest()
++        families[family] = {
++            "rows": row_count,
++            "scaling": float(q_scaling),
++            "multiplier": float(multiplier),
++            "path": os.path.basename(output_path),
++            "bytes": int(stream_bytes),
++            "sha256": stream_sha256,
++        }
++    return {
++        "shape": list(raw_factor_logits.shape),
++        "dtype": str(raw_factor_logits.dtype).split(".")[1],
++        "ap_two_class_factors": True,
++        "base_scaling": base_scaling,
++        "factor0_activation_value": float(factor0_activation_value),
++        "reconstruction_rule": "adaptive-symbols+counted-factor0/factor3-semantics",
++        "families": families,
++    }
++
++
++def _decompress_ap_factors(
++    compress_dir: str,
++    param_name: str,
++    meta: Dict[str, Any],
++    anchor_features: Tensor,
++    precision_mask: Tensor,
++    active_mask: Tensor,
++    real_mask: Tensor,
++    **kwargs,
++) -> Tensor:
++    if not meta.get("ap_two_class_factors", False):
++        raise ValueError("not a protected AP factor stream")
++    shape = tuple(int(value) for value in meta["shape"])
++    if len(shape) != 2 or shape[1] != 4:
++        raise ValueError("protected factor shape is malformed")
++    precision_mask = precision_mask.to(device=kwargs["device"], dtype=torch.bool)
++    active_mask = active_mask.to(device=kwargs["device"], dtype=torch.bool)
++    real_mask = real_mask.to(device=kwargs["device"], dtype=torch.bool)
++    if any(mask.shape != (shape[0],) for mask in (precision_mask, active_mask, real_mask)):
++        raise ValueError("decoded protected factor masks do not align")
++    output = torch.empty(shape, device=kwargs["device"])
++    entropy_model = kwargs["entropy_model"]
++    for family, family_mask in (("path", precision_mask), ("bg", ~precision_mask)):
++        family_meta = meta["families"][family]
++        row_count = int(family_meta["rows"])
++        expected_path = f"{param_name}_{family}.bin"
++        if family_meta.get("path") != expected_path:
++            raise ValueError(f"{family} protected factor path is noncanonical")
++        if int(family_mask.sum().item()) != row_count:
++            raise ValueError(f"{family} factor row count mismatch")
++        if not row_count:
++            if (
++                int(family_meta["bytes"]) != 0
++                or family_meta["sha256"] != hashlib.sha256(b"").hexdigest()
++            ):
++                raise ValueError("empty factor family binding is invalid")
++            continue
++        output_path = os.path.join(compress_dir, str(family_meta["path"]))
++        if not os.path.isfile(output_path):
++            raise ValueError(f"missing protected factor stream: {output_path}")
++        payload = Path(output_path).read_bytes()
++        if (
++            len(payload) != int(family_meta["bytes"])
++            or hashlib.sha256(payload).hexdigest() != family_meta["sha256"]
++        ):
++            raise ValueError(f"{family} protected factor stream binding mismatch")
++        decoded = entropy_model.decompress(
++            anchor_features[family_mask], output_path, adaptive=True
++        )
++        if decoded.shape != (row_count, 4):
++            raise ValueError(f"{family} protected factor decode shape mismatch")
++        output[family_mask] = decoded * float(family_meta["scaling"])
++    output = normalize_factor_semantics(
++        output,
++        active_mask,
++        real_mask,
++        float(meta["factor0_activation_value"]),
++    )
++    output = output.to(dtype=getattr(torch, meta["dtype"]))
++    if not torch.isfinite(output).all():
++        raise ValueError("nonfinite protected factor decode")
++    return output
++
++
+ def _compress_ap_time_features_ar(
+     compress_dir: str,
+     param_name: str,
+@@ -1092,7 +1684,7 @@ def _compress_ap_time_features_ar(
+ 
+     family_meta: Dict[str, Any] = {}
+     for family, family_mask, multiplier in (
+-        ("ap", class_mask, float(q_ap_multiplier)),
++        ("path", class_mask, float(q_ap_multiplier)),
+         ("bg", ~class_mask, float(q_bg_multiplier)),
+     ):
+         family_params = params[family_mask]
+@@ -1129,12 +1721,13 @@ def _compress_ap_time_features_ar(
+             "channel": channel,
+         }
+ 
+-    if family_meta["ap"]["rows"] + family_meta["bg"]["rows"] != params.shape[0]:
++    if family_meta["path"]["rows"] + family_meta["bg"]["rows"] != params.shape[0]:
+         raise AssertionError("two-class temporal encoder lost rows")
+     return {
+         "shape": list(params.shape),
+         "dtype": str(params.dtype).split(".")[1],
+         "ap_two_class": True,
++        "precision_mask_contract": "path_input_mask",
+         "base_scaling": base_scaling,
+         "length": int(params.flatten(1).shape[1] // channel),
+         "channel": channel,
+@@ -1159,7 +1752,9 @@ def _decompress_ap_time_features_ar(
+     flat_channels = int(np.prod(shape[1:]))
+     flat = torch.empty((shape[0], flat_channels), device=kwargs["device"])
+ 
+-    for family, family_mask in (("ap", class_mask), ("bg", ~class_mask)):
++    if meta.get("precision_mask_contract") != "path_input_mask":
++        raise ValueError("temporal precision stream lacks the path-input contract")
++    for family, family_mask in (("path", class_mask), ("bg", ~class_mask)):
+         family_meta = meta["families"][family]
+         row_count = int(family_meta["rows"])
+         if int(family_mask.sum().item()) != row_count:
+diff --git a/gsplat/compression/h007_certification.py b/gsplat/compression/h007_certification.py
+index 9f94fe7..63d75d1 100644
+--- a/gsplat/compression/h007_certification.py
++++ b/gsplat/compression/h007_certification.py
+@@ -3,7 +3,7 @@
+ The Stage-02 marker is not a generic directory checksum.  It is an exclusive,
+ no-follow freeze of an exact five-scene x five-GOP reference grid, the selected
+ real nested sequence archives, ordinary image/rate preconditions, and the
+-active eight-stage evaluator provenance.  Validation reopens and recomputes the
++active nine-stage evaluator provenance.  Validation reopens and recomputes the
+ complete closure; a caller-supplied PASS object is never trusted.
+ """
+ 
+@@ -273,8 +273,8 @@ def _verify_runtime(
+         repo_root,
+         require_sha256(provenance_manifest_sha256, "patch-chain manifest SHA-256"),
+     )
+-    if len(receipt.get("patch_sha256", [])) != 8:
+-        raise ValueError("Stage 02 requires the exact eight-stage runtime provenance")
++    if len(receipt.get("patch_sha256", [])) != 9:
++        raise ValueError("Stage 02 requires the exact nine-stage runtime provenance")
+     return receipt
+ 
+ 
+@@ -1006,7 +1006,7 @@ def validate_stage02_freeze(
+         read_regular_bytes(root / RUNTIME_RECEIPT_NAME) != runtime_payload
+         or sha256_bytes(runtime_payload) != freeze["runtime_provenance_sha256"]
+     ):
+-        raise ValueError("Stage-02 eight-stage runtime receipt mismatch")
++        raise ValueError("Stage-02 nine-stage runtime receipt mismatch")
+     reference_cases, reference_files, reference_rebuilds = _validate_reference_grid(
+         root, evaluator_sha, repo_root
+     )
+diff --git a/gsplat/compression/h007_clean_runtime.py b/gsplat/compression/h007_clean_runtime.py
+index 816a330..39e941c 100644
+--- a/gsplat/compression/h007_clean_runtime.py
++++ b/gsplat/compression/h007_clean_runtime.py
+@@ -8,9 +8,10 @@ from typing import Any, Dict, Mapping, Optional, Tuple, Union
+ 
+ import numpy as np
+ import torch
+-from sklearn.neighbors import KDTree
+ from torch import Tensor
+ 
++from gsplat.compression.ap_gifstream import canonical_voxel_ids
++from gsplat.compression.h007_path_contract import deterministic_knn_indices
+ from gsplat.compression.h007_sequence_container import (
+     expected_gifstream_nets_keys,
+     expected_gifstream_reference_nets_keys,
+@@ -170,22 +171,39 @@ def instantiate_counted_models(
+     }
+ 
+ 
+-def _knn_indices(anchors: Tensor, count: int) -> Tensor:
++def _knn_indices(
++    anchors: Tensor,
++    count: int,
++    *,
++    canonical_ids: Optional[Tensor] = None,
++) -> Tensor:
+     if count <= 0 or anchors.shape[0] <= count:
+         raise ValueError("counted KNN request exceeds decoded anchor population")
+-    points = anchors.detach().cpu().numpy().astype(np.float64, copy=False)
+-    _, indices = KDTree(points).query(points, k=count + 1)
+-    return torch.from_numpy(indices[:, 1:].astype(np.int64, copy=False)).to(anchors.device)
++    return deterministic_knn_indices(
++        anchors, int(count), canonical_ids=canonical_ids
++    )
+ 
+ 
+ def counted_knn_indices(
+-    splats: Mapping[str, Tensor], config: Mapping[str, Any]
++    splats: Mapping[str, Tensor],
++    config: Mapping[str, Any],
++    *,
++    canonical_ids: Optional[Tensor] = None,
+ ) -> Optional[Tensor]:
+     """Build the deterministic counted KNN set once for a render/evaluation run."""
+ 
+     if not bool(config["knn"]):
+         return None
+-    return _knn_indices(splats["anchors"], int(config["n_knn"]))
++    ids = (
++        canonical_voxel_ids(splats["anchors"], float(config["voxel_size"]))
++        if canonical_ids is None
++        else canonical_ids
++    )
++    return _knn_indices(
++        splats["anchors"],
++        int(config["n_knn"]),
++        canonical_ids=ids,
++    )
+ 
+ 
+ def _quaternion_to_rotation_matrix(quaternion: Tensor) -> Tensor:
+@@ -652,6 +670,7 @@ def counted_camera_render_benchmark(
+     camera_arrays: Mapping[str, np.ndarray],
+     warmup_renders: int,
+     timed_renders: int,
++    knn_indices: Optional[Tensor] = None,
+ ) -> Dict[str, Any]:
+     if warmup_renders <= 0 or timed_renders <= 0:
+         raise ValueError("clean-process warm/timed render counts must be positive")
+@@ -681,11 +700,18 @@ def counted_camera_render_benchmark(
+     intrinsic = torch.from_numpy(
+         np.asarray(camera_arrays["intrinsics"][meta_index], dtype=np.float32)
+     ).to(device)[None]
+-    knn_indices = (
+-        _knn_indices(splats["anchors"], int(config["n_knn"]))
+-        if bool(config["knn"])
+-        else None
+-    )
++    if bool(config["knn"]):
++        if knn_indices is None:
++            knn_indices = counted_knn_indices(splats, config)
++        if (
++            knn_indices.dtype != torch.int64
++            or knn_indices.shape
++            != (anchor_count, int(config["n_knn"]))
++        ):
++            raise ValueError("counted render KNN graph has an invalid contract")
++        knn_indices = knn_indices.to(device=device)
++    elif knn_indices is not None:
++        raise ValueError("non-KNN counted render unexpectedly received a graph")
+ 
+     last_render = last_alpha = None
+     shape_audit: Dict[str, int] = {}
+diff --git a/gsplat/compression/h007_path_contract.py b/gsplat/compression/h007_path_contract.py
+new file mode 100644
+index 0000000..0ed2cb0
+--- /dev/null
++++ b/gsplat/compression/h007_path_contract.py
+@@ -0,0 +1,451 @@
++"""Shared path-state reconstruction contract for AP-GIFStream.
++
++The training simulator, real encoder, and clean decoder must agree on three
++things that affect a persistent path:
++
++* the retained-row KNN graph,
++* the rows whose path inputs receive the protected precision family, and
++* the reconstructed values of the four factor channels.
++
++This module contains the deterministic, side-effect-free parts of that
++contract.  Stream I/O remains in ``gifstream_end2end_compression.py``.
++"""
++
++from __future__ import annotations
++
++import hashlib
++import json
++import math
++from typing import Dict, Optional, Tuple
++
++import numpy as np
++import torch
++from sklearn.neighbors import KDTree
++from torch import Tensor
++
++
++PATH_CONTRACT_SCHEMA = "h007.ap_gifstream.path_contract.v1"
++
++# Patch-bound development operating point.  These are separate from the
++# temporal AP/background multipliers frozen in the score artifact: factors are
++# substantially more path-sensitive, while anchor features only need the
++# one-hop dependency family.
++FACTOR_PROTECTED_MULTIPLIER = 1.0 / 256.0
++FACTOR_BACKGROUND_MULTIPLIER = 1.0 / 64.0
++ANCHOR_FEATURE_PROTECTED_MULTIPLIER = 0.25
++ANCHOR_FEATURE_BACKGROUND_MULTIPLIER = 1.0
++
++
++def _validate_row_mask(mask: Tensor, row_count: int, name: str, device: torch.device) -> Tensor:
++    mask = mask.to(device=device, dtype=torch.bool)
++    if mask.shape != (row_count,):
++        raise ValueError(f"{name} must have shape [{row_count}]")
++    return mask
++
++
++def deterministic_knn_indices(
++    anchors: Tensor,
++    count: int,
++    *,
++    canonical_ids: Optional[Tensor] = None,
++) -> Tensor:
++    """Return row-order-invariant KNN indices with an exact tie rule.
++
++    KDTree query order alone is not a sufficient contract on a voxel lattice:
++    more than ``count`` candidates may lie at the same boundary distance.  We
++    therefore query the full boundary-radius set and rank it by
++    ``(squared-distance, canonical-id-x, canonical-id-y, canonical-id-z)``.
++    The result is finally mapped back to the caller's row order.
++    """
++
++    if anchors.ndim != 2 or anchors.shape[1] != 3:
++        raise ValueError("anchors must be [N,3]")
++    row_count = int(anchors.shape[0])
++    if type(count) is not int or count <= 0 or row_count <= count:
++        raise ValueError("KNN count must be positive and smaller than the row count")
++    if not torch.isfinite(anchors).all():
++        raise ValueError("anchors contain nonfinite values")
++
++    if canonical_ids is None:
++        # The lexicographic tie authority need only be stable under row
++        # permutation.  Float64 coordinate bytes provide that authority when
++        # an explicit voxel identity is unavailable during ordinary training.
++        points64 = anchors.detach().to(torch.float64).cpu().numpy()
++        unique = np.unique(points64, axis=0)
++        if unique.shape[0] != row_count:
++            raise ValueError("deterministic KNN requires unique anchor rows")
++        identity = points64
++    else:
++        if canonical_ids.dtype != torch.int64 or canonical_ids.shape != (row_count, 3):
++            raise ValueError("canonical_ids must be int64 [N,3]")
++        if int(torch.unique(canonical_ids, dim=0).shape[0]) != row_count:
++            raise ValueError("canonical KNN identities are not unique")
++        identity = canonical_ids.detach().cpu().numpy().astype(np.int64, copy=False)
++        # Integer voxel identities are also the distance authority.  A uniform
++        # voxel scale preserves every distance ordering, while avoiding a
++        # float32 ULP/tie disagreement between pre-codec anchors and the
++        # decoder's exact ``canonical_id * voxel_size`` reconstruction.
++        points64 = identity.astype(np.float64, copy=False)
++
++    order = np.lexsort((identity[:, 2], identity[:, 1], identity[:, 0]))
++    sorted_points = points64[order]
++    sorted_identity = identity[order]
++    tree = KDTree(sorted_points)
++
++    # First find the boundary distance.  Then include every exact-distance tie
++    # at that boundary before applying the canonical lexicographic rule.
++    distances, _ = tree.query(sorted_points, k=count + 1)
++    boundary = np.nextafter(distances[:, count], np.inf)
++    radius_rows = tree.query_radius(sorted_points, r=boundary)
++    result_sorted = np.empty((row_count, count), dtype=np.int64)
++    for row, candidates in enumerate(radius_rows):
++        candidates = np.asarray(candidates, dtype=np.int64)
++        candidates = candidates[candidates != row]
++        if candidates.size < count:
++            raise AssertionError("KNN boundary query returned too few non-self rows")
++        delta = sorted_points[candidates] - sorted_points[row]
++        squared_distance = np.einsum("ij,ij->i", delta, delta)
++        candidate_ids = sorted_identity[candidates]
++        ranked = np.lexsort(
++            (
++                candidate_ids[:, 2],
++                candidate_ids[:, 1],
++                candidate_ids[:, 0],
++                squared_distance,
++            )
++        )
++        result_sorted[row] = candidates[ranked[:count]]
++
++    # ``order[sorted_row]`` is the original row.  Populate both dimensions in
++    # the original caller order.
++    result = np.empty_like(result_sorted)
++    result[order] = order[result_sorted]
++    output = torch.from_numpy(result).to(device=anchors.device, dtype=torch.int64)
++    if output.shape != (row_count, count):
++        raise AssertionError("deterministic KNN returned an invalid shape")
++    self_rows = torch.arange(row_count, device=anchors.device).unsqueeze(1)
++    if torch.any(output == self_rows):
++        raise AssertionError("deterministic KNN retained a self edge")
++    return output
++
++
++def build_path_input_precision_mask(
++    anchors: Tensor,
++    protected_mask: Tensor,
++    retain_mask: Tensor,
++    count: int,
++    *,
++    canonical_ids: Optional[Tensor] = None,
++) -> Tuple[Tensor, Tensor]:
++    """Expand protected rows to the one-hop retained KNN dependency closure."""
++
++    row_count = int(anchors.shape[0])
++    protected = _validate_row_mask(
++        protected_mask, row_count, "protected_mask", anchors.device
++    )
++    retained = _validate_row_mask(retain_mask, row_count, "retain_mask", anchors.device)
++    if torch.any(protected & ~retained):
++        raise ValueError("protected rows escape the retained universe")
++    retained_rows = torch.nonzero(retained, as_tuple=False).flatten()
++    if int(retained_rows.numel()) <= count:
++        raise ValueError("retained universe is too small for the frozen KNN count")
++    retained_anchors = anchors[retained_rows]
++    retained_ids = canonical_ids[retained_rows] if canonical_ids is not None else None
++    retained_knn = deterministic_knn_indices(
++        retained_anchors, count, canonical_ids=retained_ids
++    )
++    retained_protected = protected[retained_rows]
++    precision_retained = retained_protected.clone()
++    if torch.any(retained_protected):
++        neighbor_rows = retained_knn[retained_protected].reshape(-1)
++        precision_retained[neighbor_rows] = True
++    precision = torch.zeros(row_count, dtype=torch.bool, device=anchors.device)
++    precision[retained_rows] = precision_retained
++    if torch.any(protected & ~precision):
++        raise AssertionError("path-input closure lost a protected row")
++    if torch.any(precision & ~retained):
++        raise AssertionError("path-input closure escaped retained rows")
++    return precision, retained_knn
++
++
++def build_codec_knn_indices(
++    anchors: Tensor,
++    retain_mask: Tensor,
++    count: int,
++    *,
++    canonical_ids: Optional[Tensor] = None,
++) -> Tuple[Tensor, Tensor, Tensor]:
++    """Build the graph seen by retained rows in the real decoded container.
++
++    Training keeps zero-retention rows in tensor storage until the real codec
++    runs.  Those rows must not remain eligible as KNN context for retained
++    rows, because the decoder never receives them.  Non-retained query rows are
++    left on the full graph only to keep training tensor shapes unchanged; their
++    rendered contribution is zero by the factor-3 contract.
++    """
++
++    row_count = int(anchors.shape[0])
++    retained = _validate_row_mask(
++        retain_mask, row_count, "retain_mask", anchors.device
++    )
++    retained_rows = torch.nonzero(retained, as_tuple=False).flatten()
++    if int(retained_rows.numel()) <= count:
++        raise ValueError("retained universe is too small for the frozen KNN count")
++    full_knn = deterministic_knn_indices(
++        anchors, count, canonical_ids=canonical_ids
++    )
++    retained_ids = (
++        canonical_ids[retained_rows] if canonical_ids is not None else None
++    )
++    retained_knn = deterministic_knn_indices(
++        anchors[retained_rows], count, canonical_ids=retained_ids
++    )
++    codec_graph = full_knn.clone()
++    codec_graph[retained_rows] = retained_rows[retained_knn]
++    if torch.any(~retained[codec_graph[retained_rows]]):
++        raise AssertionError("codec KNN graph depends on an unretained row")
++    return codec_graph, retained_rows, retained_knn
++
++
++def retained_knn_graph_sha256(
++    retained_canonical_ids: Tensor, retained_knn: Tensor
++) -> str:
++    """Hash a retained KNN graph independently of its tensor row order."""
++
++    if (
++        retained_canonical_ids.dtype != torch.int64
++        or retained_canonical_ids.ndim != 2
++        or retained_canonical_ids.shape[1] != 3
++    ):
++        raise ValueError("retained canonical IDs must be int64 [N,3]")
++    row_count = int(retained_canonical_ids.shape[0])
++    if (
++        retained_knn.dtype != torch.int64
++        or retained_knn.ndim != 2
++        or retained_knn.shape[0] != row_count
++        or retained_knn.shape[1] <= 0
++    ):
++        raise ValueError("retained KNN graph shape/dtype is malformed")
++    if torch.any(retained_knn < 0) or torch.any(retained_knn >= row_count):
++        raise ValueError("retained KNN graph contains an out-of-range row")
++    ids = (
++        retained_canonical_ids.detach()
++        .cpu()
++        .numpy()
++        .astype(np.int64, copy=False)
++    )
++    graph = retained_knn.detach().cpu().numpy().astype(np.int64, copy=False)
++    order = np.lexsort((ids[:, 2], ids[:, 1], ids[:, 0]))
++    canonical_rows = []
++    for source in order:
++        canonical_rows.append(
++            np.concatenate(
++                [
++                    ids[source],
++                    ids[graph[source]].reshape(-1),
++                ]
++            )
++        )
++    payload = (
++        np.stack(canonical_rows, axis=0)
++        .astype("<i8", copy=False)
++        .tobytes(order="C")
++    )
++    header = json.dumps(
++        {
++            "schema": PATH_CONTRACT_SCHEMA,
++            "row_count": row_count,
++            "knn_count": int(retained_knn.shape[1]),
++            "row": "source-canonical-id+ordered-neighbor-canonical-ids",
++        },
++        sort_keys=True,
++        separators=(",", ":"),
++    ).encode("utf-8")
++    digest = hashlib.sha256()
++    digest.update(len(header).to_bytes(8, "little"))
++    digest.update(header)
++    digest.update(payload)
++    return digest.hexdigest()
++
++
++def row_quantization_scaling(
++    base_scaling: float,
++    precision_mask: Tensor,
++    protected_multiplier: float,
++    background_multiplier: float,
++    *,
++    rank: int,
++    dtype: torch.dtype,
++) -> Tensor:
++    if not math.isfinite(float(base_scaling)) or float(base_scaling) <= 0:
++        raise ValueError("base scaling must be finite and positive")
++    if not (0.0 < float(protected_multiplier) <= 1.0):
++        raise ValueError("protected multiplier must be in (0,1]")
++    if not math.isfinite(float(background_multiplier)) or float(background_multiplier) <= 0:
++        raise ValueError("background multiplier must be finite and positive")
++    if rank < 1:
++        raise ValueError("rank must be positive")
++    shape = (precision_mask.shape[0],) + (1,) * (rank - 1)
++    protected = torch.full(
++        shape,
++        float(base_scaling) * float(protected_multiplier),
++        dtype=dtype,
++        device=precision_mask.device,
++    )
++    background = torch.full(
++        shape,
++        float(base_scaling) * float(background_multiplier),
++        dtype=dtype,
++        device=precision_mask.device,
++    )
++    return torch.where(precision_mask.view(shape), protected, background)
++
++
++def ste_row_quantize(
++    values: Tensor,
++    precision_mask: Tensor,
++    base_scaling: float,
++    protected_multiplier: float,
++    background_multiplier: float,
++) -> Tensor:
++    precision = _validate_row_mask(
++        precision_mask, int(values.shape[0]), "precision_mask", values.device
++    )
++    scaling = row_quantization_scaling(
++        base_scaling,
++        precision,
++        protected_multiplier,
++        background_multiplier,
++        rank=values.ndim,
++        dtype=values.dtype,
++    )
++    rounded = torch.round(values / scaling) * scaling
++    return (rounded - values).detach() + values
++
++
++def factor_distribution(
++    entropy_model: torch.nn.Module, condition: Tensor
++) -> Tuple[Tensor, Tensor, Tensor]:
++    distribution = entropy_model.model(condition)
++    if distribution.ndim != 2 or distribution.shape[1] % 3:
++        raise ValueError("factor entropy distribution is malformed")
++    width = distribution.shape[1] // 3
++    means, scalings, qs = distribution.split([width, width, width], dim=-1)
++    qs = 1.0 + 0.8 * torch.tanh(qs)
++    return means, scalings, qs
++
++
++def normalize_factor_semantics(
++    activated: Tensor,
++    active_mask: Tensor,
++    real_mask: Tensor,
++    factor0_activation_value: float,
++) -> Tensor:
++    """Apply the shared continuous/categorical factor semantics."""
++
++    if activated.ndim != 2 or activated.shape[1] != 4:
++        raise ValueError("factors must be [N,4]")
++    row_count = int(activated.shape[0])
++    active = _validate_row_mask(active_mask, row_count, "active_mask", activated.device)
++    real = _validate_row_mask(real_mask, row_count, "real_mask", activated.device)
++    if torch.any(active & ~real):
++        raise ValueError("active factor rows escape real rows")
++    activation = float(factor0_activation_value)
++    if not math.isfinite(activation) or activation < 0.1 or activation > 1.0:
++        raise ValueError("factor0 activation value must be in [0.1,1]")
++
++    continuous = torch.where(
++        activated[:, :3] < 0.1,
++        torch.zeros_like(activated[:, :3]),
++        activated[:, :3],
++    )
++    factor0 = torch.where(
++        active,
++        torch.maximum(
++            continuous[:, 0],
++            torch.full_like(continuous[:, 0], activation),
++        ),
++        torch.zeros_like(continuous[:, 0]),
++    )
++    output = torch.cat(
++        [
++            factor0[:, None],
++            continuous[:, 1:3],
++            real.to(dtype=activated.dtype)[:, None],
++        ],
++        dim=1,
++    )
++    if not torch.equal(output[:, 0] > 0, active):
++        raise AssertionError("factor0 reconstruction disagrees with active mask")
++    if not torch.equal(output[:, 3] > 0, real):
++        raise AssertionError("factor3 reconstruction disagrees with real mask")
++    return output
++
++
++def reconstruct_ap_factors(
++    raw_factor_logits: Tensor,
++    reconstructed_anchor_features: Tensor,
++    entropy_model: torch.nn.Module,
++    base_scaling: float,
++    precision_mask: Tensor,
++    protected_multiplier: float,
++    background_multiplier: float,
++    active_mask: Tensor,
++    real_mask: Tensor,
++    factor0_activation_value: float,
++) -> Tuple[Tensor, Dict[str, Tensor]]:
++    """Reconstruct the exact values represented by the AP factor symbols."""
++
++    if raw_factor_logits.ndim != 2 or raw_factor_logits.shape[1] != 4:
++        raise ValueError("raw factor logits must be [N,4]")
++    if reconstructed_anchor_features.shape[0] != raw_factor_logits.shape[0]:
++        raise ValueError("factor condition row count mismatch")
++    precision = _validate_row_mask(
++        precision_mask,
++        int(raw_factor_logits.shape[0]),
++        "factor_precision_mask",
++        raw_factor_logits.device,
++    )
++    _, _, qs = factor_distribution(entropy_model, reconstructed_anchor_features)
++    if qs.shape != raw_factor_logits.shape:
++        raise ValueError("adaptive factor Q shape mismatch")
++    activated = torch.sigmoid(raw_factor_logits)
++    activated = normalize_factor_semantics(
++        activated, active_mask, real_mask, factor0_activation_value
++    )
++    scaling = row_quantization_scaling(
++        base_scaling,
++        precision,
++        protected_multiplier,
++        background_multiplier,
++        rank=2,
++        dtype=activated.dtype,
++    )
++    symbols = torch.round((activated / scaling) * qs)
++    quantized = symbols / qs * scaling
++    reconstruction = (quantized - activated).detach() + activated
++    reconstruction = normalize_factor_semantics(
++        reconstruction, active_mask, real_mask, factor0_activation_value
++    )
++    if not torch.isfinite(reconstruction).all():
++        raise ValueError("nonfinite AP factor reconstruction")
++    return reconstruction, {
++        "symbols": symbols.detach(),
++        "qs": qs.detach(),
++        "scaling": scaling.detach(),
++    }
++
++
++def reconstruct_decoded_ap_factors(
++    decoded_scaled_factors: Tensor,
++    q_scaling: float,
++    active_mask: Tensor,
++    real_mask: Tensor,
++    factor0_activation_value: float,
++) -> Tensor:
++    if not math.isfinite(float(q_scaling)) or float(q_scaling) <= 0:
++        raise ValueError("decoded factor scaling must be finite and positive")
++    reconstructed = decoded_scaled_factors * float(q_scaling)
++    return normalize_factor_semantics(
++        reconstructed, active_mask, real_mask, factor0_activation_value
++    )
+diff --git a/gsplat/compression/h007_runtime_provenance.py b/gsplat/compression/h007_runtime_provenance.py
+index 34ff05a..c041b03 100644
+--- a/gsplat/compression/h007_runtime_provenance.py
++++ b/gsplat/compression/h007_runtime_provenance.py
+@@ -29,6 +29,7 @@ PATCH_STAGES = (
+     "patch5",
+     "patch6",
+     "patch7",
++    "patch8",
+ )
+ TREE_ROOTS = ("examples", "gsplat", "third_party")
+ TREE_ROOT_FILES: Tuple[str, ...] = ("setup.py",)
+diff --git a/gsplat/compression/h007_sequence_container.py b/gsplat/compression/h007_sequence_container.py
+index 3f53da3..82802cd 100644
+--- a/gsplat/compression/h007_sequence_container.py
++++ b/gsplat/compression/h007_sequence_container.py
+@@ -967,7 +967,7 @@ def _ap_score_npz_contract(
+         "time_entropy_model_frozen_after_freeze.npy": scalar_bool,
+         "runtime_manifest_sha256.npy": ("<U64", ()),
+         "normalized_code_tree_sha256.npy": ("<U64", ()),
+-        "patch_chain_sha256.npy": ("<U64", (8,)),
++        "patch_chain_sha256.npy": ("<U64", (9,)),
+         "path_definition.npy": (_unicode_scalar_descr(AP_PATH_DEFINITION), ()),
+         "motion_definition.npy": (_unicode_scalar_descr(AP_MOTION_DEFINITION), ()),
+         "estimated_byte_definition.npy": (
+@@ -2192,6 +2192,14 @@ def _validate_ap_training_receipt_contract(
+         "time_feature_scaling",
+         "time_entropy_model_frozen_after_freeze",
+         "factor_membership_columns_frozen",
++        "path_contract_schema",
++        "path_dependency_rule",
++        "path_knn_count",
++        "path_knn_graph_sha256",
++        "factor_protected_multiplier",
++        "factor_background_multiplier",
++        "anchor_feature_protected_multiplier",
++        "anchor_feature_background_multiplier",
+         "path_loss_required",
+         "path_loss_lambda",
+         "path_loss_every",
+@@ -2205,7 +2213,7 @@ def _validate_ap_training_receipt_contract(
+     if not isinstance(receipt, dict) or set(receipt) != required:
+         raise ValueError("counted AP training receipt fields are incomplete or unexpected")
+     if (
+-        receipt["schema"] != "h007.ap_training_receipt.v1"
++        receipt["schema"] != "h007.ap_training_receipt.v2"
+         or receipt["variant"] != method
+         or receipt["runtime_provenance"] != dict(runtime_provenance)
+         or receipt["time_entropy_model_frozen_after_freeze"] is not True
+@@ -2219,7 +2227,11 @@ def _validate_ap_training_receipt_contract(
+         != "quantized_factor3_gt0_and_factor0_gt0"
+         or receipt["estimated_byte_rule"] != "exact_frozen_integer_subset_sum"
+         or receipt["path_loss_reference"]
+-        != "current_raw_stop_gradient_with_frozen_action_weights"
++        != "current_raw_full_graph_vs_simulated_retained_graph_on_retained_rows"
++        or receipt["path_contract_schema"]
++        != "h007.ap_gifstream.path_contract.v1"
++        or receipt["path_dependency_rule"]
++        != "protected-plus-one-hop-retained-knn"
+         or sha256_bytes(payload) != _require_sha256(
+             expected_sha256, "counted AP training receipt SHA-256"
+         )
+@@ -2239,6 +2251,17 @@ def _validate_ap_training_receipt_contract(
+         _finite_number(receipt[name], f"AP receipt {name}", positive=True)
+     _nonnegative_int(receipt["freeze_step"], "AP freeze step")
+     _nonnegative_int(receipt["random_seed"], "AP random seed")
++    _positive_int(receipt["path_knn_count"], "AP path KNN count")
++    _require_sha256(
++        receipt["path_knn_graph_sha256"], "AP retained-KNN graph SHA-256"
++    )
++    for name in (
++        "factor_protected_multiplier",
++        "factor_background_multiplier",
++        "anchor_feature_protected_multiplier",
++        "anchor_feature_background_multiplier",
++    ):
++        _finite_number(receipt[name], f"AP receipt {name}", positive=True)
+     _finite_number(
+         receipt["path_loss_lambda"], "AP path-loss lambda", nonnegative=True
+     )
+@@ -2323,7 +2346,7 @@ def _validate_runtime_provenance_shape(value: Any, label: str) -> Dict[str, Any]
+         value["schema"] != "h007.ap_gifstream.runtime_provenance.v1"
+         or value["official_commit"] != OFFICIAL_COMMIT
+         or not isinstance(value["patch_sha256"], list)
+-        or len(value["patch_sha256"]) != 8
++        or len(value["patch_sha256"]) != 9
+         or not isinstance(tree, dict)
+         or set(tree) != tree_required
+         or tree["schema"] != "h007.normalized_code_tree.v1"
+@@ -2346,18 +2369,38 @@ def _validate_meta_parameter(name: str, row: Any, method: str) -> None:
+         "anchor_features": {"shape", "dtype", "scaling", "length", "channel"},
+         "factors": {"shape", "dtype", "scaling"},
+     }
+-    if name == "time_features":
++    quantized_ap = method in QUANTIZED_AP_VARIANTS
++    if name == "anchor_features" and quantized_ap:
++        expected = {
++            "shape",
++            "dtype",
++            "ap_two_class_anchor_features",
++            "base_scaling",
++            "families",
++        }
++    elif name == "factors" and quantized_ap:
++        expected = {
++            "shape",
++            "dtype",
++            "ap_two_class_factors",
++            "base_scaling",
++            "factor0_activation_value",
++            "reconstruction_rule",
++            "families",
++        }
++    elif name == "time_features":
+         expected = (
+             {
+                 "shape",
+                 "dtype",
+                 "ap_two_class",
++                "precision_mask_contract",
+                 "base_scaling",
+                 "length",
+                 "channel",
+                 "families",
+             }
+-            if method in QUANTIZED_AP_VARIANTS
++            if quantized_ap
+             else {"shape", "dtype", "scaling", "length", "channel"}
+         )
+     else:
+@@ -2387,16 +2430,21 @@ def _validate_meta_parameter(name: str, row: Any, method: str) -> None:
+         _positive_int(row["length"], f"GIFStream {name} stream length")
+     if "channel" in row:
+         _positive_int(row["channel"], f"GIFStream {name} channel count")
+-    if name == "time_features" and method in QUANTIZED_AP_VARIANTS:
+-        if row["ap_two_class"] is not True:
+-            raise ValueError("AP temporal metadata lacks two-class coding")
+-        families = row["families"]
+-        if not isinstance(families, dict) or set(families) != {"ap", "bg"}:
+-            raise ValueError("AP temporal families are incomplete")
+-        _finite_number(
+-            row["base_scaling"], "AP temporal base scaling", positive=True
++    if name in {"anchor_features", "time_features"} and quantized_ap:
++        flag = (
++            row.get("ap_two_class_anchor_features")
++            if name == "anchor_features"
++            else row.get("ap_two_class")
+         )
+-        for family in ("ap", "bg"):
++        if flag is not True:
++            raise ValueError(f"AP {name} metadata lacks two-class coding")
++        if name == "time_features" and row.get("precision_mask_contract") != "path_input_mask":
++            raise ValueError("AP temporal metadata lacks the path-input precision contract")
++        families = row["families"]
++        if not isinstance(families, dict) or set(families) != {"path", "bg"}:
++            raise ValueError(f"AP {name} families are incomplete")
++        _finite_number(row["base_scaling"], f"AP {name} base scaling", positive=True)
++        for family in ("path", "bg"):
+             family_row = families[family]
+             if not isinstance(family_row, dict) or set(family_row) != {
+                 "rows",
+@@ -2405,26 +2453,59 @@ def _validate_meta_parameter(name: str, row: Any, method: str) -> None:
+                 "length",
+                 "channel",
+             }:
+-                raise ValueError(f"AP temporal family fields are unexpected: {family}")
+-            _nonnegative_int(
+-                family_row["rows"], f"AP {family} temporal family row count"
+-            )
+-            _finite_number(
+-                family_row["scaling"], f"AP {family} temporal scaling", positive=True
+-            )
+-            _finite_number(
+-                family_row["multiplier"],
+-                f"AP {family} temporal multiplier",
+-                positive=True,
+-            )
+-            _positive_int(
+-                family_row["length"], f"AP {family} temporal stream length"
+-            )
+-            _positive_int(
+-                family_row["channel"], f"AP {family} temporal channel count"
+-            )
+-
+-
++                raise ValueError(f"AP {name} family fields are unexpected: {family}")
++            _nonnegative_int(family_row["rows"], f"AP {family} {name} row count")
++            _finite_number(family_row["scaling"], f"AP {family} {name} scaling", positive=True)
++            _finite_number(family_row["multiplier"], f"AP {family} {name} multiplier", positive=True)
++            _positive_int(family_row["length"], f"AP {family} {name} stream length")
++            _positive_int(family_row["channel"], f"AP {family} {name} channel count")
++    if name == "factors" and quantized_ap:
++        if (
++            row["ap_two_class_factors"] is not True
++            or row["reconstruction_rule"]
++            != "adaptive-symbols+counted-factor0/factor3-semantics"
++        ):
++            raise ValueError("AP factor metadata lacks the v6 reconstruction contract")
++        _finite_number(row["base_scaling"], "AP factor base scaling", positive=True)
++        _finite_number(
++            row["factor0_activation_value"],
++            "AP factor0 activation value",
++            positive=True,
++        )
++        families = row["families"]
++        if not isinstance(families, dict) or set(families) != {"path", "bg"}:
++            raise ValueError("AP factor families are incomplete")
++        for family in ("path", "bg"):
++            family_row = families[family]
++            if not isinstance(family_row, dict) or set(family_row) != {
++                "rows",
++                "scaling",
++                "multiplier",
++                "path",
++                "bytes",
++                "sha256",
++            }:
++                raise ValueError(f"AP factor family fields are unexpected: {family}")
++            _nonnegative_int(family_row["rows"], f"AP {family} factor row count")
++            _finite_number(family_row["scaling"], f"AP {family} factor scaling", positive=True)
++            _finite_number(family_row["multiplier"], f"AP {family} factor multiplier", positive=True)
++            _nonnegative_int(family_row["bytes"], f"AP {family} factor bytes")
++            _require_sha256(family_row["sha256"], f"AP {family} factor SHA-256")
++            if int(family_row["rows"]) == 0:
++                if (
++                    int(family_row["bytes"]) != 0
++                    or family_row["sha256"] != sha256_bytes(b"")
++                ):
++                    raise ValueError(
++                        f"empty AP {family} factor family binding is invalid"
++                    )
++            elif int(family_row["bytes"]) <= 0:
++                raise ValueError(
++                    f"nonempty AP {family} factor family lacks a payload"
++                )
++            expected_path = f"factors_{family}.bin"
++            if family_row["path"] != expected_path:
++                raise ValueError(f"AP {family} factor stream path is noncanonical")
+ def _required_gifstream_streams(meta: Mapping[str, Any], method: str) -> Dict[str, str]:
+     """Derive the exact codec payload consumed by GIFStream's decoder.
+ 
+@@ -2473,12 +2554,39 @@ def _required_gifstream_streams(meta: Mapping[str, Any], method: str) -> Dict[st
+         "opacities.npz": "opacity_payload",
+         "scales.bin": "scale_entropy_stream",
+         "offsets.bin": "offset_entropy_stream",
+-        "factors.bin": "factor_entropy_stream",
+     }
+     anchor_meta = meta["anchor_features"]
+-    anchor_length = _positive_int(anchor_meta.get("length"), "anchor-feature stream length")
+-    for index in range(anchor_length):
+-        streams[f"anchor_features_{index:05d}.bin"] = "anchor_feature_entropy_stream"
++    if method in QUANTIZED_AP_VARIANTS:
++        for family in ("path", "bg"):
++            family_meta = anchor_meta["families"][family]
++            if _nonnegative_int(
++                family_meta["rows"], f"{family} anchor-feature rows"
++            ):
++                for index in range(
++                    _positive_int(
++                        family_meta["length"],
++                        f"{family} anchor-feature stream length",
++                    )
++                ):
++                    streams[
++                        f"anchor_features_{family}_{index:05d}.bin"
++                    ] = f"{family}_anchor_feature_entropy_stream"
++        factor_meta = meta["factors"]
++        for family in ("path", "bg"):
++            family_meta = factor_meta["families"][family]
++            if _nonnegative_int(family_meta["rows"], f"{family} factor rows"):
++                streams[str(family_meta["path"])] = (
++                    f"{family}_factor_entropy_stream"
++                )
++    else:
++        streams["factors.bin"] = "factor_entropy_stream"
++        anchor_length = _positive_int(
++            anchor_meta.get("length"), "anchor-feature stream length"
++        )
++        for index in range(anchor_length):
++            streams[
++                f"anchor_features_{index:05d}.bin"
++            ] = "anchor_feature_entropy_stream"
+ 
+     time_meta = meta["time_features"]
+     if method == "official":
+@@ -2490,9 +2598,9 @@ def _required_gifstream_streams(meta: Mapping[str, Any], method: str) -> Dict[st
+     else:
+         if time_meta.get("ap_two_class") is True:
+             families = time_meta.get("families")
+-            if not isinstance(families, dict) or set(families) != {"ap", "bg"}:
++            if not isinstance(families, dict) or set(families) != {"path", "bg"}:
+                 raise ValueError("AP GIFStream temporal families are incomplete")
+-            for family in ("ap", "bg"):
++            for family in ("path", "bg"):
+                 family_meta = families[family]
+                 if not isinstance(family_meta, dict):
+                     raise ValueError(f"AP temporal family metadata is malformed: {family}")
+@@ -2528,6 +2636,8 @@ def _required_gifstream_streams(meta: Mapping[str, Any], method: str) -> Dict[st
+             "q_ap_multiplier",
+             "q_bg_multiplier",
+             "mask",
++            "path_input_mask",
++            "path_contract",
+             "real_row_mask",
+             "padding_row_mask",
+             "active_row_mask",
+@@ -2536,12 +2646,55 @@ def _required_gifstream_streams(meta: Mapping[str, Any], method: str) -> Dict[st
+         if (
+             not isinstance(ap_meta, dict)
+             or set(ap_meta) != ap_required
+-            or ap_meta.get("schema") != "h007.ap_gifstream.codec.v5"
++            or ap_meta.get("schema") != "h007.ap_gifstream.codec.v6"
+             or ap_meta.get("variant", {}).get("name") != method
+         ):
+             raise ValueError("AP codec metadata variant differs from decoder config")
+         if ap_meta["variant"] != AP_VARIANT_METADATA.get(method):
+             raise ValueError("AP variant metadata differs from the frozen producer")
++        path_contract = ap_meta["path_contract"]
++        if (
++            not isinstance(path_contract, dict)
++            or set(path_contract)
++            != {
++                "schema",
++                "knn_count",
++                "knn_rule",
++                "dependency_rule",
++                "retained_knn_graph_sha256",
++                "canonical_anchor_reconstruction",
++                "factor_protected_multiplier",
++                "factor_background_multiplier",
++                "anchor_feature_protected_multiplier",
++                "anchor_feature_background_multiplier",
++            }
++            or path_contract["schema"]
++            != "h007.ap_gifstream.path_contract.v1"
++            or path_contract["dependency_rule"]
++            != "protected-plus-one-hop-retained-knn"
++            or path_contract["knn_rule"]
++            != "retained-canonical-radius-complete-distance+lexicographic-id"
++            or path_contract["canonical_anchor_reconstruction"] is not True
++            or path_contract["factor_protected_multiplier"] != 1.0 / 256.0
++            or path_contract["factor_background_multiplier"] != 1.0 / 64.0
++            or path_contract["anchor_feature_protected_multiplier"] != 0.25
++            or path_contract["anchor_feature_background_multiplier"] != 1.0
++        ):
++            raise ValueError("AP-v6 path contract is incomplete")
++        _positive_int(path_contract["knn_count"], "AP path-contract KNN count")
++        _require_sha256(
++            path_contract["retained_knn_graph_sha256"],
++            "AP retained-KNN graph SHA-256",
++        )
++        for name in (
++            "factor_protected_multiplier",
++            "factor_background_multiplier",
++            "anchor_feature_protected_multiplier",
++            "anchor_feature_background_multiplier",
++        ):
++            _finite_number(
++                path_contract[name], f"AP path-contract {name}", positive=True
++            )
+         score_required = {
+             "schema",
+             "score_artifact",
+@@ -2678,6 +2831,10 @@ def _required_gifstream_streams(meta: Mapping[str, Any], method: str) -> Dict[st
+         )
+         fixed_ap = {
+             "mask": ("ap_class_mask.bin", "ap_class_mask"),
++            "path_input_mask": (
++                "ap_path_input_mask.bin",
++                "ap_path_input_mask",
++            ),
+             "real_row_mask": ("ap_real_row_mask.bin", "ap_real_row_mask"),
+             "padding_row_mask": ("ap_padding_row_mask.bin", "ap_padding_row_mask"),
+             "active_row_mask": ("ap_active_row_mask.bin", "ap_active_row_mask"),
+@@ -2690,10 +2847,17 @@ def _required_gifstream_streams(meta: Mapping[str, Any], method: str) -> Dict[st
+             record = ap_meta.get(key)
+             if not isinstance(record, dict) or record.get("path") != filename:
+                 raise ValueError(f"AP metadata has an unsafe/noncanonical sidecar path: {key}")
+-            if key in {"mask", "real_row_mask", "padding_row_mask", "active_row_mask"}:
++            if key in {
++                "mask",
++                "path_input_mask",
++                "real_row_mask",
++                "padding_row_mask",
++                "active_row_mask",
++            }:
+                 required = {"path", "count", "true_count", "bytes", "sha256", "bitorder"}
+                 expected_true_count = {
+                     "mask": class_count,
++                    "path_input_mask": record.get("true_count"),
+                     "real_row_mask": real_count,
+                     "padding_row_mask": padding_count,
+                     "active_row_mask": active_count,
+@@ -2703,6 +2867,14 @@ def _required_gifstream_streams(meta: Mapping[str, Any], method: str) -> Dict[st
+                     or record.get("bitorder") != "little"
+                     or record.get("count") != encoded_count
+                     or record.get("true_count") != expected_true_count
++                    or (
++                        key == "path_input_mask"
++                        and (
++                            type(record.get("true_count")) is not int
++                            or record.get("true_count") < class_count
++                            or record.get("true_count") > real_count
++                        )
++                    )
+                 ):
+                     raise ValueError(f"AP mask metadata is malformed: {key}")
+             else:
+@@ -2826,8 +2998,8 @@ def _validate_gifstream_decoder_closure(
+         raise ValueError("GOP decoder config is not the frozen GIFStream decoder contract")
+     _validate_decoder_config_discrete_types(config)
+     patch_chain = config.get("patch_chain_sha256")
+-    if not isinstance(patch_chain, list) or len(patch_chain) != 8:
+-        raise ValueError("GIFStream GOP is not bound to the registered eight-stage runtime")
++    if not isinstance(patch_chain, list) or len(patch_chain) != 9:
++        raise ValueError("GIFStream GOP is not bound to the registered nine-stage runtime")
+     for index, digest in enumerate(patch_chain):
+         _require_sha256(digest, f"patch-chain entry {index} SHA-256")
+     manifest_sha = _require_sha256(
+@@ -2877,6 +3049,7 @@ def _validate_gifstream_decoder_closure(
+             "patch5",
+             "patch6",
+             "patch7",
++            "patch8",
+         ]
+         or any(
+             not isinstance(row, dict)
+@@ -2902,8 +3075,15 @@ def _validate_gifstream_decoder_closure(
+         ap_meta = meta["__ap__"]
+         if ap_meta.get("runtime_provenance") != runtime_provenance:
+             raise ValueError("AP codec metadata runtime provenance differs from the GOP")
++        if int(ap_meta["path_contract"]["knn_count"]) != int(
++            config["n_knn"]
++        ):
++            raise ValueError(
++                "AP path-contract KNN count differs from decoder config"
++            )
+         for key in (
+             "mask",
++            "path_input_mask",
+             "real_row_mask",
+             "padding_row_mask",
+             "active_row_mask",
+@@ -2916,7 +3096,13 @@ def _validate_gifstream_decoder_closure(
+                 or sha256_bytes(sidecar_payload) != record["sha256"]
+             ):
+                 raise ValueError(f"AP metadata/sidecar byte binding mismatch: {key}")
+-            if key in {"mask", "real_row_mask", "padding_row_mask", "active_row_mask"}:
++            if key in {
++                "mask",
++                "path_input_mask",
++                "real_row_mask",
++                "padding_row_mask",
++                "active_row_mask",
++            }:
+                 _packed_bool_mask_contract(
+                     sidecar_payload,
+                     record["count"],
+@@ -2927,6 +3113,24 @@ def _validate_gifstream_decoder_closure(
+                 _identity_correction_payload_contract(
+                     sidecar_payload, record, "AP identity corrections"
+                 )
++        if method in QUANTIZED_AP_VARIANTS:
++            for family in ("path", "bg"):
++                factor_record = meta["factors"]["families"][family]
++                if int(factor_record["rows"]) == 0:
++                    if int(factor_record["bytes"]) != 0:
++                        raise ValueError(
++                            f"empty AP {family} factor family has counted bytes"
++                        )
++                    continue
++                factor_payload = handle.read(factor_record["path"])
++                if (
++                    len(factor_payload) != int(factor_record["bytes"])
++                    or sha256_bytes(factor_payload)
++                    != factor_record["sha256"]
++                ):
++                    raise ValueError(
++                        f"AP {family} factor metadata/stream binding mismatch"
++                    )
+     payload_manifest_payload = handle.read("gifstream_payload_manifest.json")
+     payload_manifest = _strict_canonical_json(
+         payload_manifest_payload, "counted GIFStream payload manifest"
+@@ -2987,6 +3191,21 @@ def _validate_gifstream_decoder_closure(
+             or row["sha256"] != sha256_bytes(payload)
+         ):
+             raise ValueError(f"GIFStream payload-manifest binding mismatch: {name}")
++    if method in QUANTIZED_AP_VARIANTS:
++        for family in ("path", "bg"):
++            factor_row = meta["factors"]["families"][family]
++            if int(factor_row["rows"]) == 0:
++                if int(factor_row["bytes"]) != 0:
++                    raise ValueError("empty AP factor family has nonzero bytes")
++                continue
++            bound = declared_inputs[str(factor_row["path"])]
++            if (
++                int(factor_row["bytes"]) != int(bound["bytes"])
++                or factor_row["sha256"] != bound["sha256"]
++            ):
++                raise ValueError(
++                    f"AP {family} factor metadata differs from counted payload"
++                )
+     optional_ap = {"ap_training_receipt.json"} if method != "official" else set()
+     edit_group = {
+         "ap_edit_hook.json",
+@@ -4364,7 +4583,7 @@ def validate_eligibility_recomputation_contract(
+         runtime["schema"] != "h007.ap_gifstream.runtime_provenance.v1"
+         or runtime["official_commit"] != OFFICIAL_COMMIT
+         or not isinstance(patches, list)
+-        or len(patches) != 8
++        or len(patches) != 9
+         or not isinstance(tree, dict)
+         or set(tree)
+         != {
+@@ -4861,7 +5080,7 @@ def _validate_ordinary_rate_quality_evidence(
+ 
+     The request JSON contains no trusted PASS flag.  This function opens every
+     referenced archive and every source RGB member, validates the active
+-    registered eight-stage runtime, and recomputes the ordinary rate/quality accounting.
++    registered nine-stage runtime, and recomputes the ordinary rate/quality accounting.
+     """
+ 
+     evidence = _strict_canonical_json(payload, "ordinary rate-quality evidence")
+@@ -4930,8 +5149,8 @@ def _validate_ordinary_rate_quality_evidence(
+         runtime_repo_root,
+         runtime_sha,
+     )
+-    if len(runtime_receipt.get("patch_sha256", [])) != 8:
+-        raise ValueError("ordinary evidence does not bind the registered eight-stage runtime")
++    if len(runtime_receipt.get("patch_sha256", [])) != 9:
++        raise ValueError("ordinary evidence does not bind the registered nine-stage runtime")
+     evaluator_relative = _nonempty_string(
+         evidence["evaluator_relative_path"], "ordinary evaluator relative path"
+     )
+diff --git a/gsplat/compression_simulation/simulation.py b/gsplat/compression_simulation/simulation.py
+index 90a6e44..9813ca0 100644
+--- a/gsplat/compression_simulation/simulation.py
++++ b/gsplat/compression_simulation/simulation.py
+@@ -6,6 +6,16 @@ import torch.nn.functional as F
+ from torch import Tensor, device
+ 
+ from .ops import fake_quantize_ste, log_transform, inverse_log_transform, fake_quantize_scaling, fake_quantize_factors
++from gsplat.compression.h007_path_contract import (
++    ANCHOR_FEATURE_BACKGROUND_MULTIPLIER,
++    ANCHOR_FEATURE_PROTECTED_MULTIPLIER,
++    FACTOR_BACKGROUND_MULTIPLIER,
++    FACTOR_PROTECTED_MULTIPLIER,
++    PATH_CONTRACT_SCHEMA,
++    normalize_factor_semantics,
++    reconstruct_ap_factors,
++    ste_row_quantize,
++)
+ from .entropy_model import Entropy_factorized, Entropy_factorized_optimized, Entropy_factorized_optimized_refactor, Entropy_gaussian, ConditionEntropy
+ from gsplat.compression_simulation import entropy_model
+ from gsplat.compression.ap_gifstream import canonical_voxel_ids, variant_spec
+@@ -667,19 +677,39 @@ class GIFStreamCompressionSimulation:
+     @staticmethod
+     def _apply_factor_mask(
+         factors: Tensor, column: int, target: Tensor, activation_value: float
+-    ) -> None:
++    ) -> Tensor:
++        if factors.ndim != 2 or column < 0 or column >= factors.shape[1]:
++            raise ValueError("factor tensor/column is malformed")
++        target = target.to(device=factors.device, dtype=torch.bool)
++        if target.shape != (factors.shape[0],):
++            raise ValueError("factor target mask has an invalid shape")
+         current = factors[:, column] > 0
+-        promoted = target & ~current
+-        demoted = ~target & current
+         if not torch.isfinite(torch.tensor(activation_value)) or activation_value <= 0:
+             raise ValueError(f"invalid frozen activation value for factor column {column}")
+-        if promoted.any():
+-            factors[promoted, column] = float(activation_value)
+-        factors[demoted, column] = 0.0
+-        if not torch.equal(factors[:, column] > 0, target):
++        replacement = torch.where(
++            target,
++            torch.where(
++                current,
++                factors[:, column],
++                torch.full_like(factors[:, column], float(activation_value)),
++            ),
++            torch.zeros_like(factors[:, column]),
++        )
++        output = torch.cat(
++            [
++                factors[:, :column],
++                replacement[:, None],
++                factors[:, column + 1 :],
++            ],
++            dim=1,
++        )
++        if not torch.equal(output[:, column] > 0, target):
+             raise AssertionError(f"factor column {column} does not match frozen AP mask")
++        return output
+ 
+-    def _apply_ap_state(self, splats: Dict[str, Tensor], factors: Tensor, ap_state: Dict) -> Dict:
++    def _apply_ap_state(
++        self, splats: Dict[str, Tensor], factors: Tensor, ap_state: Dict
++    ) -> Tuple[Tensor, Dict]:
+         spec = variant_spec(str(ap_state["variant"]))
+         ids = canonical_voxel_ids(splats["anchors"], float(ap_state["voxel_size"]))
+         if not torch.equal(ids, ap_state["canonical_ids"].to(ids.device)):
+@@ -689,22 +719,34 @@ class GIFStreamCompressionSimulation:
+         ap_retain = ap_state["ap_retain_mask"].to(factors.device, dtype=torch.bool)
+         ap_active = ap_state["ap_active_mask"].to(factors.device, dtype=torch.bool)
+         temporal_class = ap_state["ap_class_mask"].to(factors.device, dtype=torch.bool)
++        path_input_mask = ap_state["ap_path_input_mask"].to(
++            factors.device, dtype=torch.bool
++        )
++        if ap_state.get("path_contract_schema") != PATH_CONTRACT_SCHEMA:
++            raise ValueError("AP state lacks the registered path-input contract")
+         if torch.any(ap_active & ~ap_retain):
+             raise ValueError("frozen AP active mask escapes whole-retain mask")
+-        self._apply_factor_mask(
++        if torch.any(temporal_class & ~ap_active):
++            raise ValueError("protected AP class contains an inactive row")
++        if torch.any(path_input_mask & ~ap_retain) or torch.any(
++            temporal_class & ~path_input_mask
++        ):
++            raise ValueError("AP path-input precision mask is not a retained closure")
++        factors = self._apply_factor_mask(
+             factors,
+             3,
+             ap_retain,
+             float(ap_state["factor3_activation_value"]),
+         )
+-        self._apply_factor_mask(
++        factors = self._apply_factor_mask(
+             factors,
+             0,
+             ap_active,
+             float(ap_state["factor0_activation_value"]),
+         )
+-        return {
++        return factors, {
+             "class_mask": temporal_class,
++            "path_input_mask": path_input_mask,
+             "active_mask": ap_active,
+             "retain_mask": ap_retain,
+             "whole": ap_state["whole_allocation_audit"],
+@@ -727,6 +769,21 @@ class GIFStreamCompressionSimulation:
+             "quant": spec.quant,
+             "q_ap_multiplier": float(ap_state["q_ap_multiplier"]),
+             "q_bg_multiplier": float(ap_state["q_bg_multiplier"]),
++            "factor0_activation_value": float(
++                ap_state["factor0_activation_value"]
++            ),
++            # Straight-through canonicalization: exact AP-v6 forward
++            # coordinates with the original anchor gradient.  This mirrors the
++            # encoder/decoder's canonical-id * voxel-size reconstruction.
++            "canonical_anchors": splats["anchors"]
++            + (
++                ids.to(
++                    device=splats["anchors"].device,
++                    dtype=splats["anchors"].dtype,
++                )
++                * float(ap_state["voxel_size"])
++                - splats["anchors"]
++            ).detach(),
+         }
+ 
+     def simulate_compression(self, splats: Dict[str, Tensor], step: int, frame_idx: int = 0, c_channel: int = 0, ap_state: Optional[Dict] = None) -> Dict[str, Tensor]:
+@@ -750,37 +807,80 @@ class GIFStreamCompressionSimulation:
+             "frame_idx": frame_idx,
+             "c_channel": c_channel
+         }
+-        # Factor quantization must precede temporal simulation for every mode.
+-        # ParameterDict places time_features before factors, while the real
+-        # encoder prunes on quantized factor3 and then activates on factor0.
+-        factors, factor_bits = self.simulate_compression_factors(
++        # Establish the official factor membership first.  AP then applies the
++        # frozen masks before the one-and-only protected factor symbolization.
++        base_factors, factor_bits = self.simulate_compression_factors(
+             splats["factors"], step, choose_idx, pos, **kwargs
+         )
+-        factors = factors.clone()
+-        new_splats["factors"] = factors
+-        esti_bits_dict["factors"] = factor_bits
+-        kwargs["factors"] = factors
+-        kwargs["ap_active_mask"] = (factors[:, 3] > 0) & (factors[:, 0] > 0)
++        factors = base_factors.clone()
+         self.last_ap_audit = None
++        ap_context = None
+         if ap_state is not None:
+-            ap_context = self._apply_ap_state(splats, factors, ap_state)
++            factors, ap_context = self._apply_ap_state(
++                splats, factors, ap_state
++            )
+             self.last_ap_audit = {
+                 key: value
+                 for key, value in ap_context.items()
+-                if key not in {"class_mask", "active_mask", "retain_mask"}
++                if key
++                not in {
++                    "class_mask",
++                    "path_input_mask",
++                    "active_mask",
++                    "retain_mask",
++                    "canonical_anchors",
++                }
+             }
+             kwargs.update(
+                 {
+                     "factors": factors,
+                     "ap_class_mask": ap_context["class_mask"],
++                    "ap_path_input_mask": ap_context["path_input_mask"],
+                     "ap_active_mask": ap_context["active_mask"],
++                    "ap_retain_mask": ap_context["retain_mask"],
+                     "ap_quant": ap_context["quant"],
+                     "q_ap_multiplier": ap_context["q_ap_multiplier"],
+                     "q_bg_multiplier": ap_context["q_bg_multiplier"],
++                    "factor0_activation_value": ap_context[
++                        "factor0_activation_value"
++                    ],
+                 }
+             )
++
++        # The adaptive factor distribution is conditioned on the exact
++        # reconstructed anchor features.  Build that condition before factors
++        # for AP-v6; official/non-quantized modes retain the legacy order.
++        anchor_features_precomputed = bool(
++            ap_context is not None and ap_context["quant"]
++        )
++        if anchor_features_precomputed:
++            anchor_features, anchor_bits = self.simulate_compression_anchor_features(
++                splats["anchor_features"], step, choose_idx, pos, **kwargs
++            )
++            new_splats["anchor_features"] = anchor_features
++            esti_bits_dict["anchor_features"] = anchor_bits
++            kwargs["anchor_features"] = anchor_features
++            factors, factor_bits = self.simulate_compression_ap_factors(
++                splats["factors"], step, choose_idx, pos, **kwargs
++            )
++
++        new_splats["factors"] = factors
++        esti_bits_dict["factors"] = factor_bits
++        if ap_context is not None:
++            new_splats["anchors"] = ap_context["canonical_anchors"]
++            esti_bits_dict["anchors"] = None
++        kwargs["factors"] = factors
++        kwargs["ap_active_mask"] = (
++            ap_context["active_mask"]
++            if ap_context is not None
++            else (factors[:, 3] > 0) & (factors[:, 0] > 0)
++        )
+         for param_name in splats.keys():
+-            if param_name == "factors":
++            if param_name == "factors" or (
++                param_name == "anchor_features" and anchor_features_precomputed
++            ) or (
++                param_name == "anchors" and ap_context is not None
++            ):
+                 continue
+             # Check which params need to be simulate
+             if self.simulation_option[param_name]:
+@@ -803,7 +903,13 @@ class GIFStreamCompressionSimulation:
+ 
+         # entropy constraint
+         if step > self.entropy_steps["scales"] and self.entropy_model_enable:
+-            anchor_features = fake_quantize_scaling(kwargs["anchor_features"], self.scaling["anchor_features"])["output_value"].detach()
++            anchor_features = (
++                kwargs["anchor_features"].detach()
++                if kwargs.get("ap_quant", False)
++                else fake_quantize_scaling(
++                    kwargs["anchor_features"], self.scaling["anchor_features"]
++                )["output_value"].detach()
++            )
+             esti_bits, qs = self.entropy_models["scales"](param / self.scaling["scales"], anchor_features, adaptive=True)
+             
+             if step < 0.2 * self.max_steps:
+@@ -831,7 +937,17 @@ class GIFStreamCompressionSimulation:
+ 
+     def simulate_compression_anchor_features(self, param: torch.nn.Parameter, step: int, choose_idx: torch.Tensor, pos: torch.Tensor=None, **kwargs) -> Tensor:
+         # fake quantize
+-        if step < 0.2 * self.max_steps:
++        if kwargs.get("ap_quant", False):
++            fq_out_dict = {
++                "output_value": ste_row_quantize(
++                    param,
++                    kwargs["ap_path_input_mask"],
++                    float(self.scaling["anchor_features"]),
++                    ANCHOR_FEATURE_PROTECTED_MULTIPLIER,
++                    ANCHOR_FEATURE_BACKGROUND_MULTIPLIER,
++                )
++            }
++        elif step < 0.2 * self.max_steps:
+             fq_out_dict = fake_quantize_scaling(param, self.scaling["anchor_features"] * 0.001)
+         elif step < 2/3 * self.max_steps:
+             fq_out_dict = fake_quantize_scaling(param, self.scaling["anchor_features"], q_type="noise")
+@@ -841,7 +957,60 @@ class GIFStreamCompressionSimulation:
+         # entropy constraint
+         if step > self.entropy_steps["anchor_features"] and self.entropy_model_enable:
+             c_channel = kwargs["c_channel"]
+-            N,f_channel = fq_out_dict["output_value"].shape
++            N, f_channel = fq_out_dict["output_value"].shape
++            if kwargs.get("ap_quant", False):
++                masks_and_q = (
++                    (
++                        kwargs["ap_path_input_mask"].to(param.device, dtype=torch.bool),
++                        float(self.scaling["anchor_features"])
++                        * ANCHOR_FEATURE_PROTECTED_MULTIPLIER,
++                    ),
++                    (
++                        ~kwargs["ap_path_input_mask"].to(param.device, dtype=torch.bool),
++                        float(self.scaling["anchor_features"])
++                        * ANCHOR_FEATURE_BACKGROUND_MULTIPLIER,
++                    ),
++                )
++                parts = []
++                weights = []
++                for family_mask, family_q in masks_and_q:
++                    if not family_mask.any():
++                        continue
++                    family_output = fq_out_dict["output_value"][family_mask] / family_q
++                    family_param = param[family_mask] / family_q
++                    condition = torch.cat(
++                        [
++                            torch.zeros(
++                                (family_output.shape[0], 3 * c_channel),
++                                device=param.device,
++                            ),
++                            family_output,
++                        ],
++                        dim=-1,
++                    )
++                    condition = torch.cat(
++                        [
++                            condition.view(
++                                (family_output.shape[0], -1, c_channel)
++                            )[:, x : -3 + x]
++                            for x in range(3)
++                        ],
++                        dim=-1,
++                    )
++                    parts.append(
++                        self.entropy_models["anchor_features"](
++                            family_param.view((-1, c_channel)),
++                            condition.flatten(0, 1),
++                        )
++                    )
++                    weights.append(int(family_mask.sum().item()))
++                esti_bits = (
++                    sum(part * weight for part, weight in zip(parts, weights))
++                    / sum(weights)
++                    if parts
++                    else None
++                )
++                return fq_out_dict["output_value"].reshape(param.shape), esti_bits
+             condition = torch.cat([torch.zeros((N,3*c_channel), device=param.device), fq_out_dict["output_value"]],dim=-1)
+             condition = torch.cat([condition.view((N,-1,c_channel))[:,x:-3+x] for x in range(3)],dim=-1)
+             fq_out_dict["output_value"] = fq_out_dict["output_value"].squeeze(1)
+@@ -858,7 +1027,13 @@ class GIFStreamCompressionSimulation:
+ 
+         # entropy constraint
+         if step > self.entropy_steps["offsets"] and self.entropy_model_enable:
+-            anchor_features = fake_quantize_scaling(kwargs["anchor_features"], self.scaling["anchor_features"])["output_value"].detach()
++            anchor_features = (
++                kwargs["anchor_features"].detach()
++                if kwargs.get("ap_quant", False)
++                else fake_quantize_scaling(
++                    kwargs["anchor_features"], self.scaling["anchor_features"]
++                )["output_value"].detach()
++            )
+ 
+             esti_bits, qs = self.entropy_models["offsets"](param / self.scaling["offsets"], anchor_features, adaptive=True)
+             
+@@ -907,11 +1082,69 @@ class GIFStreamCompressionSimulation:
+             else:
+                 fq_out_dict = fake_quantize_factors(param, self.scaling["factors"], q_aware=True, q_type="round")
+             return (fq_out_dict), None
++
++    def simulate_compression_ap_factors(
++        self,
++        param: torch.nn.Parameter,
++        step: int,
++        choose_idx: torch.Tensor,
++        pos: torch.Tensor = None,
++        **kwargs,
++    ) -> Tensor:
++        """Use the same AP-v6 factor symbols as the real entropy stream."""
++
++        reconstruction, _ = reconstruct_ap_factors(
++            param,
++            kwargs["anchor_features"],
++            self.entropy_models["factors"],
++            float(self.scaling["factors"]),
++            kwargs["ap_path_input_mask"],
++            FACTOR_PROTECTED_MULTIPLIER,
++            FACTOR_BACKGROUND_MULTIPLIER,
++            kwargs["ap_active_mask"],
++            kwargs["ap_retain_mask"],
++            float(kwargs.get("factor0_activation_value", 0.1)),
++        )
++        esti_bits = None
++        if step > self.entropy_steps["factors"] and self.entropy_model_enable:
++            active = normalize_factor_semantics(
++                torch.sigmoid(param),
++                kwargs["ap_active_mask"],
++                kwargs["ap_retain_mask"],
++                float(kwargs.get("factor0_activation_value", 0.1)),
++            )
++            parts = []
++            weights = []
++            for family_mask, multiplier in (
++                (
++                    kwargs["ap_path_input_mask"].to(param.device, dtype=torch.bool),
++                    FACTOR_PROTECTED_MULTIPLIER,
++                ),
++                (
++                    ~kwargs["ap_path_input_mask"].to(param.device, dtype=torch.bool),
++                    FACTOR_BACKGROUND_MULTIPLIER,
++                ),
++            ):
++                if not family_mask.any():
++                    continue
++                family_q = float(self.scaling["factors"]) * float(multiplier)
++                part, _ = self.entropy_models["factors"](
++                    active[family_mask] / family_q,
++                    kwargs["anchor_features"][family_mask],
++                    adaptive=True,
++                )
++                parts.append(part)
++                weights.append(int(family_mask.sum().item()))
++            if parts:
++                esti_bits = sum(
++                    part * weight for part, weight in zip(parts, weights)
++                ) / sum(weights)
++        return reconstruction, esti_bits
+         
+     def simulate_compression_time_features(self, param: torch.nn.Parameter, step: int, choose_idx: torch.Tensor, pos: torch.Tensor=None, **kwargs) -> Tensor:
+         # fake quantize
+         if kwargs.get("ap_quant", False):
+-            class_mask = kwargs["ap_class_mask"].to(param.device).view(-1, 1, 1)
++            class_mask = kwargs["ap_path_input_mask"].to(param.device).view(-1, 1, 1)
+             q_ap = float(self.scaling["time_features"]) * float(kwargs["q_ap_multiplier"])
+             q_bg = float(self.scaling["time_features"]) * float(kwargs["q_bg_multiplier"])
+             q = torch.where(class_mask, q_ap, q_bg)
+@@ -933,7 +1166,9 @@ class GIFStreamCompressionSimulation:
+             esti_parts = []
+             weight_parts = []
+             if kwargs.get("ap_quant", False):
+-                class_mask = kwargs["ap_class_mask"].to(param.device, dtype=torch.bool)
++                class_mask = kwargs["ap_path_input_mask"].to(
++                    param.device, dtype=torch.bool
++                )
+                 families = (
+                     (active_mask & class_mask, float(self.scaling["time_features"]) * float(kwargs["q_ap_multiplier"])),
+                     (active_mask & ~class_mask, float(self.scaling["time_features"]) * float(kwargs["q_bg_multiplier"])),
+diff --git a/tests/test_ap_gifstream_core.py b/tests/test_ap_gifstream_core.py
+index 75b3e70..045c930 100644
+--- a/tests/test_ap_gifstream_core.py
++++ b/tests/test_ap_gifstream_core.py
+@@ -24,16 +24,30 @@ from gsplat.compression.ap_gifstream import (
+ )
+ from gsplat.compression.h007_clean_runtime import (
+     build_decoder_modules,
++    counted_knn_indices,
+     instantiate_counted_models,
+ )
+ from gsplat.compression import h007_runtime_provenance as provenance
+ from gsplat.compression.gifstream_end2end_compression import (
+     _apply_factor_mask,
++    _compress_ap_anchor_features_ar,
++    _compress_ap_factors,
+     _compress_ap_time_features_ar,
++    _decompress_ap_anchor_features_ar,
++    _decompress_ap_factors,
+     _decompress_ap_time_features_ar,
+     _tensor_equal_device_agnostic,
+     _validate_counted_retained_identity,
+ )
++from gsplat.compression.h007_path_contract import (
++    build_codec_knn_indices,
++    build_path_input_precision_mask,
++    deterministic_knn_indices,
++    reconstruct_ap_factors,
++    retained_knn_graph_sha256,
++    ste_row_quantize,
++)
++from gsplat.compression_simulation.simulation import GIFStreamCompressionSimulation
+ 
+ 
+ class _RoundEntropy:
+@@ -46,6 +60,16 @@ class _RoundEntropy:
+         return torch.load(output_path, map_location=condition.device, weights_only=True)
+ 
+ 
++class _UnitAdaptiveRoundEntropy(_RoundEntropy):
++    """Adaptive entropy double with a unit reconstruction multiplier."""
++
++    def model(self, condition):
++        rows = condition.shape[0]
++        zeros = torch.zeros((rows, 4), dtype=condition.dtype, device=condition.device)
++        ones = torch.ones_like(zeros)
++        return torch.cat([zeros, ones, zeros], dim=-1)
++
++
+ class APGIFStreamCoreTest(unittest.TestCase):
+     @staticmethod
+     def _runtime_receipt():
+@@ -62,6 +86,7 @@ class APGIFStreamCoreTest(unittest.TestCase):
+                 "8" * 64,
+                 "9" * 64,
+                 "a" * 64,
++                "b" * 64,
+             ],
+             "normalized_code_tree": {"sha256": "5" * 64},
+         }
+@@ -102,6 +127,308 @@ class APGIFStreamCoreTest(unittest.TestCase):
+                 torch.zeros((3, 2)), 0, torch.tensor([True, False]), 0.0625
+             )
+ 
++    def test_deterministic_knn_is_row_permutation_invariant_with_ties(self):
++        anchors = torch.tensor(
++            [
++                [0.0, 0.0, 0.0],
++                [1.0, 0.0, 0.0],
++                [-1.0, 0.0, 0.0],
++                [0.0, 1.0, 0.0],
++                [0.0, -1.0, 0.0],
++            ],
++            dtype=torch.float32,
++        )
++        ids = anchors.to(torch.int64)
++        first = deterministic_knn_indices(anchors, 2, canonical_ids=ids)
++        permutation = torch.tensor([3, 0, 4, 2, 1], dtype=torch.int64)
++        second = deterministic_knn_indices(
++            anchors[permutation], 2, canonical_ids=ids[permutation]
++        )
++
++        def canonical_edges(row_ids, graph):
++            return {
++                tuple(row_ids[row].tolist()): tuple(
++                    tuple(value)
++                    for value in row_ids[graph[row]].tolist()
++                )
++                for row in range(row_ids.shape[0])
++            }
++
++        self.assertEqual(
++            canonical_edges(ids, first),
++            canonical_edges(ids[permutation], second),
++        )
++
++    def test_canonical_knn_ignores_predecode_float_ulp_drift(self):
++        ids = torch.tensor(
++            [
++                [0, 0, 0],
++                [1, 0, 0],
++                [-1, 0, 0],
++                [0, 1, 0],
++                [0, -1, 0],
++            ],
++            dtype=torch.int64,
++        )
++        decoded = ids.to(torch.float32) * 0.1
++        predecode = decoded.clone()
++        predecode[:, 0] += torch.tensor(
++            [0.0, 2e-8, -2e-8, 1e-8, -1e-8], dtype=torch.float32
++        )
++        expected = deterministic_knn_indices(
++            decoded, 2, canonical_ids=ids
++        )
++        actual = deterministic_knn_indices(
++            predecode, 2, canonical_ids=ids
++        )
++        self.assertTrue(torch.equal(actual, expected))
++
++    def test_counted_runtime_knn_uses_canonical_distance_authority(self):
++        ids = torch.tensor(
++            [
++                [0, 0, 0],
++                [1, 0, 0],
++                [-1, 0, 0],
++                [0, 1, 0],
++                [0, -1, 0],
++            ],
++            dtype=torch.int64,
++        )
++        decoded = ids.to(torch.float32) * 0.1
++        predecode = decoded.clone()
++        predecode[:, 0] += torch.tensor(
++            [0.0, 2e-8, -2e-8, 1e-8, -1e-8], dtype=torch.float32
++        )
++        config = {"knn": True, "n_knn": 2, "voxel_size": 0.1}
++        expected = counted_knn_indices({"anchors": decoded}, config)
++        actual = counted_knn_indices({"anchors": predecode}, config)
++        self.assertTrue(torch.equal(actual, expected))
++
++    def test_ap_simulation_uses_exact_canonical_anchor_forward_with_gradient(self):
++        ids = torch.tensor(
++            [
++                [0, 0, 0],
++                [1, 0, 0],
++                [-1, 0, 0],
++                [0, 1, 0],
++                [0, -1, 0],
++            ],
++            dtype=torch.int64,
++        )
++        anchors = ids.to(torch.float32) * 0.1
++        anchors[:, 0] += torch.tensor(
++            [0.0, 2e-8, -2e-8, 1e-8, -1e-8], dtype=torch.float32
++        )
++        anchors.requires_grad_(True)
++        all_rows = torch.ones(5, dtype=torch.bool)
++        protected = torch.tensor([True, False, False, False, False])
++        state = {
++            "variant": "path-swap",
++            "voxel_size": 0.1,
++            "canonical_ids": ids,
++            "ap_retain_mask": all_rows,
++            "ap_active_mask": all_rows,
++            "ap_class_mask": protected,
++            "ap_path_input_mask": all_rows,
++            "path_contract_schema": "h007.ap_gifstream.path_contract.v1",
++            "factor3_activation_value": 0.5,
++            "factor0_activation_value": 0.5,
++            "official_retain_mask": all_rows,
++            "official_active_mask": all_rows,
++            "whole_allocation_audit": {},
++            "temporal_allocation_audit": {},
++            "q_ap_multiplier": 0.5,
++            "q_bg_multiplier": 1.25,
++        }
++        simulator = object.__new__(GIFStreamCompressionSimulation)
++        factor_input = torch.ones(
++            (5, 4), dtype=torch.float32, requires_grad=True
++        )
++        masked_factors, context = simulator._apply_ap_state(
++            {"anchors": anchors},
++            factor_input,
++            state,
++        )
++        expected = ids.to(torch.float32) * 0.1
++        self.assertTrue(torch.equal(context["canonical_anchors"], expected))
++        (
++            context["canonical_anchors"].sum()
++            + masked_factors[:, 1:3].sum()
++        ).backward()
++        self.assertTrue(torch.equal(anchors.grad, torch.ones_like(anchors)))
++        self.assertTrue(
++            torch.equal(
++                factor_input.grad[:, 1:3],
++                torch.ones_like(factor_input[:, 1:3]),
++            )
++        )
++
++    def test_path_input_closure_and_codec_graph_exclude_dropped_rows(self):
++        anchors = torch.tensor(
++            [[float(index), 0.0, 0.0] for index in range(7)],
++            dtype=torch.float32,
++        )
++        ids = anchors.to(torch.int64)
++        retain = torch.tensor([True, False, True, True, True, True, False])
++        protected = torch.tensor([False, False, False, True, False, False, False])
++        precision, retained_knn = build_path_input_precision_mask(
++            anchors, protected, retain, 2, canonical_ids=ids
++        )
++        codec_graph, retained_rows, codec_retained_knn = build_codec_knn_indices(
++            anchors, retain, 2, canonical_ids=ids
++        )
++        self.assertTrue(torch.equal(retained_knn, codec_retained_knn))
++        self.assertTrue(torch.equal(precision & ~retain, torch.zeros_like(retain)))
++        self.assertTrue(precision[protected].all())
++        self.assertTrue(retain[codec_graph[retained_rows]].all())
++
++    def test_retained_knn_graph_hash_is_row_order_independent(self):
++        anchors = torch.tensor(
++            [
++                [0.0, 0.0, 0.0],
++                [1.0, 0.0, 0.0],
++                [0.0, 1.0, 0.0],
++                [1.0, 1.0, 0.0],
++            ],
++            dtype=torch.float32,
++        )
++        ids = anchors.to(torch.int64)
++        first = deterministic_knn_indices(anchors, 2, canonical_ids=ids)
++        first_hash = retained_knn_graph_sha256(ids, first)
++        permutation = torch.tensor([2, 0, 3, 1], dtype=torch.int64)
++        second = deterministic_knn_indices(
++            anchors[permutation], 2, canonical_ids=ids[permutation]
++        )
++        second_hash = retained_knn_graph_sha256(ids[permutation], second)
++        self.assertEqual(first_hash, second_hash)
++
++    def test_ap_factor_symbols_round_trip_all_four_semantics(self):
++        activated = torch.tensor(
++            [
++                [0.2, 0.3, 0.7, 0.8],
++                [0.4, 0.6, 0.2, 0.9],
++                [0.7, 0.8, 0.4, 0.6],
++                [0.9, 0.5, 0.5, 0.5],
++            ],
++            dtype=torch.float32,
++        )
++        logits = torch.logit(activated)
++        anchor_features = torch.zeros((4, 3), dtype=torch.float32)
++        precision = torch.tensor([True, False, True, False])
++        active = torch.tensor([True, False, True, False])
++        real = torch.tensor([True, True, True, False])
++        entropy = _UnitAdaptiveRoundEntropy()
++        expected, _ = reconstruct_ap_factors(
++            logits,
++            anchor_features,
++            entropy,
++            0.25,
++            precision,
++            0.25,
++            0.5,
++            active,
++            real,
++            0.125,
++        )
++        with tempfile.TemporaryDirectory() as tmp:
++            meta = _compress_ap_factors(
++                tmp,
++                "factors",
++                logits,
++                n_sidelen=2,
++                precision_mask=precision,
++                active_mask=active,
++                real_mask=real,
++                factor0_activation_value=0.125,
++                protected_multiplier=0.25,
++                background_multiplier=0.5,
++                expected_reconstruction=expected,
++                scaling=0.25,
++                anchor_features=anchor_features,
++                entropy_model=entropy,
++            )
++            decoded = _decompress_ap_factors(
++                tmp,
++                "factors",
++                meta,
++                anchor_features=anchor_features,
++                precision_mask=precision,
++                active_mask=active,
++                real_mask=real,
++                entropy_model=entropy,
++                device=torch.device("cpu"),
++            )
++            torch.testing.assert_close(decoded, expected, rtol=0.0, atol=1e-7)
++            self.assertTrue(torch.equal(decoded[:, 0] > 0, active))
++            self.assertTrue(torch.equal(decoded[:, 3] > 0, real))
++            path = Path(tmp) / "factors_path.bin"
++            path.write_bytes(path.read_bytes() + b"tamper")
++            with self.assertRaisesRegex(ValueError, "stream binding mismatch"):
++                _decompress_ap_factors(
++                    tmp,
++                    "factors",
++                    meta,
++                    anchor_features=anchor_features,
++                    precision_mask=precision,
++                    active_mask=active,
++                    real_mask=real,
++                    entropy_model=entropy,
++                    device=torch.device("cpu"),
++                )
++
++    def test_ap_factor_reconstruction_preserves_continuous_gradients(self):
++        logits = torch.zeros((3, 4), dtype=torch.float32, requires_grad=True)
++        anchor_features = torch.zeros((3, 2), dtype=torch.float32)
++        reconstruction, _ = reconstruct_ap_factors(
++            logits,
++            anchor_features,
++            _UnitAdaptiveRoundEntropy(),
++            0.25,
++            torch.tensor([True, False, True]),
++            0.25,
++            0.5,
++            torch.tensor([True, False, True]),
++            torch.tensor([True, True, True]),
++            0.125,
++        )
++        reconstruction[:, 1:3].sum().backward()
++        self.assertTrue(torch.isfinite(logits.grad).all())
++        self.assertTrue(torch.all(logits.grad[:, 1:3] != 0))
++
++    def test_ap_anchor_feature_two_family_round_trip_matches_simulator(self):
++        values = torch.tensor(
++            [
++                [0.12, 0.62, 1.12, 1.62],
++                [0.37, 0.87, 1.37, 1.87],
++            ],
++            dtype=torch.float32,
++        )
++        precision = torch.tensor([True, False])
++        expected = ste_row_quantize(values, precision, 0.5, 0.25, 1.0)
++        with tempfile.TemporaryDirectory() as tmp:
++            meta = _compress_ap_anchor_features_ar(
++                tmp,
++                "anchor_features",
++                values,
++                n_sidelen=2,
++                precision_mask=precision,
++                protected_multiplier=0.25,
++                background_multiplier=1.0,
++                expected_reconstruction=expected,
++                scaling=0.5,
++                c_channel=2,
++                entropy_model=_RoundEntropy(),
++            )
++            decoded = _decompress_ap_anchor_features_ar(
++                tmp,
++                "anchor_features",
++                meta,
++                precision_mask=precision,
++                entropy_model=_RoundEntropy(),
++                device=torch.device("cpu"),
++            )
++        torch.testing.assert_close(decoded, expected, rtol=0.0, atol=1e-7)
++
+     def test_tensor_equality_helper_preserves_dtype_and_value(self):
+         left = torch.tensor([1, 2], dtype=torch.int64)
+         self.assertTrue(_tensor_equal_device_agnostic(left, left.clone()))
+@@ -168,6 +495,7 @@ class APGIFStreamCoreTest(unittest.TestCase):
+                         "8" * 64,
+                         "9" * 64,
+                         "a" * 64,
++                        "b" * 64,
+                     ]
+                 ),
+             )
+@@ -369,6 +697,10 @@ class APGIFStreamCoreTest(unittest.TestCase):
+         factors = torch.zeros((4, 4))
+         factors[pre_real, 3] = 1.0
+         factors[pre_active, 0] = 1.0
++        raw_factors = torch.tensor(
++            [[0.1, 0.2, 0.3, 0.4], [0.5, 0.6, 0.7, 0.8]]
++        )
++        padded_raw_factors = torch.cat([raw_factors, torch.zeros((2, 4))])
+         kwargs = {
+             "official_retain_mask": torch.tensor([True, True, False, False]),
+             "official_active_mask": torch.tensor([True, False, False, False]),
+@@ -378,13 +710,18 @@ class APGIFStreamCoreTest(unittest.TestCase):
+             "source_estimated_bytes": source_bytes,
+             "pre_sort_retained_ids": ids,
+             "pre_sort_estimated_bytes": retained_bytes,
++            "pre_sort_path_input_mask": pre_class[:2],
++            "pre_sort_encoded_factors": factors[:2],
++            "pre_sort_raw_factor_logits": raw_factors,
+             "sort_indices": permutation,
+             "encoded_ids": pre_ids[permutation],
+             "encoded_estimated_bytes": pre_bytes[permutation],
+             "encoded_factors": factors[permutation],
++            "encoded_raw_factor_logits": padded_raw_factors[permutation],
+             "real_mask": pre_real[permutation],
+             "padding_mask": ~pre_real[permutation],
+             "ap_class_mask": pre_class[permutation],
++            "ap_path_input_mask": pre_class[permutation],
+         }
+         audit = recompute_sorted_codec_invariants(**kwargs)
+         self.assertEqual(audit["whole_promoted_count"], audit["whole_demoted_count"])
+@@ -394,6 +731,16 @@ class APGIFStreamCoreTest(unittest.TestCase):
+             ("encoded_ids", pre_ids, "canonical IDs"),
+             ("encoded_estimated_bytes", pre_bytes, "estimated-byte rows"),
+             ("real_mask", pre_real, "real/padding mask"),
++            (
++                "encoded_raw_factor_logits",
++                padded_raw_factors,
++                "raw factor rows",
++            ),
++            (
++                "ap_path_input_mask",
++                pre_class,
++                "path-input rows",
++            ),
+         ):
+             corrupted = dict(kwargs)
+             corrupted[field] = bad
+diff --git a/tests/test_h007_certification_stdlib.py b/tests/test_h007_certification_stdlib.py
+index 0394cd4..a6b2dd3 100644
+--- a/tests/test_h007_certification_stdlib.py
++++ b/tests/test_h007_certification_stdlib.py
+@@ -144,6 +144,7 @@ class H007CertificationStdlibTest(unittest.TestCase):
+                         "7" * 64,
+                         "8" * 64,
+                         "9" * 64,
++                        "a" * 64,
+                     ],
+                     "normalized_code_tree": {
+                         "schema": "h007.normalized_code_tree.v1",
+@@ -323,6 +324,44 @@ class H007CertificationStdlibTest(unittest.TestCase):
+         self.assertLess(entropy, post_backward)
+         self.assertLess(post_backward, save_call)
+ 
++    def test_checkpoint_only_ap_producer_reapplies_frozen_simulation_state(self):
++        trainer = MODULE_PATH.parents[2] / "examples/simple_trainer_GIFStream.py"
++        source = trainer.read_text(encoding="utf-8")
++        loader = source[
++            source.index("    def load_entropy_model_from_ckpt(") :
++            source.index("    def load_models_from_compressed_dir(")
++        ]
++        self.assertIn("ap_state=(", loader)
++        self.assertIn('self.cfg.ap_variant != "official"', loader)
++        eval_only = source[
++            source.index("            # run eval only") :
++            source.index("        else:", source.index("            # run eval only"))
++        ]
++        self.assertLess(
++            eval_only.index("runner.restore_ap_training_state("),
++            eval_only.index("runner.load_entropy_model_from_ckpt("),
++        )
++        freeze = source[
++            source.index("    def freeze_ap_reference_state(") :
++            source.index("    def compute_ap_path_loss(")
++        ]
++        self.assertIn("canonical_ids=ids", freeze)
++        self.assertIn("knn_indices=reference_knn", freeze)
++        compression_eval = source[
++            source.index("        # evaluate compression") :
++            source.index("        # Render the actual archive reconstruction.")
++        ]
++        self.assertIn("decoded_knn_indices", compression_eval)
++        self.assertNotIn(
++            'find_k_neighbors(self.splats["anchors"], self.cfg.n_knn)',
++            source,
++        )
++        self.assertNotIn(
++            'find_k_neighbors(runner.splats["anchors"], cfg.n_knn)',
++            source,
++        )
++        self.assertGreaterEqual(source.count("canonical_ids=canonical_voxel_ids("), 5)
++
+     def test_exclusive_write_does_not_follow_dangling_symlink(self):
+         with tempfile.TemporaryDirectory() as temporary:
+             root = Path(temporary).resolve()
+@@ -350,7 +389,7 @@ class H007CertificationStdlibTest(unittest.TestCase):
+     def test_manual_case_without_generation_closure_is_rejected(self):
+         stage = {
+             "freeze": {"evaluator_sha256": "1" * 64},
+-            "runtime_provenance": {"patch_sha256": ["a" * 64] * 8},
++            "runtime_provenance": {"patch_sha256": ["a" * 64] * 9},
+         }
+         sequence = {
+             "archive_sha256": "2" * 64,
+diff --git a/tests/test_h007_runtime_provenance_stdlib.py b/tests/test_h007_runtime_provenance_stdlib.py
+index eda0861..5deeee8 100644
+--- a/tests/test_h007_runtime_provenance_stdlib.py
++++ b/tests/test_h007_runtime_provenance_stdlib.py
+@@ -1,4 +1,4 @@
+-"""Stdlib-only tamper tests for the eight-stage H007 provenance contract."""
++"""Stdlib-only tamper tests for the nine-stage H007 provenance contract."""
+ 
+ from __future__ import annotations
+ 
+@@ -38,7 +38,7 @@ class H007RuntimeProvenanceStdlibTest(unittest.TestCase):
+         (self.repo / "examples" / "fixture.py").write_text("VALUE = 1\n", encoding="utf-8")
+         patch_dir = self.root / "patches"
+         patch_dir.mkdir()
+-        self.patch_payloads = [f"patch-{index}\n".encode() for index in range(1, 9)]
++        self.patch_payloads = [f"patch-{index}\n".encode() for index in range(1, 10)]
+         self.patch_hashes = []
+         rows = []
+         for stage, payload in zip(provenance.PATCH_STAGES, self.patch_payloads):
+@@ -77,7 +77,7 @@ class H007RuntimeProvenanceStdlibTest(unittest.TestCase):
+                 self.manifest, self.repo, self.manifest_sha
+             )
+ 
+-    def test_clean_eight_stage_chain_is_accepted(self) -> None:
++    def test_clean_nine_stage_chain_is_accepted(self) -> None:
+         receipt = self._verify()
+         self.assertEqual(receipt["patch_sha256"], self.patch_hashes)
+         self.assertEqual(receipt["normalized_code_tree"]["file_count"], 2)
+diff --git a/tests/test_h007_sequence_container.py b/tests/test_h007_sequence_container.py
+index 109441d..7de074e 100644
+--- a/tests/test_h007_sequence_container.py
++++ b/tests/test_h007_sequence_container.py
+@@ -94,15 +94,66 @@ def fixture_ap_meta(method="ap-gifstream-full"):
+         "factors": {"shape": [anchor_count, 4], "dtype": "float32", "scaling": 0.1},
+     }
+     if method in sequence.QUANTIZED_AP_VARIANTS:
++        core["anchor_features"] = {
++            "shape": [anchor_count, 32],
++            "dtype": "float32",
++            "ap_two_class_anchor_features": True,
++            "base_scaling": 0.1,
++            "families": {
++                "path": {
++                    "rows": 2,
++                    "scaling": 0.025,
++                    "multiplier": 0.25,
++                    "length": 8,
++                    "channel": 4,
++                },
++                "bg": {
++                    "rows": 2,
++                    "scaling": 0.1,
++                    "multiplier": 1.0,
++                    "length": 8,
++                    "channel": 4,
++                },
++            },
++        }
++        core["factors"] = {
++            "shape": [anchor_count, 4],
++            "dtype": "float32",
++            "ap_two_class_factors": True,
++            "base_scaling": 0.1,
++            "factor0_activation_value": 0.125,
++            "reconstruction_rule": (
++                "adaptive-symbols+counted-factor0/factor3-semantics"
++            ),
++            "families": {
++                "path": {
++                    "rows": 2,
++                    "scaling": 0.1 / 256.0,
++                    "multiplier": 1.0 / 256.0,
++                    "path": "factors_path.bin",
++                    "bytes": 8,
++                    "sha256": "b" * 64,
++                },
++                "bg": {
++                    "rows": 2,
++                    "scaling": 0.1 / 64.0,
++                    "multiplier": 1.0 / 64.0,
++                    "path": "factors_bg.bin",
++                    "bytes": 8,
++                    "sha256": "c" * 64,
++                },
++            },
++        }
+         core["time_features"] = {
+             "shape": [active_count, 60, 4],
+             "dtype": "float32",
+             "ap_two_class": True,
++            "precision_mask_contract": "path_input_mask",
+             "base_scaling": 0.1,
+             "length": 1,
+             "channel": 4,
+             "families": {
+-                "ap": {
++                "path": {
+                     "rows": 1,
+                     "scaling": 0.05,
+                     "multiplier": 0.5,
+@@ -143,7 +194,7 @@ def fixture_ap_meta(method="ap-gifstream-full"):
+         "time_entropy_model_frozen_after_freeze": True,
+         "runtime_manifest_sha256": digest,
+         "normalized_code_tree_sha256": digest,
+-        "patch_chain_sha256": [digest] * 8,
++        "patch_chain_sha256": [digest] * 9,
+         "anchor_count": anchor_count,
+         "eligible_count": 3,
+     }
+@@ -169,7 +220,7 @@ def fixture_ap_meta(method="ap-gifstream-full"):
+         "schema": "h007.ap_gifstream.runtime_provenance.v1",
+         "manifest_sha256": digest,
+         "official_commit": sequence.OFFICIAL_COMMIT,
+-        "patch_sha256": [digest] * 8,
++        "patch_sha256": [digest] * 9,
+         "normalized_code_tree": {
+             "schema": "h007.normalized_code_tree.v1",
+             "normalization": "fixture",
+@@ -202,7 +253,7 @@ def fixture_ap_meta(method="ap-gifstream-full"):
+         "code": "uint8-base3-dx-dy-dz-plus1",
+     }
+     core["__ap__"] = {
+-        "schema": "h007.ap_gifstream.codec.v5",
++        "schema": "h007.ap_gifstream.codec.v6",
+         "variant": dict(sequence.AP_VARIANT_METADATA[method]),
+         "score": score,
+         "allocation": allocation,
+@@ -211,6 +262,25 @@ def fixture_ap_meta(method="ap-gifstream-full"):
+         "q_ap_multiplier": 0.5,
+         "q_bg_multiplier": 1.25,
+         "mask": {**mask, "path": "ap_class_mask.bin", "true_count": class_count},
++        "path_input_mask": {
++            **mask,
++            "path": "ap_path_input_mask.bin",
++            "true_count": 2,
++        },
++        "path_contract": {
++            "schema": "h007.ap_gifstream.path_contract.v1",
++            "knn_count": 3,
++            "knn_rule": (
++                "retained-canonical-radius-complete-distance+lexicographic-id"
++            ),
++            "dependency_rule": "protected-plus-one-hop-retained-knn",
++            "retained_knn_graph_sha256": "b" * 64,
++            "canonical_anchor_reconstruction": True,
++            "factor_protected_multiplier": 1.0 / 256.0,
++            "factor_background_multiplier": 1.0 / 64.0,
++            "anchor_feature_protected_multiplier": 0.25,
++            "anchor_feature_background_multiplier": 1.0,
++        },
+         "real_row_mask": {**mask, "path": "ap_real_row_mask.bin", "true_count": real_count},
+         "padding_row_mask": {
+             **mask,
+@@ -840,7 +910,7 @@ class H007SequenceContainerTest(unittest.TestCase):
+             "schema": "h007.ap_gifstream.runtime_provenance.v1",
+             "manifest_sha256": hashlib.sha256(runtime_manifest.read_bytes()).hexdigest(),
+             "official_commit": sequence.OFFICIAL_COMMIT,
+-            "patch_sha256": ["a" * 64] * 8,
++            "patch_sha256": ["a" * 64] * 9,
+             "normalized_code_tree": {
+                 "schema": "h007.normalized_code_tree.v1",
+                 "normalization": "sorted-posix-path+lf-bytes+uint64le-lengths",
+@@ -967,7 +1037,7 @@ class H007SequenceContainerTest(unittest.TestCase):
+             "file_count": 1,
+             "sha256": "a" * 64,
+         }
+-        patch_hashes = [f"{index:x}" * 64 for index in range(1, 9)]
++        patch_hashes = [f"{index:x}" * 64 for index in range(1, 10)]
+         runtime_manifest_payload = sequence.canonical_json_bytes(
+             {
+                 "schema": "h007.ap_gifstream.patch_chain_manifest.v1",
+@@ -988,6 +1058,7 @@ class H007SequenceContainerTest(unittest.TestCase):
+                             "patch5",
+                             "patch6",
+                             "patch7",
++                            "patch8",
+                         ),
+                         patch_hashes,
+                     )
+@@ -2207,7 +2278,7 @@ class H007SequenceContainerTest(unittest.TestCase):
+             "code": "uint8-base3-dx-dy-dz-plus1",
+         }
+         meta["__ap__"] = {
+-            "schema": "h007.ap_gifstream.codec.v5",
++            "schema": "h007.ap_gifstream.codec.v6",
+             "variant": {"name": "ap-gifstream-full"},
+             "score": {"score_artifact_sha256": "a" * 64},
+             "allocation": {},
+@@ -2229,13 +2300,15 @@ class H007SequenceContainerTest(unittest.TestCase):
+         quantized_streams = sequence._required_gifstream_streams(
+             quantized, "ap-gifstream-full"
+         )
+-        self.assertIn("time_features_ap_00000.bin", quantized_streams)
++        self.assertIn("time_features_path_00000.bin", quantized_streams)
+         self.assertIn("time_features_bg_00000.bin", quantized_streams)
++        self.assertIn("anchor_features_path_00000.bin", quantized_streams)
++        self.assertIn("factors_path.bin", quantized_streams)
+ 
+         swap_only = fixture_ap_meta("path-swap")
+         swap_streams = sequence._required_gifstream_streams(swap_only, "path-swap")
+         self.assertIn("time_features_00000.bin", swap_streams)
+-        self.assertNotIn("time_features_ap_00000.bin", swap_streams)
++        self.assertNotIn("time_features_path_00000.bin", swap_streams)
+ 
+     def test_ap_score_source_count_may_differ_from_encoded_padded_count(self):
+         meta = fixture_ap_meta("ap-gifstream-full")

@@ -1,0 +1,2565 @@
+diff --git a/examples/h007_clean_decode_gifstream.py b/examples/h007_clean_decode_gifstream.py
+new file mode 100644
+index 0000000..dff6547
+--- /dev/null
++++ b/examples/h007_clean_decode_gifstream.py
+@@ -0,0 +1,313 @@
++#!/usr/bin/env python3
++"""Archive-only clean-process decoder for the H007 GIFStream container.
++
++The decoder reads no source images, checkpoints, score files, or downstream
++outcomes outside the counted ZIP.  It reconstructs the entropy models from the
++counted configuration and ``nets.pt``, decodes splats, validates identities and
++camera sidecars, and writes a tensor-hash manifest.
++"""
++
++from __future__ import annotations
++
++import argparse
++import hashlib
++import json
++import os
++import stat
++import zipfile
++from pathlib import Path
++from typing import Any, Dict
++
++import numpy as np
++import torch
++
++from gsplat.compression import GIFStreamEnd2endCompression
++from gsplat.compression.ap_gifstream import (
++    canonical_json_bytes,
++    canonical_voxel_ids,
++    tensor_mapping_sha256,
++    variant_spec,
++)
++from gsplat.compression_simulation.simulation import GIFStreamCompressionSimulation
++
++
++OFFICIAL_COMMIT = "c98486632e7dafd830740b1a1692bd08c48b96e3"
++PATCH1_SHA256 = "65ecd8f1fe30fac5d5bce3aed295cfe04f0b0582f106efaf37489b005d2e431b"
++ENTROPY_KEYS = (
++    "anchors",
++    "quats",
++    "scales",
++    "opacities",
++    "anchor_features",
++    "offsets",
++    "factors",
++    "time_features",
++)
++
++
++def _sha256(path: Path) -> str:
++    return hashlib.sha256(path.read_bytes()).hexdigest()
++
++
++def _safe_extract(archive: Path, destination: Path) -> None:
++    if destination.exists() and any(destination.iterdir()):
++        raise ValueError("clean-decode output directory must be empty")
++    destination.mkdir(parents=True, exist_ok=True)
++    root = destination.resolve()
++    with zipfile.ZipFile(archive, "r") as handle:
++        names = []
++        for info in handle.infolist():
++            name = info.filename
++            if name in names:
++                raise ValueError(f"duplicate ZIP member: {name}")
++            names.append(name)
++            mode = info.external_attr >> 16
++            if stat.S_ISLNK(mode):
++                raise ValueError(f"symlink ZIP member forbidden: {name}")
++            target = (destination / name).resolve()
++            if os.path.commonpath([str(root), str(target)]) != str(root):
++                raise ValueError(f"unsafe ZIP member: {name}")
++        handle.extractall(destination)
++
++
++def _validate_census(root: Path) -> None:
++    census_path = root / "byte_census.json"
++    census = json.loads(census_path.read_text(encoding="utf-8"))
++    if census.get("schema") != "h007.container_byte_census.v1":
++        raise ValueError("unsupported byte-census schema")
++    declared = {str(row["path"]): row for row in census["files"]}
++    actual = {
++        path.relative_to(root).as_posix()
++        for path in root.rglob("*")
++        if path.is_file() and path != census_path
++    }
++    if set(declared) != actual:
++        raise ValueError("container members differ from counted byte census")
++    for name, row in declared.items():
++        path = root / name
++        payload = path.read_bytes()
++        if len(payload) != int(row["bytes"]):
++            raise ValueError(f"byte-census size mismatch: {name}")
++        if hashlib.sha256(payload).hexdigest() != row["sha256"]:
++            raise ValueError(f"byte-census hash mismatch: {name}")
++
++
++def _validate_camera_metadata(root: Path) -> Dict[str, Any]:
++    camera_dir = root / "camera_metadata"
++    arrays = {
++        name: np.load(camera_dir / f"{name}.npy", allow_pickle=False)
++        for name in (
++            "camera_keys",
++            "intrinsics",
++            "image_sizes",
++            "camtoworlds",
++            "camera_ids",
++            "camera_names",
++            "transform",
++            "bounds",
++        )
++    }
++    n_cameras = int(arrays["camera_keys"].shape[0])
++    if arrays["intrinsics"].shape != (n_cameras, 3, 3):
++        raise ValueError("counted camera intrinsics are malformed")
++    if arrays["image_sizes"].shape != (n_cameras, 2):
++        raise ValueError("counted camera image sizes are malformed")
++    if arrays["camtoworlds"].ndim != 3 or arrays["camtoworlds"].shape[1:] not in (
++        (3, 4),
++        (4, 4),
++    ):
++        raise ValueError("counted camera poses are malformed")
++    if arrays["camera_ids"].shape[0] != arrays["camtoworlds"].shape[0]:
++        raise ValueError("counted camera IDs/poses disagree")
++    if not all(np.isfinite(value).all() for value in arrays.values() if value.dtype.kind in "f"):
++        raise ValueError("nonfinite counted camera metadata")
++    return {
++        "camera_key_count": n_cameras,
++        "pose_count": int(arrays["camtoworlds"].shape[0]),
++    }
++
++
++def _tensor_manifest(splats: Dict[str, torch.Tensor]) -> Dict[str, Any]:
++    output: Dict[str, Any] = {}
++    for name, value in sorted(splats.items()):
++        tensor = value.detach().cpu().contiguous()
++        if not torch.isfinite(tensor).all():
++            raise ValueError(f"decoded tensor is nonfinite: {name}")
++        payload = tensor.numpy().tobytes(order="C")
++        output[name] = {
++            "shape": list(tensor.shape),
++            "dtype": str(tensor.dtype),
++            "sha256": hashlib.sha256(payload).hexdigest(),
++        }
++    return output
++
++
++def clean_decode(archive: Path, output_dir: Path, device: str) -> Dict[str, Any]:
++    archive = archive.resolve()
++    if not archive.is_file():
++        raise ValueError(f"archive does not exist: {archive}")
++    container = output_dir / "container"
++    if output_dir.exists() and any(output_dir.iterdir()):
++        raise ValueError("clean-decode output directory must be empty")
++    output_dir.mkdir(parents=True, exist_ok=True)
++    _safe_extract(archive, container)
++    _validate_census(container)
++
++    config = json.loads((container / "decoder_config.json").read_text(encoding="utf-8"))
++    if config.get("schema") != "h007.gifstream_decoder_config.v1":
++        raise ValueError("unsupported decoder-config schema")
++    if config.get("official_commit") != OFFICIAL_COMMIT:
++        raise ValueError("container official commit mismatch")
++    if config.get("variant") != "official":
++        patch_sha = str(config.get("patch_sha256", ""))
++        if len(patch_sha) != 64 or any(
++            ch not in "0123456789abcdef" for ch in patch_sha.lower()
++        ):
++            raise ValueError("AP container patch SHA-256 is malformed")
++        if config.get("patch1_sha256") != PATCH1_SHA256 or config.get(
++            "patch2_sha256"
++        ) != patch_sha:
++            raise ValueError("AP container patch-chain provenance is malformed")
++    if config.get("clean_decode_entrypoint") != "examples/h007_clean_decode_gifstream.py":
++        raise ValueError("container clean-decode entrypoint mismatch")
++    if int(config["GOP_size"]) != 60 and config.get("variant") != "official":
++        raise ValueError("U3 AP container must contain a 60-frame GOP")
++    camera_audit = _validate_camera_metadata(container)
++    edit_audit_path = container / "ap_edit_hook.json"
++    if edit_audit_path.is_file():
++        edit_audit = json.loads(edit_audit_path.read_text(encoding="utf-8"))
++        edit_artifact = container / str(edit_audit["counted_artifact"])
++        if _sha256(edit_artifact) != edit_audit["counted_artifact_sha256"]:
++            raise ValueError("counted edit artifact differs from edit-hook receipt")
++    receipt = None
++    if config.get("variant") != "official":
++        receipt_path = container / "ap_training_receipt.json"
++        if not receipt_path.is_file():
++            raise ValueError("AP container lacks its counted training receipt")
++        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
++        if receipt.get("schema") != "h007.ap_training_receipt.v1" or receipt.get(
++            "variant"
++        ) != config["variant"]:
++            raise ValueError("counted AP training receipt is incompatible")
++        spec = variant_spec(str(config["variant"]))
++        if bool(receipt.get("path_loss_required")) != bool(spec.action_loss):
++            raise ValueError("counted AP receipt action-loss flag mismatch")
++        if not bool(receipt.get("time_entropy_model_frozen_after_freeze")):
++            raise ValueError("counted AP receipt lacks entropy-estimator freeze evidence")
++        if receipt.get("factor_membership_columns_frozen") != [0, 3]:
++            raise ValueError("counted AP receipt lacks factor-membership freeze evidence")
++        if spec.action_loss and (
++            int(receipt.get("path_loss_applications", 0)) <= 0
++            or not receipt.get("path_loss_steps")
++        ):
++            raise ValueError("full AP container lacks action-loss evidence")
++        codec_meta = json.loads((container / "meta.json").read_text(encoding="utf-8"))
++        if receipt.get("score_sha256") != codec_meta["__ap__"]["score_copy"]["sha256"]:
++            raise ValueError("AP receipt and counted score artifact disagree")
++
++    target_device = torch.device(device)
++    nets = torch.load(container / "nets.pt", map_location=target_device, weights_only=True)
++    if "decoders" not in nets or "scaling" not in nets:
++        raise ValueError("counted nets.pt is incomplete")
++    entropy_steps = {name: 1 for name in ENTROPY_KEYS}
++    simulation = GIFStreamCompressionSimulation(
++        entropy_model_enable=True,
++        entropy_model_type="conditional_gaussian_model",
++        entropy_steps=entropy_steps,
++        device=target_device,
++        feature_dim=int(config["anchor_feature_dim"]),
++        n_offsets=int(config["n_offsets"]),
++        c_channel=int(config["entropy_channel"]),
++        p_channel=int(config["c_perframe"]),
++        scaling=nets["scaling"],
++    )
++    for name, model in simulation.entropy_models.items():
++        if model is None:
++            continue
++        key = f"{name}_entropy_model"
++        if key not in nets:
++            raise ValueError(f"counted nets.pt lacks {key}")
++        model.load_state_dict(nets[key], strict=True)
++        model.eval()
++    if receipt is not None:
++        current_time_hash = tensor_mapping_sha256(
++            simulation.entropy_models["time_features"].state_dict()
++        )
++        with np.load(container / "ap_score_artifact.npz", allow_pickle=False) as score:
++            frozen_time_hash = str(
++                np.asarray(score["time_entropy_model_sha256"]).item()
++            )
++            frozen_scaling = float(np.asarray(score["time_feature_scaling"]).item())
++            estimator_version = str(np.asarray(score["estimator_version"]).item())
++        if current_time_hash != frozen_time_hash or receipt.get(
++            "time_entropy_model_sha256"
++        ) != frozen_time_hash:
++            raise ValueError("clean decoder entropy model differs from byte estimator")
++        if frozen_scaling != float(nets["scaling"]["time_features"]):
++            raise ValueError("clean decoder temporal scaling differs from byte estimator")
++        if estimator_version != "h007.conditional_gaussian_per_row_bits.v1":
++            raise ValueError("clean decoder byte estimator version mismatch")
++
++    codec = GIFStreamEnd2endCompression()
++    splats = codec.decompress(container.as_posix(), simulation.entropy_models, target_device)
++    expected = {
++        "anchors",
++        "scales",
++        "quats",
++        "opacities",
++        "offsets",
++        "anchor_features",
++        "time_features",
++        "factors",
++    }
++    if set(splats) != expected:
++        raise ValueError("decoded splat fields are incomplete or unexpected")
++    if splats["time_features"].shape[:2] != (
++        splats["anchors"].shape[0],
++        int(config["GOP_size"]),
++    ):
++        raise ValueError("decoded temporal tensor shape disagrees with configuration")
++    decoded_ids = canonical_voxel_ids(splats["anchors"], float(config["voxel_size"]))
++    sidecar_ids = np.load(container / "ap_canonical_ids.npy", allow_pickle=False) if (
++        container / "ap_canonical_ids.npy"
++    ).is_file() else None
++    if sidecar_ids is not None:
++        sidecar_set = {tuple(int(v) for v in row) for row in sidecar_ids.tolist()}
++        if not all(tuple(int(v) for v in row) in sidecar_set for row in decoded_ids.cpu().tolist()):
++            raise ValueError("decoded canonical IDs are absent from counted AP sidecar")
++
++    decoded_path = output_dir / "decoded_splats.pt"
++    torch.save({name: value.detach().cpu() for name, value in splats.items()}, decoded_path)
++    manifest = {
++        "schema": "h007.clean_decode_result.v1",
++        "archive": archive.name,
++        "archive_sha256": _sha256(archive),
++        "official_commit": OFFICIAL_COMMIT,
++        "variant": config["variant"],
++        "device": str(target_device),
++        "source_images_read": 0,
++        "external_checkpoint_files_read": 0,
++        "outcome_fields_read": [],
++        "decoded_splats": decoded_path.name,
++        "decoded_splats_sha256": _sha256(decoded_path),
++        "camera_audit": camera_audit,
++        "ap_training_receipt_validated": receipt is not None,
++        "edit_hook_validated": edit_audit_path.is_file(),
++        "tensors": _tensor_manifest(splats),
++    }
++    (output_dir / "clean_decode_manifest.json").write_bytes(canonical_json_bytes(manifest))
++    return manifest
++
++
++def main() -> None:
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--archive", type=Path, required=True)
++    parser.add_argument("--output-dir", type=Path, required=True)
++    parser.add_argument("--device", default="cuda:0")
++    args = parser.parse_args()
++    manifest = clean_decode(args.archive, args.output_dir, args.device)
++    print(json.dumps(manifest, sort_keys=True))
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/examples/h007_make_ap_edit_ids.py b/examples/h007_make_ap_edit_ids.py
+new file mode 100644
+index 0000000..e5afd3e
+--- /dev/null
++++ b/examples/h007_make_ap_edit_ids.py
+@@ -0,0 +1,77 @@
++#!/usr/bin/env python3
++"""Freeze exact parent-anchor IDs for the H007 recolor witness."""
++
++from __future__ import annotations
++
++import argparse
++import hashlib
++import json
++from pathlib import Path
++
++import numpy as np
++
++
++def main() -> None:
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--score-artifact", type=Path, required=True)
++    parser.add_argument("--count", type=int, required=True)
++    parser.add_argument("--output", type=Path, required=True)
++    args = parser.parse_args()
++    if args.count <= 0:
++        raise ValueError("edit anchor count must be positive")
++    with np.load(args.score_artifact, allow_pickle=False) as score:
++        if str(np.asarray(score["schema"]).item()) != "h007.ap_scores.v2":
++            raise ValueError("unsupported AP score schema")
++        if str(np.asarray(score["scene"]).item()) != "flame_salmon_1":
++            raise ValueError("U3 edit selection is development-locked to flame_salmon_1")
++        ids = np.asarray(score["canonical_ids"], dtype=np.int64)
++        path_score = np.asarray(score["path_score"], dtype=np.float64)
++        eligible = np.asarray(score["eligible"], dtype=np.bool_)
++        official_retain = np.asarray(score["official_retain_mask"], dtype=np.bool_)
++        ap_retain = np.asarray(score["ap_retain_mask"], dtype=np.bool_)
++        voxel_size = float(np.asarray(score["voxel_size"]).item())
++    if ids.ndim != 2 or ids.shape[1] != 3:
++        raise ValueError("malformed canonical IDs")
++    universe = eligible & official_retain & ap_retain & np.isfinite(path_score)
++    candidates = np.flatnonzero(universe)
++    if candidates.size < args.count:
++        raise ValueError(
++            f"only {candidates.size} exactly shared retained anchors for {args.count} edits"
++        )
++    order = np.lexsort(
++        (
++            ids[candidates, 2],
++            ids[candidates, 1],
++            ids[candidates, 0],
++            -path_score[candidates],
++        )
++    )
++    chosen = candidates[order[: args.count]]
++    args.output.parent.mkdir(parents=True, exist_ok=True)
++    np.savez(
++        args.output,
++        schema=np.asarray("h007.ap_edit_ids.v1"),
++        scene=np.asarray("flame_salmon_1"),
++        voxel_size=np.asarray(voxel_size, dtype=np.float64),
++        canonical_ids=ids[chosen],
++        source_score_sha256=np.asarray(
++            hashlib.sha256(args.score_artifact.read_bytes()).hexdigest()
++        ),
++        selection=np.asarray("top_path_score_intersection_official_and_ap_retained"),
++        path_score=path_score[chosen],
++    )
++    print(
++        json.dumps(
++            {
++                "schema": "h007.ap_edit_ids_build.v1",
++                "output": str(args.output.resolve()),
++                "count": int(chosen.size),
++                "outcome_fields_read": [],
++            },
++            sort_keys=True,
++        )
++    )
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/examples/simple_trainer_GIFStream.py b/examples/simple_trainer_GIFStream.py
+index 6002098..8ba9415 100644
+--- a/examples/simple_trainer_GIFStream.py
++++ b/examples/simple_trainer_GIFStream.py
+@@ -1,3 +1,4 @@
++import hashlib
+ import json
+ import math
+ import os
+@@ -6,6 +7,7 @@ import shutil
+ from contextlib import nullcontext
+ from dataclasses import dataclass, field
+ from collections import defaultdict
++from pathlib import Path
+ from typing import Dict, List, Optional, Tuple, Union, ContextManager
+ 
+ import imageio
+@@ -36,9 +38,14 @@ import random
+ 
+ from gsplat.compression import GIFStreamEnd2endCompression, GIFStream2dcodecCompression
+ from gsplat.compression.ap_gifstream import (
++    AP_SCORE_SCHEMA,
+     canonical_json_bytes,
++    canonical_voxel_ids,
++    build_count_preserving_anchor_allocation,
++    build_equal_estimated_byte_allocation,
+     deterministic_zip_directory,
+     file_byte_census,
++    tensor_mapping_sha256,
+     variant_spec,
+ )
+ from gsplat.distributed import cli
+@@ -257,6 +264,15 @@ class Config:
+     ap_q_ap_multiplier: float = 0.5
+     ap_q_bg_multiplier: float = 1.25
+     ap_compression_seed: int = 20260715
++    ap_freeze_step: int = 20_000
++    ap_path_loss_lambda: float = 0.01
++    ap_path_loss_every: int = 50
++    # Optional deterministic parent-anchor recolor witness.  The same frozen
++    # canonical-ID artifact is consumed by official and AP variants.
++    ap_edit_ids_path: Optional[str] = None
++    ap_edit_strength: float = 0.75
++    ap_warmup_renders: int = 5
++    ap_timed_renders: int = 30
+     # quantization scalings
+     compression_scaling = [
+         {
+@@ -457,6 +473,15 @@ class Runner:
+     def __init__(
+         self, local_rank: int, world_rank, world_size: int, cfg: Config
+     ) -> None:
++        if cfg.ap_variant != "official":
++            if os.path.basename(os.path.normpath(cfg.data_dir)) != "flame_salmon_1":
++                raise ValueError(
++                    "U3 AP-GIFStream patch is development-locked to flame_salmon_1"
++                )
++            if int(cfg.GOP_size) != 60:
++                raise ValueError("U3 AP-GIFStream requires an exact 60-frame GOP")
++            if int(world_size) != 1:
++                raise ValueError("U3 AP-GIFStream frozen-ID allocation requires world_size=1")
+         set_random_seed(42 + local_rank)
+ 
+         self.cfg = cfg
+@@ -552,18 +577,6 @@ class Runner:
+         self.compression_method = None
+         if cfg.compression is not None:
+             if cfg.compression == "end2end":
+-                if cfg.ap_variant != "official" and os.path.basename(
+-                    os.path.normpath(cfg.data_dir)
+-                ) != "flame_salmon_1":
+-                    raise ValueError(
+-                        "U3 AP-GIFStream patch is development-locked to flame_salmon_1"
+-                    )
+-                if variant_spec(cfg.ap_variant).action_loss:
+-                    raise NotImplementedError(
+-                        f"{cfg.ap_variant} requires the action-weighted path-loss training hook; "
+-                        "U3 codec patch 1 implements swap/quant/accounting only and refuses "
+-                        "to mislabel an incomplete full variant"
+-                    )
+                 self.compression_method = GIFStreamEnd2endCompression(
+                     ap_config={
+                         "variant": cfg.ap_variant,
+@@ -600,6 +613,32 @@ class Runner:
+             if cfg.entropy_model_opt:
+                 selected_key = min((k for k, v in cfg.entropy_steps.items() if v > 0), key=lambda k: cfg.entropy_steps[k])
+                 self.entropy_min_step = cfg.entropy_steps[selected_key]
++        if cfg.ap_variant != "official" and cfg.compression is None:
++            if not cfg.compression_sim or not cfg.entropy_model_opt:
++                raise ValueError("AP-GIFStream training requires compression_sim and entropy_model_opt")
++            last_topology_boundary = max(
++                int(cfg.strategy.refine_stop_iter), int(2 * cfg.max_steps / 3)
++            )
++            if cfg.ap_freeze_step < last_topology_boundary or cfg.ap_freeze_step >= cfg.max_steps:
++                raise ValueError(
++                    "ap_freeze_step must follow all topology/factor pruning and precede training end"
++                )
++            if cfg.ap_path_loss_every <= 0:
++                raise ValueError("ap_path_loss_every must be positive")
++            if variant_spec(cfg.ap_variant).action_loss and cfg.ap_path_loss_lambda <= 0:
++                raise ValueError("full AP variants require a positive path-loss weight")
++        self.ap_state = None
++        self.ap_training_receipt = None
++        self.ap_loss_applications = 0
++        self.ap_loss_steps: List[int] = []
++        self._ap_factor_gradient_hook = None
++        self._ap_edit_cache_signature = None
++        self._ap_edit_anchor_mask = None
++        self.ap_edit_audit = None
++        if cfg.ap_edit_ids_path is not None and not (0.0 < cfg.ap_edit_strength <= 1.0):
++            raise ValueError("ap_edit_strength must be in (0,1]")
++        if cfg.ap_warmup_renders < 1 or cfg.ap_timed_renders < 1:
++            raise ValueError("warm-render benchmark counts must be positive")
+         
+         # Profiler
+         self.profiler: Optional[torch.profiler.profile] = None
+@@ -663,6 +702,519 @@ class Runner:
+         grads_norm = - torch.log(1/grads_norm - 1)
+         self.splats["factors"].data[:,1] = grads_norm
+ 
++    def decode_persistent_anchor_paths(
++        self, splats: Dict[str, Tensor], factors_are_logits: bool
++    ) -> Tensor:
++        """Decode view-independent persistent anchor centers for all GOP frames."""
++        anchors = splats["anchors"]
++        features = splats["anchor_features"]
++        time_features = splats["time_features"]
++        factors = (
++            fake_quantize_factors(splats["factors"], q_aware=False)
++            if factors_are_logits
++            else splats["factors"]
++        )
++        if anchors.ndim != 2 or time_features.shape[:2] != (
++            anchors.shape[0],
++            self.cfg.GOP_size,
++        ):
++            raise ValueError("persistent path decoder received malformed splats")
++        if self.cfg.knn:
++            _, path_indices = find_k_neighbors(anchors, self.cfg.n_knn)
++            flat_indices = path_indices.reshape(-1)
++            knn_features = features[flat_indices].reshape(
++                -1, self.cfg.n_knn, features.shape[-1]
++            ).mean(dim=1)
++        paths = []
++        base_i = torch.ones((1,), dtype=torch.float32, device=anchors.device)
++        for frame in range(self.cfg.GOP_size):
++            time_value = float(frame) / float(self.cfg.GOP_size - 1)
++            frame_features = time_features[:, frame]
++            if self.cfg.knn:
++                knn_time = (
++                    time_features[:, frame] * factors[:, 0].unsqueeze(-1)
++                )[flat_indices].reshape(
++                    -1, self.cfg.n_knn, self.cfg.c_perframe
++                ).mean(dim=1)
++                adaptive = factors[:, 2].unsqueeze(-1) * torch.cat(
++                    [features, frame_features * factors[:, 0].unsqueeze(-1)], dim=-1
++                ) + (1.0 - factors[:, 2].unsqueeze(-1)) * torch.cat(
++                    [knn_features, knn_time], dim=-1
++                )
++            else:
++                adaptive = torch.cat(
++                    [features, frame_features * factors[:, 0].unsqueeze(-1)], dim=-1
++                )
++            embedding = torch.cat(
++                [
++                    torch.sin(self.cfg.phi**n * torch.pi * base_i * time_value)
++                    for n in range(self.cfg.time_dim // 2)
++                ]
++                + [
++                    torch.cos(self.cfg.phi**n * torch.pi * base_i * time_value)
++                    for n in range(self.cfg.time_dim // 2)
++                ]
++            )
++            adaptive = torch.cat(
++                [adaptive, embedding.unsqueeze(0).expand((adaptive.shape[0], -1))], dim=1
++            )
++            motion = self.decoders["mlp_motion"](adaptive) * factors[:, 1].unsqueeze(-1)
++            paths.append(anchors + motion[:, :3])
++        output = torch.stack(paths, dim=1)
++        if output.shape != (anchors.shape[0], self.cfg.GOP_size, 3):
++            raise AssertionError("persistent path decoder returned unexpected shape")
++        return output
++
++    @torch.no_grad()
++    def freeze_ap_reference_state(self, step: int) -> None:
++        if self.cfg.ap_variant == "official":
++            return
++        if step != self.cfg.ap_freeze_step or self.ap_state is not None:
++            raise ValueError("AP reference state must be frozen exactly once at ap_freeze_step")
++        if torch.cuda.is_available():
++            torch.cuda.synchronize()
++        freeze_start = time.perf_counter()
++        ids = canonical_voxel_ids(self.splats["anchors"], self.cfg.voxel_size)
++        reference_paths = self.decode_persistent_anchor_paths(
++            self.splats, factors_are_logits=True
++        ).detach()
++        path_score = torch.linalg.vector_norm(
++            reference_paths[:, 1:] - reference_paths[:, :-1], dim=-1
++        ).sum(dim=1)
++        motion_score = torch.linalg.vector_norm(
++            reference_paths - self.splats["anchors"].detach()[:, None, :], dim=-1
++        ).mean(dim=1)
++        eligible = torch.isfinite(reference_paths).all(dim=(1, 2)) & torch.isfinite(path_score)
++        estimated_bytes = self.compression_sim_method.estimate_time_stream_bytes(
++            self.splats["time_features"].detach()
++        )
++        time_entropy_model = self.compression_sim_method.entropy_models["time_features"]
++        time_entropy_model_sha256 = tensor_mapping_sha256(
++            time_entropy_model.state_dict()
++        )
++        for parameter in time_entropy_model.parameters():
++            parameter.requires_grad_(False)
++        time_feature_scaling = float(
++            self.compression_sim_method.scaling["time_features"]
++        )
++        ranking = variant_spec(self.cfg.ap_variant).ranking
++        if ranking == "path":
++            scores = path_score.clone()
++        elif ranking == "motion":
++            scores = motion_score.clone()
++        elif ranking == "random":
++            generator = torch.Generator(device="cpu")
++            generator.manual_seed(int(self.cfg.ap_random_seed))
++            scores = torch.rand(ids.shape[0], generator=generator, dtype=torch.float64).to(
++                ids.device
++            )
++        else:
++            raise ValueError(f"unexpected AP ranking during freeze: {ranking}")
++        scores = scores.to(torch.float64)
++        scores[~eligible] = -torch.inf
++        if not eligible.any():
++            raise ValueError("AP reference score freeze produced no eligible anchors")
++
++        factor_kwargs = {
++            "anchor_features": self.splats["anchor_features"],
++            "factors": self.splats["factors"],
++            "frame_idx": 0,
++            "c_channel": self.cfg.entropy_channel,
++        }
++        quantized_factors, _ = self.compression_sim_method.simulate_compression_factors(
++            self.splats["factors"], step, None, None, **factor_kwargs
++        )
++        quantized_factors = quantized_factors.detach()
++        official_retain = quantized_factors[:, 3] > 0
++        official_factor0 = quantized_factors[:, 0] > 0
++        ap_retain, whole_class, whole_audit = build_count_preserving_anchor_allocation(
++            official_retain,
++            scores,
++            eligible,
++            ids,
++            self.cfg.ap_protected_fraction,
++            enable_swap=variant_spec(self.cfg.ap_variant).swap,
++        )
++        official_active = official_factor0 & official_retain
++        ap_starting_active = official_factor0 & ap_retain
++        ap_active, ap_class, temporal_audit = build_equal_estimated_byte_allocation(
++            official_active,
++            scores,
++            eligible,
++            ids,
++            estimated_bytes,
++            self.cfg.ap_protected_fraction,
++            enable_swap=variant_spec(self.cfg.ap_variant).swap,
++            starting_active=ap_starting_active,
++            retain_mask=ap_retain,
++        )
++        if not torch.equal(whole_class, ap_class):
++            raise AssertionError("frozen whole and temporal AP classes disagree")
++        if torch.any(ap_active & ~ap_retain):
++            raise AssertionError("frozen temporal allocation escaped whole-retain mask")
++        positive0 = quantized_factors[quantized_factors[:, 0] > 0, 0]
++        positive3 = quantized_factors[quantized_factors[:, 3] > 0, 3]
++        if positive0.numel() == 0 or positive3.numel() == 0:
++            raise ValueError("official frozen factor masks have no positive activation value")
++        factor0_value = float(positive0.min().item())
++        factor3_value = float(positive3.min().item())
++
++        self.ap_state = {
++            "schema": "h007.ap_training_state.v1",
++            "variant": self.cfg.ap_variant,
++            "voxel_size": float(self.cfg.voxel_size),
++            "canonical_ids": ids.detach(),
++            "eligible": eligible.detach(),
++            "scores": scores.detach(),
++            "path_score": path_score.detach(),
++            "motion_score": motion_score.detach(),
++            "estimated_time_bytes": estimated_bytes.detach(),
++            "reference_paths": reference_paths.detach(),
++            "official_retain_mask": official_retain.detach(),
++            "official_factor0_mask": official_factor0.detach(),
++            "official_active_mask": official_active.detach(),
++            "ap_retain_mask": ap_retain.detach(),
++            "ap_active_mask": ap_active.detach(),
++            "ap_class_mask": ap_class.detach(),
++            "factor0_activation_value": factor0_value,
++            "factor3_activation_value": factor3_value,
++            "whole_allocation_audit": whole_audit,
++            "temporal_allocation_audit": temporal_audit,
++            "protected_fraction": float(self.cfg.ap_protected_fraction),
++            "q_ap_multiplier": float(self.cfg.ap_q_ap_multiplier),
++            "q_bg_multiplier": float(self.cfg.ap_q_bg_multiplier),
++            "random_seed": int(self.cfg.ap_random_seed),
++            "freeze_step": int(step),
++            "estimator_version": "h007.conditional_gaussian_per_row_bits.v1",
++            "time_entropy_model_sha256": time_entropy_model_sha256,
++            "time_feature_scaling": time_feature_scaling,
++            "time_entropy_model_frozen_after_freeze": True,
++            "factor_membership_columns_frozen": [0, 3],
++        }
++        factor_param = self.splats["factors"]
++        if self._ap_factor_gradient_hook is not None:
++            raise ValueError("AP factor-membership gradient hook was already installed")
++        gradient_mask = torch.ones_like(factor_param)
++        gradient_mask[:, 0] = 0
++        gradient_mask[:, 3] = 0
++        self._ap_factor_gradient_hook = factor_param.register_hook(
++            lambda gradient: gradient * gradient_mask
++        )
++        factor_optimizer_state = self.optimizers["factors"].state.get(factor_param, {})
++        for value in factor_optimizer_state.values():
++            if isinstance(value, Tensor) and value.shape == factor_param.shape:
++                value[:, 0] = 0
++                value[:, 3] = 0
++        freeze_dir = os.path.join(self.cfg.result_dir, "ap_freeze")
++        os.makedirs(freeze_dir, exist_ok=True)
++        score_path = os.path.join(freeze_dir, f"reference_scores_step{step}.npz")
++        np.savez(
++            score_path,
++            schema=np.asarray(AP_SCORE_SCHEMA),
++            scene=np.asarray("flame_salmon_1"),
++            voxel_size=np.asarray(self.cfg.voxel_size, dtype=np.float64),
++            frame_count=np.asarray(self.cfg.GOP_size, dtype=np.int64),
++            variant=np.asarray(self.cfg.ap_variant),
++            protected_fraction=np.asarray(self.cfg.ap_protected_fraction, dtype=np.float64),
++            q_ap_multiplier=np.asarray(self.cfg.ap_q_ap_multiplier, dtype=np.float64),
++            q_bg_multiplier=np.asarray(self.cfg.ap_q_bg_multiplier, dtype=np.float64),
++            random_seed=np.asarray(self.cfg.ap_random_seed, dtype=np.int64),
++            canonical_ids=ids.cpu().numpy().astype(np.int64, copy=False),
++            eligible=eligible.cpu().numpy().astype(np.bool_, copy=False),
++            path_score=path_score.cpu().numpy().astype(np.float64, copy=False),
++            motion_score=motion_score.cpu().numpy().astype(np.float64, copy=False),
++            allocation_score=scores.cpu().numpy().astype(np.float64, copy=False),
++            estimated_time_bytes=estimated_bytes.cpu().numpy().astype(np.int64, copy=False),
++            official_retain_mask=official_retain.cpu().numpy().astype(np.bool_, copy=False),
++            official_factor0_mask=official_factor0.cpu().numpy().astype(np.bool_, copy=False),
++            official_active_mask=official_active.cpu().numpy().astype(np.bool_, copy=False),
++            ap_retain_mask=ap_retain.cpu().numpy().astype(np.bool_, copy=False),
++            ap_active_mask=ap_active.cpu().numpy().astype(np.bool_, copy=False),
++            ap_class_mask=ap_class.cpu().numpy().astype(np.bool_, copy=False),
++            factor0_activation_value=np.asarray(factor0_value, dtype=np.float64),
++            factor3_activation_value=np.asarray(factor3_value, dtype=np.float64),
++            estimator_version=np.asarray("h007.conditional_gaussian_per_row_bits.v1"),
++            time_entropy_model_sha256=np.asarray(time_entropy_model_sha256),
++            time_feature_scaling=np.asarray(time_feature_scaling, dtype=np.float64),
++            time_entropy_model_frozen_after_freeze=np.asarray(True),
++            path_definition=np.asarray("sum_consecutive_euclidean_displacement"),
++            motion_definition=np.asarray("mean_distance_from_canonical_anchor"),
++            estimated_byte_definition=np.asarray(
++                "ceil_deterministic_conditional_gaussian_bits_over_8"
++            ),
++        )
++        path_file = os.path.join(freeze_dir, f"reference_paths_step{step}.npy")
++        np.save(path_file, reference_paths.cpu().numpy().astype(np.float32, copy=False))
++        score_payload = Path(score_path).read_bytes()
++        path_payload = Path(path_file).read_bytes()
++        if torch.cuda.is_available():
++            torch.cuda.synchronize()
++        ap_score_seconds = time.perf_counter() - freeze_start
++        freeze_audit = {
++            "schema": "h007.ap_score_freeze.v1",
++            "scene": "flame_salmon_1",
++            "variant": self.cfg.ap_variant,
++            "step": step,
++            "score_path": os.path.basename(score_path),
++            "score_sha256": hashlib.sha256(score_payload).hexdigest(),
++            "path_file": os.path.basename(path_file),
++            "path_sha256": hashlib.sha256(path_payload).hexdigest(),
++            "anchor_count": int(ids.shape[0]),
++            "eligible_count": int(eligible.sum().item()),
++            "ap_score_seconds": float(ap_score_seconds),
++            "outcome_fields_read": [],
++        }
++        with open(os.path.join(freeze_dir, "freeze_audit.json"), "wb") as f:
++            f.write(canonical_json_bytes(freeze_audit))
++        self.ap_state["score_path"] = score_path
++        self.ap_state["score_sha256"] = freeze_audit["score_sha256"]
++        self.ap_state["ap_score_seconds"] = float(ap_score_seconds)
++
++    def compute_ap_path_loss(self) -> Tensor:
++        if self.ap_state is None:
++            raise ValueError("AP path loss requested before score freeze")
++        decoded_paths = self.decode_persistent_anchor_paths(
++            self.comp_sim_splats, factors_are_logits=False
++        )
++        # Compare against the current raw model at the same optimization step.
++        # Only the action weights/universe are frozen at ap_freeze_step.
++        with torch.no_grad():
++            reference_paths = self.decode_persistent_anchor_paths(
++                self.splats, factors_are_logits=True
++            ).detach()
++        weights = self.ap_state["path_score"].to(decoded_paths.device).clamp_min(0)
++        weights = weights * self.ap_state["eligible"].to(decoded_paths.device)
++        if float(weights.sum().detach().item()) <= 0:
++            raise ValueError("AP path loss has zero reference action mass")
++        weights = weights / weights.sum()
++        per_anchor = torch.linalg.vector_norm(decoded_paths - reference_paths, dim=-1).mean(dim=1)
++        loss = torch.sum(weights * per_anchor)
++        if not torch.isfinite(loss):
++            raise ValueError("nonfinite AP path loss")
++        return loss
++
++    def restore_ap_training_state(self, checkpoint: Dict) -> None:
++        if self.cfg.ap_variant == "official":
++            return
++        if "ap_state" not in checkpoint or "ap_training_receipt" not in checkpoint:
++            raise ValueError("AP checkpoint is missing frozen state or training receipt")
++        state = checkpoint["ap_state"]
++        receipt = checkpoint["ap_training_receipt"]
++        if state.get("schema") != "h007.ap_training_state.v1":
++            raise ValueError("unsupported AP training-state schema")
++        if receipt.get("schema") != "h007.ap_training_receipt.v1":
++            raise ValueError("unsupported AP training-receipt schema")
++        if state["variant"] != self.cfg.ap_variant or receipt["variant"] != self.cfg.ap_variant:
++            raise ValueError("checkpoint AP variant differs from requested variant")
++        restored = {}
++        for key, value in state.items():
++            restored[key] = value.to(self.device) if isinstance(value, Tensor) else value
++        ids = canonical_voxel_ids(self.splats["anchors"], self.cfg.voxel_size)
++        if not torch.equal(ids, restored["canonical_ids"]):
++            raise ValueError("restored AP state no longer matches checkpoint anchors")
++        self.ap_state = restored
++        self.ap_training_receipt = receipt
++        self.ap_loss_applications = int(receipt["path_loss_applications"])
++        self.ap_loss_steps = [int(value) for value in receipt.get("path_loss_steps", [])]
++
++        score_path = self.cfg.ap_score_path or restored.get("score_path")
++        if not score_path or not os.path.isfile(score_path):
++            raise ValueError("frozen AP score artifact is unavailable")
++        payload = open(score_path, "rb").read()
++        if hashlib.sha256(payload).hexdigest() != restored["score_sha256"]:
++            raise ValueError("frozen AP score artifact hash mismatch")
++        self.cfg.ap_score_path = score_path
++        if isinstance(self.compression_method, GIFStreamEnd2endCompression):
++            self.compression_method.ap_config["score_path"] = score_path
++
++    def _validate_ap_compression_receipt(self, step: int) -> Optional[Dict]:
++        if self.cfg.ap_variant == "official":
++            return None
++        if self.ap_state is None or self.ap_training_receipt is None:
++            raise ValueError("AP compression requires frozen state and a training receipt")
++        receipt = dict(self.ap_training_receipt)
++        state = self.ap_state
++        spec = variant_spec(self.cfg.ap_variant)
++        if receipt.get("schema") != "h007.ap_training_receipt.v1":
++            raise ValueError("unsupported AP training receipt")
++        if receipt.get("variant") != self.cfg.ap_variant or state.get(
++            "variant"
++        ) != self.cfg.ap_variant:
++            raise ValueError("AP training receipt variant mismatch")
++        if bool(receipt.get("path_loss_required")) != bool(spec.action_loss):
++            raise ValueError("AP receipt action-loss flag disagrees with the variant")
++        for name, expected in (
++            ("freeze_step", int(self.cfg.ap_freeze_step)),
++            ("random_seed", int(self.cfg.ap_random_seed)),
++        ):
++            if int(receipt.get(name, -1)) != expected:
++                raise ValueError(f"AP receipt {name} mismatch")
++        for name, expected in (
++            ("protected_fraction", float(self.cfg.ap_protected_fraction)),
++            ("q_ap_multiplier", float(self.cfg.ap_q_ap_multiplier)),
++            ("q_bg_multiplier", float(self.cfg.ap_q_bg_multiplier)),
++        ):
++            if float(receipt.get(name, float("nan"))) != expected:
++                raise ValueError(f"AP receipt {name} mismatch")
++        if receipt.get("score_sha256") != state.get("score_sha256"):
++            raise ValueError("AP state/receipt score hashes disagree")
++        for name in (
++            "estimator_version",
++            "time_entropy_model_sha256",
++            "time_feature_scaling",
++            "time_entropy_model_frozen_after_freeze",
++        ):
++            if receipt.get(name) != state.get(name):
++                raise ValueError(f"AP state/receipt estimator provenance mismatch: {name}")
++        if receipt.get("factor_membership_columns_frozen") != [0, 3] or state.get(
++            "factor_membership_columns_frozen"
++        ) != [0, 3]:
++            raise ValueError("AP factor membership was not frozen after allocation")
++        entropy_models = getattr(
++            self, "entropy_models", self.compression_sim_method.entropy_models
++        )
++        current_entropy_hash = tensor_mapping_sha256(
++            entropy_models["time_features"].state_dict()
++        )
++        if current_entropy_hash != state["time_entropy_model_sha256"]:
++            raise ValueError("temporal entropy model changed after estimated-byte freeze")
++        score_path = Path(str(self.cfg.ap_score_path or state.get("score_path", "")))
++        if not score_path.is_file():
++            raise ValueError("AP score artifact is missing during compression")
++        if hashlib.sha256(score_path.read_bytes()).hexdigest() != state["score_sha256"]:
++            raise ValueError("AP score artifact changed after training")
++        if not math.isfinite(float(receipt.get("ap_score_seconds", float("nan")))) or float(
++            receipt["ap_score_seconds"]
++        ) <= 0:
++            raise ValueError("AP score timing is missing or invalid")
++
++        cadence = int(receipt.get("path_loss_every", 0))
++        applications = int(receipt.get("path_loss_applications", -1))
++        application_steps = [int(value) for value in receipt.get("path_loss_steps", [])]
++        if len(application_steps) != applications:
++            raise ValueError("AP receipt path-loss count/list disagree")
++        if spec.action_loss:
++            if cadence != int(self.cfg.ap_path_loss_every) or float(
++                receipt.get("path_loss_lambda", float("nan"))
++            ) != float(self.cfg.ap_path_loss_lambda):
++                raise ValueError("full AP variant path-loss hyperparameters changed")
++            if receipt.get("path_loss_reference") != (
++                "current_raw_stop_gradient_with_frozen_action_weights"
++            ):
++                raise ValueError("full AP variant path-loss reference rule is unsupported")
++            first = (
++                (int(self.cfg.ap_freeze_step) + cadence - 1) // cadence
++            ) * cadence
++            expected_steps = (
++                [] if step < first else list(range(first, int(step) + 1, cadence))
++            )
++            if sorted(set(application_steps)) != expected_steps or applications <= 0:
++                raise ValueError(
++                    "full AP variant lacks action-loss coverage at every cadence step"
++                )
++            if any(application_steps.count(value) > int(self.cfg.batch_size) for value in expected_steps):
++                raise ValueError("full AP variant applied path loss too often within a step")
++        elif applications != 0 or application_steps:
++            raise ValueError("non-full AP ablation unexpectedly applied path loss")
++
++        n = int(self.splats["anchors"].shape[0])
++        for key in (
++            "canonical_ids",
++            "official_retain_mask",
++            "official_factor0_mask",
++            "official_active_mask",
++            "ap_retain_mask",
++            "ap_active_mask",
++            "ap_class_mask",
++            "estimated_time_bytes",
++        ):
++            if int(state[key].shape[0]) != n:
++                raise ValueError(f"AP frozen state {key} no longer matches anchor count")
++        if int(state["official_retain_mask"].sum()) != int(
++            state["ap_retain_mask"].sum()
++        ):
++            raise ValueError("AP frozen whole-anchor allocation changed count")
++        official_mass = int(
++            state["estimated_time_bytes"][state["official_active_mask"]].sum().item()
++        )
++        ap_mass = int(
++            state["estimated_time_bytes"][state["ap_active_mask"]].sum().item()
++        )
++        if official_mass != ap_mass:
++            raise ValueError("AP frozen temporal allocation changed estimated-byte mass")
++        receipt["validated_at_compression_step"] = int(step)
++        receipt["official_estimated_time_bytes"] = official_mass
++        receipt["ap_estimated_time_bytes"] = ap_mass
++        return receipt
++
++    def _get_ap_edit_anchor_mask(self) -> Optional[Tensor]:
++        """Align an evaluation-only edit artifact by exact canonical voxel ID."""
++        edit_path = self.cfg.ap_edit_ids_path
++        if edit_path is None:
++            return None
++        if self.istraining:
++            raise ValueError("the AP edit witness is evaluation-only")
++        anchors = self.splats["anchors"]
++        signature = (int(anchors.data_ptr()), int(anchors.shape[0]), str(edit_path))
++        if self._ap_edit_cache_signature == signature:
++            return self._ap_edit_anchor_mask
++
++        path = Path(edit_path)
++        if not path.is_file():
++            raise ValueError(f"AP edit-ID artifact does not exist: {path}")
++        with np.load(path, allow_pickle=False) as artifact:
++            required = {"schema", "scene", "voxel_size", "canonical_ids"}
++            missing = sorted(required - set(artifact.files))
++            if missing:
++                raise ValueError(f"AP edit-ID artifact missing members: {missing}")
++            if str(np.asarray(artifact["schema"]).item()) != "h007.ap_edit_ids.v1":
++                raise ValueError("unsupported AP edit-ID schema")
++            if str(np.asarray(artifact["scene"]).item()) != "flame_salmon_1":
++                raise ValueError("U3 edit witness is development-locked to flame_salmon_1")
++            if float(np.asarray(artifact["voxel_size"]).item()) != float(
++                self.cfg.voxel_size
++            ):
++                raise ValueError("AP edit-ID voxel size differs from decoder")
++            edit_ids = np.asarray(artifact["canonical_ids"], dtype=np.int64)
++        if edit_ids.ndim != 2 or edit_ids.shape[1] != 3 or edit_ids.shape[0] == 0:
++            raise ValueError("AP edit-ID artifact must contain a nonempty [J,3] array")
++        if np.unique(edit_ids, axis=0).shape[0] != edit_ids.shape[0]:
++            raise ValueError("AP edit-ID artifact contains duplicates")
++
++        current_ids = canonical_voxel_ids(anchors, self.cfg.voxel_size)
++        current_map = {
++            tuple(int(v) for v in row): index
++            for index, row in enumerate(current_ids.detach().cpu().tolist())
++        }
++        missing_ids = [
++            tuple(int(v) for v in row)
++            for row in edit_ids.tolist()
++            if tuple(int(v) for v in row) not in current_map
++        ]
++        if missing_ids:
++            raise ValueError(
++                f"{len(missing_ids)} frozen edit IDs are absent from the decoded anchors"
++            )
++        mask = torch.zeros(
++            (anchors.shape[0],), dtype=torch.bool, device=anchors.device
++        )
++        indices = [current_map[tuple(int(v) for v in row)] for row in edit_ids.tolist()]
++        mask[torch.tensor(indices, dtype=torch.long, device=anchors.device)] = True
++        payload = path.read_bytes()
++        self._ap_edit_cache_signature = signature
++        self._ap_edit_anchor_mask = mask
++        self.ap_edit_audit = {
++            "schema": "h007.ap_edit_hook.v1",
++            "scene": "flame_salmon_1",
++            "artifact": str(path.resolve()),
++            "artifact_sha256": hashlib.sha256(payload).hexdigest(),
++            "edited_anchor_count": int(mask.sum().item()),
++            "edit_strength": float(self.cfg.ap_edit_strength),
++            "target_rgb": [1.0, 0.0, 1.0],
++            "alignment": "exact_canonical_voxel_id",
++        }
++        return mask
++
+     def get_profiler(self, tb_writer) -> ContextManager:
+         if self.profiler_config.enabled:
+             return torch.profiler.profile(
+@@ -915,7 +1467,10 @@ class Runner:
+         anchor_offset = motion[:,-7:-4]
+         selected_anchors += anchor_offset
+         # Compute anchor rotation from motion output (as quaternion)
+-        anchor_rot = torch.nn.functional.normalize(0.1 * motion[:,-4:] + torch.tensor([[1,0,0,0]],device="cuda"))
++        anchor_rot = torch.nn.functional.normalize(
++            0.1 * motion[:, -4:]
++            + motion.new_tensor([[1.0, 0.0, 0.0, 0.0]])
++        )
+         anchor_rotation = quaternion_to_rotation_matrix(anchor_rot)
+         # Transform offsets by scale and rotation
+         selected_offsets = torch.bmm(selected_offsets.view(-1,self.cfg.n_offsets,3) * selected_scales.unsqueeze(1)[:,:,:3] ,anchor_rotation.reshape((-1,3,3)).transpose(1, 2)).reshape((-1,3))
+@@ -933,6 +1488,28 @@ class Runner:
+         scales_repeated = scales_repeated[neural_selection_mask]  # [M, 6]
+         anchors_repeated = anchors_repeated[neural_selection_mask]  # [M, 3]
+ 
++        # Optional downstream behavioral witness: recolor every selected child
++        # of the exact frozen parent-anchor IDs.  It is intentionally generic
++        # across official/AP variants and never uses nearest-neighbor matching.
++        visible_rows = torch.nonzero(visible_anchor_mask, as_tuple=False).reshape(-1)
++        parent_rows = (
++            visible_rows[:, None]
++            .expand(-1, self.cfg.n_offsets)
++            .reshape(-1)[neural_selection_mask]
++        )
++        edit_anchor_mask = self._get_ap_edit_anchor_mask()
++        edited_gaussian_mask = torch.zeros_like(parent_rows, dtype=torch.bool)
++        if edit_anchor_mask is not None:
++            edited_gaussian_mask = edit_anchor_mask[parent_rows]
++            target = selected_colors.new_tensor([1.0, 0.0, 1.0])
++            blended = (
++                (1.0 - float(self.cfg.ap_edit_strength)) * selected_colors
++                + float(self.cfg.ap_edit_strength) * target
++            ).clamp(0.0, 1.0)
++            selected_colors = torch.where(
++                edited_gaussian_mask[:, None], blended, selected_colors
++            )
++
+         # Compute final scales and rotations
+         scales = scales_repeated[:, 3:] * torch.sigmoid(selected_scale_rot[:, :3])
+         rotation = torch.nn.functional.normalize(selected_scale_rot[:, 3:7])
+@@ -953,6 +1530,8 @@ class Runner:
+             "reg_loss": selected_factors[:,:-1].mean() + 0.1 * selected_factors[:,-1].mean() if regular else 0,  # Regularization loss
+             "smooth_loss": smooth_loss,# Smoothness loss
+             "motion": anchor_offset,  # Anchor offset
++            "parent_anchor_rows": parent_rows,
++            "edited_gaussian_mask": edited_gaussian_mask,
+         }
+         return info
+ 
+@@ -1028,6 +1607,8 @@ class Runner:
+         info["gop"] = self.cfg.GOP_size
+         info["time"] = int(time * (self.cfg.GOP_size - 1))
+         info["motion"] = neural_gaussians["motion"]
++        info["parent_anchor_rows"] = neural_gaussians["parent_anchor_rows"]
++        info["edited_gaussian_mask"] = neural_gaussians["edited_gaussian_mask"]
+         return render_colors, render_alphas, info
+ 
+     def train(self, init_step: int=0):
+@@ -1096,6 +1677,12 @@ class Runner:
+                     batch_data = next(trainloader_iter)
+                 if step == int(max_steps * self.cfg.strategy.deformation_gate):
+                     self.init_dynamic()
++                if (
++                    self.cfg.ap_variant != "official"
++                    and step == self.cfg.ap_freeze_step
++                    and self.ap_state is None
++                ):
++                    self.freeze_ap_reference_state(step)
+                 
+                 #* batch forward
+                 info_list = []
+@@ -1129,7 +1716,19 @@ class Runner:
+                             self.compression_sim_method._estiblish_bbox(self.splats["means"])
+ 
+                     if cfg.compression_sim:
+-                        self.comp_sim_splats, self.esti_bits_dict = self.compression_sim_method.simulate_compression(self.splats, step, int(float(data["time"]) * (self.cfg.GOP_size - 1)), self.cfg.entropy_channel)
++                        active_ap_state = (
++                            self.ap_state
++                            if self.cfg.ap_variant != "official"
++                            and step >= self.cfg.ap_freeze_step
++                            else None
++                        )
++                        self.comp_sim_splats, self.esti_bits_dict = self.compression_sim_method.simulate_compression(
++                            self.splats,
++                            step,
++                            int(float(data["time"]) * (self.cfg.GOP_size - 1)),
++                            self.cfg.entropy_channel,
++                            ap_state=active_ap_state,
++                        )
+ 
+                     # forward
+                     renders, alphas, info = self.rasterize_splats(
+@@ -1176,6 +1775,20 @@ class Runner:
+                     scale_loss = info["scales"].prod(dim=1).mean()
+                     reg_loss = info["reg_loss"]
+                     smooth_loss = info["smooth_loss"]
++                    ap_path_loss = None
++                    if (
++                        variant_spec(cfg.ap_variant).action_loss
++                        and self.ap_state is not None
++                        and step % cfg.ap_path_loss_every == 0
++                    ):
++                        ap_path_loss = self.compute_ap_path_loss()
++                        loss = loss + (
++                            cfg.ap_path_loss_lambda
++                            * cfg.ap_path_loss_every
++                            * ap_path_loss
++                        )
++                        self.ap_loss_applications += 1
++                        self.ap_loss_steps.append(int(step))
+                     # entropy constraint
+                     if cfg.entropy_model_opt and step>self.entropy_min_step:
+                         total_esti_bits = 0
+@@ -1227,6 +1840,10 @@ class Runner:
+                             self.writer.add_histogram("train_hist/factors", self.splats["factors"], step)
+                             if total_esti_bits > 0:
+                                 self.writer.add_scalar("train/bpp_loss", total_esti_bits.item(), step)
++                            if ap_path_loss is not None:
++                                self.writer.add_scalar(
++                                    "train/ap_path_loss", ap_path_loss.detach().item(), step
++                                )
+                         
+                     self.writer.add_histogram("train_hist/means", self.splats["anchors"], step)
+                     self.writer.flush()
+@@ -1253,6 +1870,44 @@ class Runner:
+                             data["app_module"] = self.app_module.module.state_dict()
+                         else:
+                             data["app_module"] = self.app_module.state_dict()
++                    if self.ap_state is not None:
++                        serializable_ap_state = {}
++                        for key, value in self.ap_state.items():
++                            serializable_ap_state[key] = (
++                                value.detach().cpu() if isinstance(value, Tensor) else value
++                            )
++                        data["ap_state"] = serializable_ap_state
++                        self.ap_training_receipt = {
++                            "schema": "h007.ap_training_receipt.v1",
++                            "variant": cfg.ap_variant,
++                            "freeze_step": int(cfg.ap_freeze_step),
++                            "score_sha256": self.ap_state["score_sha256"],
++                            "ap_score_seconds": float(
++                                self.ap_state["ap_score_seconds"]
++                            ),
++                            "protected_fraction": float(cfg.ap_protected_fraction),
++                            "q_ap_multiplier": float(cfg.ap_q_ap_multiplier),
++                            "q_bg_multiplier": float(cfg.ap_q_bg_multiplier),
++                            "random_seed": int(cfg.ap_random_seed),
++                            "estimator_version": self.ap_state["estimator_version"],
++                            "time_entropy_model_sha256": self.ap_state[
++                                "time_entropy_model_sha256"
++                            ],
++                            "time_feature_scaling": float(
++                                self.ap_state["time_feature_scaling"]
++                            ),
++                            "time_entropy_model_frozen_after_freeze": True,
++                            "factor_membership_columns_frozen": [0, 3],
++                            "path_loss_required": variant_spec(cfg.ap_variant).action_loss,
++                            "path_loss_lambda": float(cfg.ap_path_loss_lambda),
++                            "path_loss_every": int(cfg.ap_path_loss_every),
++                            "path_loss_applications": int(self.ap_loss_applications),
++                            "path_loss_steps": list(self.ap_loss_steps),
++                            "simulation_mask_rule": "quantized_factor3_gt0_and_factor0_gt0",
++                            "estimated_byte_rule": "exact_frozen_integer_subset_sum",
++                            "path_loss_reference": "current_raw_stop_gradient_with_frozen_action_weights",
++                        }
++                        data["ap_training_receipt"] = self.ap_training_receipt
+ 
+                     if cfg.compression_sim and cfg.entropy_model_opt:
+                         self.entropy_models = self.compression_sim_method.entropy_models
+@@ -1500,6 +2155,61 @@ class Runner:
+         print(f"Video saved to {video_dir}/{stage}_traj_{step}.mp4")
+         self.istraining = training_state
+ 
++    @torch.no_grad()
++    def benchmark_warm_render_fps(self) -> Dict[str, Union[int, float]]:
++        """Benchmark one frozen camera using metadata only, never source pixels."""
++        camera_index = int(self.cfg.test_set[0]) if self.cfg.test_set else 0
++        if camera_index < 0 or camera_index >= len(self.parser.camtoworlds):
++            raise ValueError("warm-render camera index is out of range")
++        camera_key = int(self.parser.camera_ids[camera_index])
++        camtoworlds = torch.from_numpy(
++            np.asarray(self.parser.camtoworlds[camera_index], dtype=np.float32)
++        ).unsqueeze(0).to(self.device)
++        Ks = torch.from_numpy(
++            np.asarray(self.parser.Ks_dict[camera_key], dtype=np.float32)
++        ).unsqueeze(0).to(self.device)
++        width, height = self.parser.imsize_dict[camera_key]
++        camera_ids = torch.tensor([-1], dtype=torch.long, device=self.device)
++        render_kwargs = {
++            "camtoworlds": camtoworlds,
++            "Ks": Ks,
++            "width": int(width),
++            "height": int(height),
++            "sh_degree": None,
++            "near_plane": self.cfg.near_plane,
++            "far_plane": self.cfg.far_plane,
++            "time": 0.0,
++            "camera_ids": camera_ids,
++        }
++        previous_training = self.istraining
++        self.istraining = False
++        try:
++            for _ in range(int(self.cfg.ap_warmup_renders)):
++                self.rasterize_splats(**render_kwargs)
++            if torch.cuda.is_available():
++                torch.cuda.synchronize()
++            started = time.perf_counter()
++            for _ in range(int(self.cfg.ap_timed_renders)):
++                self.rasterize_splats(**render_kwargs)
++            if torch.cuda.is_available():
++                torch.cuda.synchronize()
++            seconds = time.perf_counter() - started
++        finally:
++            self.istraining = previous_training
++        if not math.isfinite(seconds) or seconds <= 0:
++            raise ValueError("invalid warm-render timing")
++        return {
++            "warmup_renders": int(self.cfg.ap_warmup_renders),
++            "timed_renders": int(self.cfg.ap_timed_renders),
++            "seconds": float(seconds),
++            "fps": float(self.cfg.ap_timed_renders / seconds),
++            "width": int(width),
++            "height": int(height),
++            "camera_index": camera_index,
++            "frame_index": 0,
++            "source_pixels_read": 0,
++        }
++
+     @torch.no_grad()
+     def run_compression(self, step: int):
+         """Entry for running compression."""
+@@ -1513,6 +2223,11 @@ class Runner:
+             shutil.rmtree(compress_dir)
+         os.makedirs(compress_dir)
+ 
++        validated_receipt = self._validate_ap_compression_receipt(step)
++        if validated_receipt is not None:
++            with open(os.path.join(compress_dir, "ap_training_receipt.json"), "wb") as f:
++                f.write(canonical_json_bytes(validated_receipt))
++
+         self.run_param_distribution_vis(self.splats, save_dir=f"{cfg.result_dir}/visualization/raw")
+ 
+         patch_sha256 = os.environ.get("H007_AP_GIFSTREAM_PATCH_SHA256")
+@@ -1524,10 +2239,14 @@ class Runner:
+             raise ValueError(
+                 "AP compression requires H007_AP_GIFSTREAM_PATCH_SHA256 to freeze code provenance"
+             )
++        if patch_sha256 is not None:
++            patch_sha256 = patch_sha256.lower()
+         decoder_config = {
+             "schema": "h007.gifstream_decoder_config.v1",
+             "official_commit": "c98486632e7dafd830740b1a1692bd08c48b96e3",
+             "patch_sha256": patch_sha256,
++            "patch1_sha256": "65ecd8f1fe30fac5d5bce3aed295cfe04f0b0582f106efaf37489b005d2e431b",
++            "patch2_sha256": patch_sha256,
+             "variant": cfg.ap_variant,
+             "data_factor": cfg.data_factor,
+             "start_frame": cfg.start_frame,
+@@ -1542,11 +2261,15 @@ class Runner:
+             "knn": cfg.knn,
+             "time_dim": cfg.time_dim,
+             "view_adaptive": cfg.view_adaptive,
++            "add_opacity_dist": cfg.add_opacity_dist,
++            "add_cov_dist": cfg.add_cov_dist,
++            "add_color_dist": cfg.add_color_dist,
+             "app_opt": cfg.app_opt,
+             "app_embed_dim": cfg.app_embed_dim,
+             "test_set": cfg.test_set,
+             "remove_set": cfg.remove_set,
+             "compression_seed": cfg.ap_compression_seed,
++            "clean_decode_entrypoint": "examples/h007_clean_decode_gifstream.py",
+         }
+         with open(os.path.join(compress_dir, "decoder_config.json"), "wb") as f:
+             f.write(canonical_json_bytes(decoder_config))
+@@ -1583,7 +2306,16 @@ class Runner:
+         encode_start = time.perf_counter()
+         
+         if isinstance(self.compression_method, GIFStreamEnd2endCompression):
+-            self.compression_method.compress(compress_dir, self.comp_sim_splats, self.entropy_models, self.cfg.entropy_channel, self.cfg.c_perframe, self.scaling, self.cfg.voxel_size)
++            self.compression_method.compress(
++                compress_dir,
++                self.comp_sim_splats,
++                self.entropy_models,
++                self.cfg.entropy_channel,
++                self.cfg.c_perframe,
++                self.scaling,
++                self.cfg.voxel_size,
++                raw_time_features=self.splats["time_features"],
++            )
+             nets = {}
+             nets["decoders"] = self.decoders.state_dict()
+             for name, entropy_model in self.entropy_models.items():
+@@ -1614,6 +2346,16 @@ class Runner:
+         if torch.cuda.is_available():
+             torch.cuda.synchronize()
+         decode_seconds = time.perf_counter() - decode_start
++        self.run_param_distribution_vis(splats_c, save_dir=f"{cfg.result_dir}/visualization/quant")
++        for k in splats_c.keys():
++            self.splats[k].data = splats_c[k].to(self.device)
++        if self.cfg.knn:
++            _, self.indices = find_k_neighbors(self.splats["anchors"], self.cfg.n_knn)
++        # Render the actual archive reconstruction. Re-running base-Q
++        # compression simulation here would erase q_ap < 1 precision and no
++        # longer evaluate the decoded container.
++        self.cfg.compression_sim = False
++        warm_render = self.benchmark_warm_render_fps()
+         runtime = {
+             "schema": "h007.gifstream_runtime.v1",
+             "encode_seconds": encode_seconds,
+@@ -1621,12 +2363,35 @@ class Runner:
+             "peak_decode_cuda_bytes": int(torch.cuda.max_memory_allocated())
+             if torch.cuda.is_available()
+             else None,
+-            "warm_render_fps": None,
+-            "ap_score_seconds": None,
+-            "note": "warm render and AP score timers remain mandatory before confirmatory use",
++            "warm_render": warm_render,
++            "warm_render_fps": warm_render["fps"],
++            "ap_score_seconds": (
++                float(self.ap_state["ap_score_seconds"])
++                if self.ap_state is not None
++                else None
++            ),
++            "outcome_fields_read": [],
+         }
+         with open(os.path.join(compress_dir, "runtime.json"), "wb") as f:
+             f.write(canonical_json_bytes(runtime))
++        if self.ap_edit_audit is not None:
++            edit_payload = Path(str(self.cfg.ap_edit_ids_path)).read_bytes()
++            counted_edit_path = Path(compress_dir) / "ap_edit_ids.npz"
++            counted_edit_path.write_bytes(edit_payload)
++            self.ap_edit_audit["counted_artifact"] = counted_edit_path.name
++            self.ap_edit_audit["counted_artifact_sha256"] = hashlib.sha256(
++                edit_payload
++            ).hexdigest()
++            with open(os.path.join(compress_dir, "ap_edit_hook.json"), "wb") as f:
++                f.write(canonical_json_bytes(self.ap_edit_audit))
++        clean_decode_request = {
++            "schema": "h007.clean_decode_request.v1",
++            "archive_only": True,
++            "entrypoint": "examples/h007_clean_decode_gifstream.py",
++            "expected_output": "decoded_splats.pt",
++        }
++        with open(os.path.join(compress_dir, "clean_decode_request.json"), "wb") as f:
++            f.write(canonical_json_bytes(clean_decode_request))
+ 
+         census = file_byte_census(compress_dir)
+         census["self_exclusion"] = "byte_census.json is counted by the archive but cannot hash itself"
+@@ -1636,14 +2401,28 @@ class Runner:
+         zip_audit = deterministic_zip_directory(compress_dir, zip_path)
+         with open(os.path.join(cfg.result_dir, f"compression_rank{world_rank}_zip_audit.json"), "wb") as f:
+             f.write(canonical_json_bytes(zip_audit))
+-        
+-        self.run_param_distribution_vis(splats_c, save_dir=f"{cfg.result_dir}/visualization/quant")
+-        for k in splats_c.keys():
+-            self.splats[k].data = splats_c[k].to(self.device)
+-        if self.cfg.knn:
+-            _, self.indices = find_k_neighbors(self.splats["anchors"], self.cfg.n_knn)
+-        if isinstance(self.compression_method, GIFStreamEnd2endCompression):
+-            self.comp_sim_splats, self.esti_bits_dict = self.compression_sim_method.simulate_compression(self.splats, self.cfg.max_steps, 0, self.cfg.entropy_channel)
++        feedback_record = {
++            "schema": "h007.gifstream_byte_feedback_record.v1",
++            "scene": "flame_salmon_1" if cfg.ap_variant != "official" else os.path.basename(
++                os.path.normpath(cfg.data_dir)
++            ),
++            "variant": cfg.ap_variant,
++            "q_ap_multiplier": float(cfg.ap_q_ap_multiplier),
++            "q_bg_multiplier": float(cfg.ap_q_bg_multiplier),
++            "bytes": int(zip_audit["bytes"]),
++            "sha256": zip_audit["sha256"],
++            "archive": zip_audit["archive"],
++            "outcome_fields_read": [],
++        }
++        with open(
++            os.path.join(
++                cfg.result_dir,
++                f"compression_rank{world_rank}_byte_feedback_record.json",
++            ),
++            "wb",
++        ) as f:
++            f.write(canonical_json_bytes(feedback_record))
++
+         self.eval(step=step, stage="compress")
+         self.render_traj(step=step, stage="compress")
+ 
+@@ -1786,6 +2565,8 @@ def main(local_rank: int, world_rank, world_size: int, cfg: Config):
+                     else runner.app_module
+                 )
+                 target.load_state_dict(ckpts[0]["app_module"])
++            if runner.cfg.ap_variant != "official":
++                runner.restore_ap_training_state(ckpts[0])
+             step = ckpts[0]["step"]
+             runner.cfg.compression_sim = ckpts[0]["compression_sim"]
+             if runner.cfg.compression_sim:
+@@ -1810,7 +2591,14 @@ def main(local_rank: int, world_rank, world_size: int, cfg: Config):
+             runner.decoders.load_state_dict(ckpts[0]["decoders"])
+             if runner.cfg.app_opt:
+                 runner.app_module.load_state_dict(ckpts[0]["app_module"])
+-            runner.train(init_step=7001)
++            if runner.cfg.ap_variant != "official" and "ap_state" in ckpts[0]:
++                runner.restore_ap_training_state(ckpts[0])
++            if runner.cfg.ap_variant != "official":
++                raise ValueError(
++                    "AP continuation is fail-closed because the official checkpoint omits "
++                    "optimizer/scheduler state; run the frozen variant uninterrupted"
++                )
++            runner.train(init_step=int(ckpts[0]["step"]) + 1)
+     else:
+         runner.train()
+ 
+diff --git a/gsplat/compression/ap_gifstream.py b/gsplat/compression/ap_gifstream.py
+index 37e2c49..037af77 100644
+--- a/gsplat/compression/ap_gifstream.py
++++ b/gsplat/compression/ap_gifstream.py
+@@ -23,8 +23,8 @@ import torch
+ from torch import Tensor
+ 
+ 
+-AP_SCORE_SCHEMA = "h007.ap_scores.v1"
+-AP_META_SCHEMA = "h007.ap_gifstream.codec.v1"
++AP_SCORE_SCHEMA = "h007.ap_scores.v2"
++AP_META_SCHEMA = "h007.ap_gifstream.codec.v2"
+ DETERMINISTIC_ZIP_EPOCH = (1980, 1, 1, 0, 0, 0)
+ 
+ 
+@@ -64,6 +64,29 @@ def canonical_voxel_ids(anchors: Tensor, voxel_size: float) -> Tensor:
+     return ids
+ 
+ 
++def tensor_mapping_sha256(values: Mapping[str, Tensor]) -> str:
++    """Hash a tensor mapping independent of ``torch.save`` container metadata."""
++    digest = hashlib.sha256()
++    for name in sorted(values):
++        value = values[name]
++        if not isinstance(value, Tensor):
++            raise ValueError(f"state mapping contains a non-tensor value: {name}")
++        tensor = value.detach().cpu().contiguous()
++        header = json.dumps(
++            {
++                "name": name,
++                "dtype": str(tensor.dtype),
++                "shape": list(tensor.shape),
++            },
++            sort_keys=True,
++            separators=(",", ":"),
++        ).encode("utf-8")
++        digest.update(len(header).to_bytes(8, "little"))
++        digest.update(header)
++        digest.update(tensor.numpy().tobytes(order="C"))
++    return digest.hexdigest()
++
++
+ def _lexicographic_rank(ids: np.ndarray, scores: np.ndarray, descending: bool) -> np.ndarray:
+     if ids.ndim != 2 or ids.shape[1] != 3:
+         raise ValueError("canonical IDs must be [N,3]")
+@@ -89,12 +112,14 @@ def load_aligned_score_artifact(
+     voxel_size: float,
+     ranking: str,
+     random_seed: int,
+-) -> Tuple[Tensor, Tensor, Dict[str, Any]]:
++    expected_variant: Optional[str] = None,
++) -> Tuple[Tensor, Tensor, Tensor, Dict[str, Any], Dict[str, Any]]:
+     """Load a frozen reference-only score artifact and align by canonical ID.
+ 
+     Required NPZ members are ``schema``, ``canonical_ids``, ``eligible``,
+-    ``path_score`` and ``motion_score``.  Random rankings reuse the exact same
+-    eligible universe, but replace the score with a frozen seeded permutation.
++    ``path_score``, ``motion_score``, ``allocation_score`` and
++    ``estimated_time_bytes``. Random rankings consume the score vector frozen
++    by training; they never regenerate a second RNG stream in the codec.
+     """
+ 
+     current_ids = canonical_voxel_ids(anchors, voxel_size).cpu().numpy()
+@@ -105,10 +130,29 @@ def load_aligned_score_artifact(
+             "scene",
+             "voxel_size",
+             "frame_count",
++            "variant",
++            "protected_fraction",
++            "q_ap_multiplier",
++            "q_bg_multiplier",
++            "random_seed",
+             "canonical_ids",
+             "eligible",
+             "path_score",
+             "motion_score",
++            "allocation_score",
++            "estimated_time_bytes",
++            "official_retain_mask",
++            "official_factor0_mask",
++            "official_active_mask",
++            "ap_retain_mask",
++            "ap_active_mask",
++            "ap_class_mask",
++            "factor0_activation_value",
++            "factor3_activation_value",
++            "estimator_version",
++            "time_entropy_model_sha256",
++            "time_feature_scaling",
++            "time_entropy_model_frozen_after_freeze",
+         }
+         missing = sorted(required - members)
+         if missing:
+@@ -128,19 +172,79 @@ def load_aligned_score_artifact(
+             )
+         if int(np.asarray(artifact["frame_count"]).item()) != 60:
+             raise ValueError("U3 score artifact must contain exactly 60 GOP frames")
++        artifact_variant = str(np.asarray(artifact["variant"]).item())
++        if expected_variant is not None and artifact_variant != expected_variant:
++            raise ValueError(
++                f"score artifact variant {artifact_variant!r} != requested {expected_variant!r}"
++            )
++        protected_fraction = float(np.asarray(artifact["protected_fraction"]).item())
++        q_ap_multiplier = float(np.asarray(artifact["q_ap_multiplier"]).item())
++        q_bg_multiplier = float(np.asarray(artifact["q_bg_multiplier"]).item())
++        artifact_random_seed = int(np.asarray(artifact["random_seed"]).item())
++        if not (0.0 < protected_fraction <= 1.0):
++            raise ValueError("invalid frozen protected_fraction")
++        if not (0.0 < q_ap_multiplier <= 1.0) or q_bg_multiplier < 1.0:
++            raise ValueError("invalid frozen AP/background quantizer multipliers")
++        if ranking == "random" and artifact_random_seed != int(random_seed):
++            raise ValueError("random ranking seed differs from frozen score artifact")
+         artifact_ids = np.asarray(artifact["canonical_ids"], dtype=np.int64)
+         eligible_src = np.asarray(artifact["eligible"], dtype=np.bool_)
++        allocation_score_src = np.asarray(artifact["allocation_score"], dtype=np.float64)
+         if ranking == "path":
+             score_src = np.asarray(artifact["path_score"], dtype=np.float64)
+         elif ranking == "motion":
+             score_src = np.asarray(artifact["motion_score"], dtype=np.float64)
+         elif ranking == "random":
+-            score_src = np.zeros((artifact_ids.shape[0],), dtype=np.float64)
++            score_src = allocation_score_src
+         else:
+             raise ValueError(f"ranking {ranking!r} does not consume an AP score artifact")
++        byte_src = np.asarray(artifact["estimated_time_bytes"], dtype=np.int64)
++        frozen_mask_src = {
++            name: np.asarray(artifact[name], dtype=np.bool_)
++            for name in (
++                "official_retain_mask",
++                "official_factor0_mask",
++                "official_active_mask",
++                "ap_retain_mask",
++                "ap_active_mask",
++                "ap_class_mask",
++            )
++        }
++        factor0_activation_value = float(np.asarray(artifact["factor0_activation_value"]).item())
++        factor3_activation_value = float(np.asarray(artifact["factor3_activation_value"]).item())
++        estimator_version = str(np.asarray(artifact["estimator_version"]).item())
++        time_entropy_model_sha256 = str(
++            np.asarray(artifact["time_entropy_model_sha256"]).item()
++        )
++        time_feature_scaling = float(np.asarray(artifact["time_feature_scaling"]).item())
++        time_entropy_model_frozen = bool(
++            np.asarray(artifact["time_entropy_model_frozen_after_freeze"]).item()
++        )
+ 
+-    if eligible_src.shape != (artifact_ids.shape[0],) or score_src.shape != (artifact_ids.shape[0],):
++    if (
++        eligible_src.shape != (artifact_ids.shape[0],)
++        or score_src.shape != (artifact_ids.shape[0],)
++        or allocation_score_src.shape != (artifact_ids.shape[0],)
++        or byte_src.shape != (artifact_ids.shape[0],)
++    ):
+         raise ValueError("malformed AP score artifact arrays")
++    for name, value in frozen_mask_src.items():
++        if value.shape != (artifact_ids.shape[0],):
++            raise ValueError(f"malformed frozen allocation mask: {name}")
++    if np.any(byte_src < 0):
++        raise ValueError("estimated_time_bytes must be nonnegative")
++    if factor0_activation_value <= 0 or factor3_activation_value <= 0:
++        raise ValueError("frozen factor activation values must be positive")
++    if estimator_version != "h007.conditional_gaussian_per_row_bits.v1":
++        raise ValueError("unsupported estimated-byte estimator version")
++    if (
++        len(time_entropy_model_sha256) != 64
++        or any(ch not in "0123456789abcdef" for ch in time_entropy_model_sha256.lower())
++        or time_feature_scaling <= 0
++    ):
++        raise ValueError("malformed frozen estimated-byte estimator provenance")
++    if not time_entropy_model_frozen:
++        raise ValueError("estimated-byte entropy model was not frozen after allocation")
+     source_index = _rows_to_index(artifact_ids)
+     aligned_indices = []
+     for row in current_ids.tolist():
+@@ -153,10 +257,15 @@ def load_aligned_score_artifact(
+ 
+     eligible = eligible_src[np.asarray(aligned_indices, dtype=np.int64)]
+     score = score_src[np.asarray(aligned_indices, dtype=np.int64)]
+-    if ranking == "random":
+-        rng = np.random.default_rng(int(random_seed))
+-        # Continuous draws are only the primary key; canonical IDs remain the frozen tie break.
+-        score = rng.random(score.shape[0], dtype=np.float64)
++    estimated_bytes = byte_src[np.asarray(aligned_indices, dtype=np.int64)]
++    aligned_masks = {
++        name: value[np.asarray(aligned_indices, dtype=np.int64)]
++        for name, value in frozen_mask_src.items()
++    }
++    if ranking in {"path", "motion"} and not np.array_equal(
++        score_src[eligible_src], allocation_score_src[eligible_src]
++    ):
++        raise ValueError("frozen allocation score disagrees with declared ranking")
+     if not np.all(np.isfinite(score[eligible])):
+         raise ValueError("eligible AP scores must be finite")
+     score[~eligible] = -np.inf
+@@ -167,13 +276,249 @@ def load_aligned_score_artifact(
+         "score_artifact": os.path.abspath(path),
+         "score_artifact_sha256": hashlib.sha256(raw).hexdigest(),
+         "ranking": ranking,
++        "variant": artifact_variant,
++        "protected_fraction": protected_fraction,
++        "q_ap_multiplier": q_ap_multiplier,
++        "q_bg_multiplier": q_bg_multiplier,
+         "random_seed": int(random_seed) if ranking == "random" else None,
++        "estimator_version": estimator_version,
++        "time_entropy_model_sha256": time_entropy_model_sha256,
++        "time_feature_scaling": time_feature_scaling,
++        "time_entropy_model_frozen_after_freeze": time_entropy_model_frozen,
+         "anchor_count": int(current_ids.shape[0]),
+         "eligible_count": int(eligible.sum()),
+     }
++    frozen_allocation = {
++        name: torch.from_numpy(value).to(device=anchors.device)
++        for name, value in aligned_masks.items()
++    }
++    frozen_allocation.update(
++        {
++            "factor0_activation_value": factor0_activation_value,
++            "factor3_activation_value": factor3_activation_value,
++        }
++    )
++    if int(frozen_allocation["official_retain_mask"].sum()) != int(
++        frozen_allocation["ap_retain_mask"].sum()
++    ):
++        raise ValueError("frozen whole-anchor allocation changed retained count")
++    if torch.any(
++        frozen_allocation["official_active_mask"]
++        & ~frozen_allocation["official_retain_mask"]
++    ):
++        raise ValueError("frozen official active mask escapes official retain mask")
++    if torch.any(
++        frozen_allocation["ap_active_mask"]
++        & ~frozen_allocation["ap_retain_mask"]
++    ):
++        raise ValueError("frozen AP active mask escapes AP retain mask")
++    if not torch.equal(
++        frozen_allocation["official_active_mask"],
++        frozen_allocation["official_retain_mask"]
++        & frozen_allocation["official_factor0_mask"],
++    ):
++        raise ValueError("frozen official active mask disagrees with factor0/retain masks")
++    official_mass = int(
++        estimated_bytes[frozen_allocation["official_active_mask"].cpu().numpy()].sum()
++    )
++    ap_mass = int(estimated_bytes[frozen_allocation["ap_active_mask"].cpu().numpy()].sum())
++    if official_mass != ap_mass:
++        raise ValueError("frozen temporal allocation changed estimated-byte mass")
++    spec = variant_spec(artifact_variant)
++    expected_retain, expected_class, _ = build_count_preserving_anchor_allocation(
++        frozen_allocation["official_retain_mask"],
++        torch.from_numpy(score).to(device=anchors.device, dtype=torch.float64),
++        torch.from_numpy(eligible).to(device=anchors.device),
++        torch.from_numpy(current_ids).to(device=anchors.device, dtype=torch.int64),
++        protected_fraction,
++        spec.swap,
++    )
++    if not torch.equal(expected_retain, frozen_allocation["ap_retain_mask"]):
++        raise ValueError("frozen whole-anchor allocation is not reproducible")
++    expected_active, expected_temporal_class, _ = build_equal_estimated_byte_allocation(
++        frozen_allocation["official_active_mask"],
++        torch.from_numpy(score).to(device=anchors.device, dtype=torch.float64),
++        torch.from_numpy(eligible).to(device=anchors.device),
++        torch.from_numpy(current_ids).to(device=anchors.device, dtype=torch.int64),
++        torch.from_numpy(estimated_bytes).to(device=anchors.device, dtype=torch.int64),
++        protected_fraction,
++        spec.swap,
++        starting_active=(
++            frozen_allocation["official_factor0_mask"] & expected_retain
++        ),
++        retain_mask=expected_retain,
++    )
++    if not torch.equal(expected_class, expected_temporal_class) or not torch.equal(
++        expected_class, frozen_allocation["ap_class_mask"]
++    ):
++        raise ValueError("frozen AP class mask is not reproducible")
++    if not torch.equal(expected_active, frozen_allocation["ap_active_mask"]):
++        raise ValueError("frozen temporal allocation is not reproducible")
+     return (
+         torch.from_numpy(score).to(device=anchors.device, dtype=torch.float64),
+         torch.from_numpy(eligible).to(device=anchors.device),
++        torch.from_numpy(estimated_bytes).to(device=anchors.device, dtype=torch.int64),
++        frozen_allocation,
++        audit,
++    )
++
++
++def build_equal_estimated_byte_allocation(
++    official_active: Tensor,
++    scores: Tensor,
++    eligible: Tensor,
++    canonical_ids: Tensor,
++    estimated_bytes: Tensor,
++    protected_fraction: float,
++    enable_swap: bool,
++    starting_active: Optional[Tensor] = None,
++    retain_mask: Optional[Tensor] = None,
++    max_dp_states: int = 2_000_000,
++) -> Tuple[Tensor, Tensor, Dict[str, Any]]:
++    """Close final temporal membership to official estimated-byte mass.
++
++    ``starting_active`` may already differ because whole-anchor membership was
++    swapped. Protected retained anchors are forced active, then a deterministic
++    exact integer subset-sum promotes or demotes eligible unprotected rows until
++    the official frozen byte mass is restored.  The final mask must be a subset
++    of ``retain_mask``.  No count-based fallback is allowed.
++    """
++
++    n = official_active.numel()
++    if (
++        scores.shape != (n,)
++        or eligible.shape != (n,)
++        or estimated_bytes.shape != (n,)
++        or canonical_ids.shape != (n, 3)
++    ):
++        raise ValueError("estimated-byte allocation arrays disagree")
++    if torch.any(estimated_bytes < 0):
++        raise ValueError("estimated temporal bytes must be nonnegative")
++    if not (0.0 < float(protected_fraction) <= 1.0):
++        raise ValueError("protected_fraction must be in (0,1]")
++
++    active_np = official_active.detach().to(torch.bool).cpu().numpy()
++    starting_np = (
++        active_np.copy()
++        if starting_active is None
++        else starting_active.detach().to(torch.bool).cpu().numpy()
++    )
++    retain_np = (
++        np.ones((n,), dtype=np.bool_)
++        if retain_mask is None
++        else retain_mask.detach().to(torch.bool).cpu().numpy()
++    )
++    if starting_np.shape != (n,) or retain_np.shape != (n,):
++        raise ValueError("starting_active/retain_mask shape mismatch")
++    if np.any(starting_np & ~retain_np):
++        raise ValueError("starting temporal allocation is not a subset of retained anchors")
++    eligible_np = eligible.detach().to(torch.bool).cpu().numpy()
++    scores_np = scores.detach().to(torch.float64).cpu().numpy()
++    ids_np = canonical_ids.detach().to(torch.int64).cpu().numpy()
++    costs_np = estimated_bytes.detach().to(torch.int64).cpu().numpy()
++    eligible_indices = np.flatnonzero(eligible_np)
++    if eligible_indices.size == 0:
++        raise ValueError("AP eligible universe is empty")
++    k = max(1, int(math.ceil(float(protected_fraction) * eligible_indices.size)))
++    ranked_eligible = eligible_indices[
++        _lexicographic_rank(ids_np[eligible_indices], scores_np[eligible_indices], descending=True)
++    ]
++    ap_class_np = np.zeros(n, dtype=np.bool_)
++    ap_class_np[ranked_eligible[:k]] = True
++
++    output_np = starting_np.copy()
++    if enable_swap:
++        protected_retain = ap_class_np & retain_np
++        if int(protected_retain.sum()) != int(ap_class_np.sum()):
++            raise ValueError("whole-anchor allocation failed to retain every AP-class anchor")
++        output_np[protected_retain] = True
++
++    target_total = int(costs_np[active_np].sum())
++    current_total = int(costs_np[output_np].sum())
++
++    def exact_subset(candidates: np.ndarray, target: int) -> np.ndarray:
++        if target == 0:
++            return np.empty(0, dtype=np.int64)
++        parents: Dict[int, Tuple[int, int]] = {0: (-1, -1)}
++        for candidate in candidates.tolist():
++            cost = int(costs_np[candidate])
++            additions: Dict[int, Tuple[int, int]] = {}
++            for subtotal in sorted(parents.keys(), reverse=True):
++                new_total = subtotal + cost
++                if new_total > target or new_total in parents or new_total in additions:
++                    continue
++                additions[new_total] = (subtotal, candidate)
++            parents.update(additions)
++            if len(parents) > int(max_dp_states):
++                raise ValueError("estimated-byte subset DP exceeded frozen state cap")
++            if target in parents:
++                break
++        if target not in parents:
++            raise ValueError(
++                f"no exact estimated-byte adjustment subset for {target} bytes"
++            )
++        selected = []
++        cursor = target
++        while cursor:
++            previous, candidate = parents[cursor]
++            selected.append(candidate)
++            cursor = previous
++        return np.asarray(selected, dtype=np.int64)
++
++    if not enable_swap and current_total != target_total:
++        raise ValueError("non-swap temporal allocation changed estimated-byte mass")
++    if enable_swap and current_total > target_total:
++        candidates = np.flatnonzero(
++            output_np & eligible_np & ~ap_class_np & (costs_np > 0)
++        )
++        candidates = candidates[
++            _lexicographic_rank(
++                ids_np[candidates], scores_np[candidates], descending=False
++            )
++        ]
++        output_np[exact_subset(candidates, current_total - target_total)] = False
++    elif enable_swap and current_total < target_total:
++        candidates = np.flatnonzero(
++            ~output_np & retain_np & eligible_np & ~ap_class_np & (costs_np > 0)
++        )
++        candidates = candidates[
++            _lexicographic_rank(
++                ids_np[candidates], scores_np[candidates], descending=True
++            )
++        ]
++        output_np[exact_subset(candidates, target_total - current_total)] = True
++
++    if np.any(output_np & ~retain_np):
++        raise AssertionError("final temporal allocation escaped whole-retain mask")
++    final_total = int(costs_np[output_np].sum())
++    if final_total != target_total:
++        raise AssertionError("temporal swap changed frozen estimated-byte mass")
++    promoted = np.flatnonzero(output_np & ~active_np)
++    demoted = np.flatnonzero(active_np & ~output_np)
++    promoted_mass = int(costs_np[promoted].sum())
++    demoted_mass = int(costs_np[demoted].sum())
++    audit = {
++        "official_active_count": int(active_np.sum()),
++        "ap_active_count": int(output_np.sum()),
++        "eligible_count": int(eligible_np.sum()),
++        "protected_count": int(ap_class_np.sum()),
++        "promoted_count": int(promoted.size),
++        "demoted_count": int(demoted.size),
++        "promoted_estimated_bytes": promoted_mass,
++        "demoted_estimated_bytes": demoted_mass,
++        "official_estimated_bytes": target_total,
++        "starting_estimated_bytes": current_total,
++        "ap_estimated_bytes": final_total,
++        "estimated_byte_delta": final_total - target_total,
++        "protected_fraction": float(protected_fraction),
++        "budget_definition": "exact_frozen_integer_estimated_time_bytes",
++        "real_zip_match_still_required": True,
++        "promoted_canonical_ids": ids_np[promoted].tolist(),
++        "demoted_canonical_ids": ids_np[demoted].tolist(),
++    }
++    return (
++        torch.from_numpy(output_np).to(device=official_active.device),
++        torch.from_numpy(ap_class_np).to(device=official_active.device),
+         audit,
+     )
+ 
+@@ -261,6 +606,31 @@ def build_equal_stream_budget_allocation(
+     )
+ 
+ 
++def build_count_preserving_anchor_allocation(
++    official_retain: Tensor,
++    scores: Tensor,
++    eligible: Tensor,
++    canonical_ids: Tensor,
++    protected_fraction: float,
++    enable_swap: bool,
++) -> Tuple[Tensor, Tensor, Dict[str, Any]]:
++    """Protect/swap whole anchors while preserving the exact retained count."""
++    retain, ap_class, audit = build_equal_stream_budget_allocation(
++        official_retain,
++        scores,
++        eligible,
++        canonical_ids,
++        protected_fraction,
++        enable_swap,
++    )
++    audit = dict(audit)
++    audit["official_retain_count"] = audit.pop("official_active_count")
++    audit["ap_retain_count"] = audit.pop("ap_active_count")
++    audit["budget_definition"] = "exact_whole_anchor_retain_count"
++    audit.pop("entropy_byte_match_deferred_to_deterministic_zip", None)
++    return retain, ap_class, audit
++
++
+ def pack_bool_mask(mask: Tensor) -> bytes:
+     arr = mask.detach().to(torch.bool).cpu().numpy().astype(np.uint8, copy=False)
+     return np.packbits(arr, bitorder="little").tobytes()
+diff --git a/gsplat/compression/gifstream_end2end_compression.py b/gsplat/compression/gifstream_end2end_compression.py
+index 10dfc69..2a7ae25 100644
+--- a/gsplat/compression/gifstream_end2end_compression.py
++++ b/gsplat/compression/gifstream_end2end_compression.py
+@@ -16,10 +16,10 @@ from gsplat.compression.outlier_filter import filter_splats
+ from gsplat.compression.sort import sort_splats, sort_anchors
+ from gsplat.compression.ap_gifstream import (
+     AP_META_SCHEMA,
+-    build_equal_stream_budget_allocation,
+     canonical_voxel_ids,
+     load_aligned_score_artifact,
+     read_ap_mask,
++    tensor_mapping_sha256,
+     variant_metadata,
+     variant_spec,
+     write_ap_mask,
+@@ -28,6 +28,21 @@ from gsplat.utils import inverse_log_transform, log_transform
+ import math
+ 
+ 
++def _apply_factor_mask(
++    factors: Tensor, column: int, target: Tensor, activation_value: float
++) -> None:
++    current = factors[:, column] > 0
++    promoted = target & ~current
++    demoted = ~target & current
++    if not math.isfinite(float(activation_value)) or float(activation_value) <= 0:
++        raise ValueError(f"invalid frozen activation value for factor column {column}")
++    if promoted.any():
++        factors[promoted, column] = float(activation_value)
++    factors[demoted, column] = 0.0
++    if not torch.equal(factors[:, column] > 0, target):
++        raise AssertionError(f"factor column {column} does not match AP mask")
++
++
+ @dataclass
+ class GIFStreamEnd2endCompression:
+     """Uses quantization and sorting to compress splats into PNG files and uses
+@@ -89,7 +104,7 @@ class GIFStreamEnd2endCompression:
+         else:
+             return _decompress_npz
+ 
+-    def compress(self, compress_dir: str, splats: Dict[str, Tensor], entropy_models: Dict[str, Module] = None, c_channel: int = 0, p_channel: int = 0, scaling = None, voxel_size = 0.01) -> None:
++    def compress(self, compress_dir: str, splats: Dict[str, Tensor], entropy_models: Dict[str, Module] = None, c_channel: int = 0, p_channel: int = 0, scaling = None, voxel_size = 0.01, raw_time_features: Optional[Tensor] = None) -> None:
+         """Run compression
+ 
+         Args:
+@@ -120,24 +135,48 @@ class GIFStreamEnd2endCompression:
+         ap_variant = str(ap_cfg.get("variant", "official"))
+         ap_spec = variant_spec(ap_variant)
+         ap_enabled = ap_variant != "official"
++        if raw_time_features is not None:
++            if raw_time_features.shape != splats["time_features"].shape:
++                raise ValueError("raw_time_features shape mismatch")
++            # Only a two-class quantized AP stream may recover precision finer
++            # than the official base-Q simulation.  Other variants continue to
++            # consume the official already-simulated tensor byte-for-byte.
++            if ap_enabled and ap_spec.quant:
++                splats["time_features"] = raw_time_features.detach().clone()
+         compression_seed = ap_cfg.get("compression_seed")
+         if ap_enabled and compression_seed is None:
+             raise ValueError("AP-GIFStream requires a frozen compression_seed")
+ 
+-        score = eligible = canonical_ids = None
++        score = eligible = estimated_bytes = frozen_allocation = canonical_ids = None
+         score_audit = allocation_audit = None
+         if ap_enabled:
+             score_path = ap_cfg.get("score_path")
+             if not score_path:
+                 raise ValueError("AP-GIFStream requires a frozen score_path")
+-            score, eligible, score_audit = load_aligned_score_artifact(
++            score, eligible, estimated_bytes, frozen_allocation, score_audit = load_aligned_score_artifact(
+                 str(score_path),
+                 splats["anchors"],
+                 voxel_size,
+                 ap_spec.ranking,
+                 int(ap_cfg.get("random_seed", 11)),
++                expected_variant=ap_variant,
+             )
++            for config_name, frozen_name, default in (
++                ("protected_fraction", "protected_fraction", 0.05),
++                ("q_ap_multiplier", "q_ap_multiplier", 0.5),
++                ("q_bg_multiplier", "q_bg_multiplier", 1.25),
++            ):
++                if float(ap_cfg.get(config_name, default)) != float(score_audit[frozen_name]):
++                    raise ValueError(f"codec {config_name} differs from frozen score artifact")
+             canonical_ids = canonical_voxel_ids(splats["anchors"], voxel_size)
++            if tensor_mapping_sha256(
++                entropy_models["time_features"].state_dict()
++            ) != score_audit["time_entropy_model_sha256"]:
++                raise ValueError("codec temporal entropy model differs from frozen byte estimator")
++            if float(scaling["time_features"]) != float(
++                score_audit["time_feature_scaling"]
++            ):
++                raise ValueError("codec temporal scaling differs from frozen byte estimator")
+ 
+         # Param-specific preprocessing
+         # splats["anchors"] = log_transform(splats["anchors"])
+@@ -145,21 +184,47 @@ class GIFStreamEnd2endCompression:
+         pruning_mask = splats["factors"][:,-1] > 0
+         ap_active = ap_class = None
+         if ap_enabled:
+-            official_active = splats["factors"][:, 0] > 0
+-            ap_active, ap_class, allocation_audit = build_equal_stream_budget_allocation(
+-                official_active,
+-                score,
+-                eligible,
+-                canonical_ids,
+-                float(ap_cfg.get("protected_fraction", 0.05)),
+-                ap_spec.swap,
++            current_retain = pruning_mask.clone()
++            current_active = current_retain & (splats["factors"][:, 0] > 0)
++            ap_retain = frozen_allocation["ap_retain_mask"]
++            ap_active = frozen_allocation["ap_active_mask"]
++            ap_class = frozen_allocation["ap_class_mask"]
++            if torch.any(ap_active & ~ap_retain):
++                raise ValueError("frozen AP active mask escapes whole-retain mask")
++            _apply_factor_mask(
++                splats["factors"],
++                3,
++                ap_retain,
++                float(frozen_allocation["factor3_activation_value"]),
+             )
+-            if torch.any(ap_class & ~pruning_mask):
+-                missing = int((ap_class & ~pruning_mask).sum().item())
+-                raise ValueError(
+-                    f"{missing} protected AP anchors would be removed by whole-anchor pruning; "
+-                    "the count-preserving whole-anchor protect/swap hook is not implemented"
+-                )
++            pruning_mask = ap_retain
++            _apply_factor_mask(
++                splats["factors"],
++                0,
++                ap_active,
++                float(frozen_allocation["factor0_activation_value"]),
++            )
++            allocation_audit = {
++                "budget_source": "frozen_score_artifact",
++                "official_retain_count": int(
++                    frozen_allocation["official_retain_mask"].sum().item()
++                ),
++                "ap_retain_count": int(ap_retain.sum().item()),
++                "official_estimated_time_bytes": int(
++                    estimated_bytes[frozen_allocation["official_active_mask"]].sum().item()
++                ),
++                "ap_estimated_time_bytes": int(estimated_bytes[ap_active].sum().item()),
++                "current_vs_frozen_whole_xor": int(
++                    torch.logical_xor(
++                        current_retain, frozen_allocation["official_retain_mask"]
++                    ).sum().item()
++                ),
++                "current_vs_frozen_temporal_xor": int(
++                    torch.logical_xor(
++                        current_active, frozen_allocation["official_active_mask"]
++                    ).sum().item()
++                ),
++            }
+         for k,v in splats.items():
+             splats[k] = v[pruning_mask]
+         if ap_enabled:
+@@ -167,6 +232,7 @@ class GIFStreamEnd2endCompression:
+             ap_class = ap_class[pruning_mask]
+             score = score[pruning_mask]
+             eligible = eligible[pruning_mask]
++            estimated_bytes = estimated_bytes[pruning_mask]
+             canonical_ids = canonical_ids[pruning_mask]
+ 
+         n_gs = len(splats["anchors"])
+@@ -191,6 +257,9 @@ class GIFStreamEnd2endCompression:
+                 eligible = torch.cat(
+                     [eligible, torch.zeros(pad, dtype=torch.bool, device=eligible.device)]
+                 )
++                estimated_bytes = torch.cat(
++                    [estimated_bytes, torch.zeros(pad, dtype=torch.int64, device=estimated_bytes.device)]
++                )
+                 sentinel = torch.zeros((pad, 3), dtype=torch.int64, device=canonical_ids.device)
+                 sentinel[:, 0] = torch.arange(pad, device=canonical_ids.device, dtype=torch.int64)
+                 sentinel[:, 0] += torch.iinfo(torch.int64).min
+@@ -218,17 +287,8 @@ class GIFStreamEnd2endCompression:
+             sort_indices = torch.arange(len(splats["anchors"]), device=splats["anchors"].device)
+ 
+         if ap_enabled:
+-            official_sorted_active = splats["factors"][:, 0] > 0
+-            promoted = ap_active & ~official_sorted_active
+-            demoted = ~ap_active & official_sorted_active
+-            positive = splats["factors"][official_sorted_active, 0]
+-            if promoted.any() and positive.numel() == 0:
+-                raise ValueError("cannot promote a temporal stream when the official active set is empty")
+-            if promoted.any():
+-                splats["factors"][promoted, 0] = positive.min()
+-            splats["factors"][demoted, 0] = 0.0
+-            if int((splats["factors"][:, 0] > 0).sum().item()) != int(ap_active.sum().item()):
+-                raise AssertionError("factor activation update disagrees with AP allocation")
++            if not torch.equal(splats["factors"][:, 0] > 0, ap_active):
++                raise AssertionError("sorted factor activation disagrees with frozen AP allocation")
+ 
+         choose_idx = splats["factors"][:,0] > 0
+         splats["time_features"] = splats["time_features"][choose_idx]
+@@ -265,6 +325,9 @@ class GIFStreamEnd2endCompression:
+ 
+         if ap_enabled:
+             mask_meta = write_ap_mask(os.path.join(compress_dir, "ap_class_mask.bin"), ap_class)
++            score_copy_path = os.path.join(compress_dir, "ap_score_artifact.npz")
++            score_copy_payload = Path(str(ap_cfg["score_path"])).read_bytes()
++            Path(score_copy_path).write_bytes(score_copy_payload)
+             permutation_path = os.path.join(compress_dir, "ap_plas_permutation.npy")
+             np.save(permutation_path, sort_indices.detach().cpu().numpy().astype(np.int64, copy=False))
+             permutation_payload = Path(permutation_path).read_bytes()
+@@ -280,6 +343,11 @@ class GIFStreamEnd2endCompression:
+                 "q_ap_multiplier": float(ap_cfg.get("q_ap_multiplier", 0.5)),
+                 "q_bg_multiplier": float(ap_cfg.get("q_bg_multiplier", 1.25)),
+                 "mask": mask_meta,
++                "score_copy": {
++                    "path": os.path.basename(score_copy_path),
++                    "bytes": len(score_copy_payload),
++                    "sha256": hashlib.sha256(score_copy_payload).hexdigest(),
++                },
+                 "plas_permutation": {
+                     "path": os.path.basename(permutation_path),
+                     "count": int(sort_indices.numel()),
+@@ -316,6 +384,15 @@ class GIFStreamEnd2endCompression:
+         if ap_meta is not None and ap_meta.get("schema") != AP_META_SCHEMA:
+             raise ValueError("unsupported AP-GIFStream metadata schema")
+         if ap_meta is not None:
++            score_copy_meta = ap_meta["score_copy"]
++            score_copy_path = os.path.join(compress_dir, score_copy_meta["path"])
++            score_copy_payload = Path(score_copy_path).read_bytes()
++            if len(score_copy_payload) != int(score_copy_meta["bytes"]):
++                raise ValueError("counted AP score artifact byte count mismatch")
++            if hashlib.sha256(score_copy_payload).hexdigest() != score_copy_meta["sha256"]:
++                raise ValueError("counted AP score artifact SHA-256 mismatch")
++            if score_copy_meta["sha256"] != ap_meta["score"]["score_artifact_sha256"]:
++                raise ValueError("counted AP score artifact differs from codec allocation source")
+             for sidecar_name in ("plas_permutation", "canonical_ids"):
+                 sidecar_meta = ap_meta[sidecar_name]
+                 sidecar_path = os.path.join(compress_dir, sidecar_meta["path"])
+@@ -850,7 +927,10 @@ def _compress_ap_time_features_ar(
+     ):
+         family_params = params[family_mask]
+         q_scaling = base_scaling * multiplier
+-        scaled = family_params / q_scaling
++        # Encode explicit integer reconstruction symbols.  Conditions are then
++        # identical to the decoder's previous reconstructed chunks, including
++        # when q_ap is finer than the official base Q.
++        scaled = torch.round(family_params / q_scaling)
+         flat = scaled.flatten(1)
+         row_count, feature_channels = flat.shape
+         length = feature_channels // channel
+diff --git a/gsplat/compression_simulation/entropy_model.py b/gsplat/compression_simulation/entropy_model.py
+index 962e982..35b9931 100644
+--- a/gsplat/compression_simulation/entropy_model.py
++++ b/gsplat/compression_simulation/entropy_model.py
+@@ -444,6 +444,24 @@ class ConditionEntropy(nn.Module):
+         else:
+             bits = self.get_y_gaussian_bits( x.flatten(1) - means + torch.nn.init.uniform_(torch.zeros_like(means), -0.5, 0.5).detach().clone(), scalings).mean()
+             return bits
++
++    def estimate_per_row_bits(self, x, condition, adaptive=False):
++        """Deterministic additive estimate used only by the AP allocation freeze.
++
++        Unlike ``forward`` this method injects no training noise and returns one
++        summed bit estimate per row, making the frozen byte-mass swap auditable.
++        """
++        distribution = self.model(condition)
++        num = distribution.shape[-1] // 3
++        means, scalings, qs = distribution.split([num, num, num], dim=-1)
++        qs = 1 + 0.8 * torch.tanh(qs)
++        symbols = (
++            torch.round(x.flatten(1) * qs) - torch.round(means)
++            if adaptive
++            else torch.round(x.flatten(1)) - torch.round(means)
++        )
++        bits = self.get_y_gaussian_bits(symbols, scalings)
++        return bits.flatten(1).sum(dim=1)
+     
+     def compress(self, x, condition, output_path, adaptive=False):
+         distribution = self.model(condition)
+@@ -470,4 +488,4 @@ class ConditionEntropy(nn.Module):
+             x_hat = (self.gaussian_encoder.decode_stream(scalings).cuda() + torch.round(means)) / qs
+         else:
+             x_hat = self.gaussian_encoder.decode_stream(scalings).cuda() + torch.round(means)
+-        return x_hat
+\ No newline at end of file
++        return x_hat
+diff --git a/gsplat/compression_simulation/simulation.py b/gsplat/compression_simulation/simulation.py
+index 2da5f57..90a6e44 100644
+--- a/gsplat/compression_simulation/simulation.py
++++ b/gsplat/compression_simulation/simulation.py
+@@ -8,6 +8,7 @@ from torch import Tensor, device
+ from .ops import fake_quantize_ste, log_transform, inverse_log_transform, fake_quantize_scaling, fake_quantize_factors
+ from .entropy_model import Entropy_factorized, Entropy_factorized_optimized, Entropy_factorized_optimized_refactor, Entropy_gaussian, ConditionEntropy
+ from gsplat.compression_simulation import entropy_model
++from gsplat.compression.ap_gifstream import canonical_voxel_ids, variant_spec
+ 
+ use_clamp = False
+ 
+@@ -521,6 +522,8 @@ class GIFStreamCompressionSimulation:
+         self.entropy_steps = entropy_steps
+         self.device = device
+         self.max_steps = max_steps
++        self.p_channel = int(kwargs["p_channel"])
++        self.last_ap_audit = None
+ 
+         self.simulation_option = {
+             "anchors": False,
+@@ -634,7 +637,99 @@ class GIFStreamCompressionSimulation:
+         return random_values >= threshold
+ 
+ 
+-    def simulate_compression(self, splats: Dict[str, Tensor], step: int, frame_idx: int = 0, c_channel: int = 0) -> Dict[str, Tensor]:
++    def estimate_time_stream_bytes(self, param: Tensor) -> Tensor:
++        """Freeze deterministic integer per-anchor bytes under official base Q."""
++        if not self.entropy_model_enable:
++            raise ValueError("AP estimated-byte allocation requires the entropy model")
++        if param.ndim != 3 or param.shape[-1] != self.p_channel:
++            raise ValueError("time_features shape disagrees with p_channel")
++        scaling = float(self.scaling["time_features"])
++        scaled = param / scaling
++        quantized = torch.round(scaled)
++        padded = torch.cat(
++            [torch.zeros((param.shape[0], 3, self.p_channel), device=param.device), quantized],
++            dim=1,
++        )
++        bits = torch.zeros((param.shape[0],), dtype=torch.float64, device=param.device)
++        model = self.entropy_models["time_features"]
++        with torch.no_grad():
++            for frame in range(param.shape[1]):
++                condition = torch.cat([padded[:, frame + x] for x in range(3)], dim=-1)
++                bits += model.estimate_per_row_bits(
++                    scaled[:, frame], condition, adaptive=False
++                ).to(torch.float64)
++        if not torch.isfinite(bits).all():
++            raise ValueError("nonfinite per-anchor temporal bit estimate")
++        # The integer byte mass is frozen once and used identically by simulation
++        # and the real compressor.  Positive rows receive at least one byte.
++        return torch.clamp(torch.ceil(bits / 8.0), min=1).to(torch.int64)
++
++    @staticmethod
++    def _apply_factor_mask(
++        factors: Tensor, column: int, target: Tensor, activation_value: float
++    ) -> None:
++        current = factors[:, column] > 0
++        promoted = target & ~current
++        demoted = ~target & current
++        if not torch.isfinite(torch.tensor(activation_value)) or activation_value <= 0:
++            raise ValueError(f"invalid frozen activation value for factor column {column}")
++        if promoted.any():
++            factors[promoted, column] = float(activation_value)
++        factors[demoted, column] = 0.0
++        if not torch.equal(factors[:, column] > 0, target):
++            raise AssertionError(f"factor column {column} does not match frozen AP mask")
++
++    def _apply_ap_state(self, splats: Dict[str, Tensor], factors: Tensor, ap_state: Dict) -> Dict:
++        spec = variant_spec(str(ap_state["variant"]))
++        ids = canonical_voxel_ids(splats["anchors"], float(ap_state["voxel_size"]))
++        if not torch.equal(ids, ap_state["canonical_ids"].to(ids.device)):
++            raise ValueError("AP state canonical IDs no longer align after score freeze")
++        current_retain = factors[:, 3] > 0
++        current_active = current_retain & (factors[:, 0] > 0)
++        ap_retain = ap_state["ap_retain_mask"].to(factors.device, dtype=torch.bool)
++        ap_active = ap_state["ap_active_mask"].to(factors.device, dtype=torch.bool)
++        temporal_class = ap_state["ap_class_mask"].to(factors.device, dtype=torch.bool)
++        if torch.any(ap_active & ~ap_retain):
++            raise ValueError("frozen AP active mask escapes whole-retain mask")
++        self._apply_factor_mask(
++            factors,
++            3,
++            ap_retain,
++            float(ap_state["factor3_activation_value"]),
++        )
++        self._apply_factor_mask(
++            factors,
++            0,
++            ap_active,
++            float(ap_state["factor0_activation_value"]),
++        )
++        return {
++            "class_mask": temporal_class,
++            "active_mask": ap_active,
++            "retain_mask": ap_retain,
++            "whole": ap_state["whole_allocation_audit"],
++            "temporal": ap_state["temporal_allocation_audit"],
++            "factor_mask_drift": {
++                "whole_xor_count": int(
++                    torch.logical_xor(
++                        current_retain,
++                        ap_state["official_retain_mask"].to(factors.device),
++                    ).sum().item()
++                ),
++                "temporal_xor_count": int(
++                    torch.logical_xor(
++                        current_active,
++                        ap_state["official_active_mask"].to(factors.device),
++                    ).sum().item()
++                ),
++            },
++            "variant": ap_state["variant"],
++            "quant": spec.quant,
++            "q_ap_multiplier": float(ap_state["q_ap_multiplier"]),
++            "q_bg_multiplier": float(ap_state["q_bg_multiplier"]),
++        }
++
++    def simulate_compression(self, splats: Dict[str, Tensor], step: int, frame_idx: int = 0, c_channel: int = 0, ap_state: Optional[Dict] = None) -> Dict[str, Tensor]:
+         """
+         """
+         # Create empty dicts for output, including fake quantized values and (optional) estimated bits
+@@ -655,7 +750,38 @@ class GIFStreamCompressionSimulation:
+             "frame_idx": frame_idx,
+             "c_channel": c_channel
+         }
++        # Factor quantization must precede temporal simulation for every mode.
++        # ParameterDict places time_features before factors, while the real
++        # encoder prunes on quantized factor3 and then activates on factor0.
++        factors, factor_bits = self.simulate_compression_factors(
++            splats["factors"], step, choose_idx, pos, **kwargs
++        )
++        factors = factors.clone()
++        new_splats["factors"] = factors
++        esti_bits_dict["factors"] = factor_bits
++        kwargs["factors"] = factors
++        kwargs["ap_active_mask"] = (factors[:, 3] > 0) & (factors[:, 0] > 0)
++        self.last_ap_audit = None
++        if ap_state is not None:
++            ap_context = self._apply_ap_state(splats, factors, ap_state)
++            self.last_ap_audit = {
++                key: value
++                for key, value in ap_context.items()
++                if key not in {"class_mask", "active_mask", "retain_mask"}
++            }
++            kwargs.update(
++                {
++                    "factors": factors,
++                    "ap_class_mask": ap_context["class_mask"],
++                    "ap_active_mask": ap_context["active_mask"],
++                    "ap_quant": ap_context["quant"],
++                    "q_ap_multiplier": ap_context["q_ap_multiplier"],
++                    "q_bg_multiplier": ap_context["q_bg_multiplier"],
++                }
++            )
+         for param_name in splats.keys():
++            if param_name == "factors":
++                continue
+             # Check which params need to be simulate
+             if self.simulation_option[param_name]:
+                 simulate_fn = self._get_simulate_fn(param_name)
+@@ -784,7 +910,14 @@ class GIFStreamCompressionSimulation:
+         
+     def simulate_compression_time_features(self, param: torch.nn.Parameter, step: int, choose_idx: torch.Tensor, pos: torch.Tensor=None, **kwargs) -> Tensor:
+         # fake quantize
+-        if step < 0.2 * self.max_steps:
++        if kwargs.get("ap_quant", False):
++            class_mask = kwargs["ap_class_mask"].to(param.device).view(-1, 1, 1)
++            q_ap = float(self.scaling["time_features"]) * float(kwargs["q_ap_multiplier"])
++            q_bg = float(self.scaling["time_features"]) * float(kwargs["q_bg_multiplier"])
++            q = torch.where(class_mask, q_ap, q_bg)
++            output_value = (torch.round(param / q) * q - param).detach() + param
++            fq_out_dict = {"output_value": output_value}
++        elif step < 0.2 * self.max_steps:
+             fq_out_dict = fake_quantize_scaling(param, self.scaling["time_features"] * 0.001)
+         elif step < 2/3 * self.max_steps:
+             fq_out_dict = fake_quantize_scaling(param, self.scaling["time_features"], q_type="noise")
+@@ -795,14 +928,39 @@ class GIFStreamCompressionSimulation:
+         if step > self.entropy_steps["time_features"] and self.entropy_model_enable:
+             frame_idx = kwargs["frame_idx"]
+             N,GOP,f_channel = fq_out_dict["output_value"].shape
+-            condition = torch.cat([torch.zeros((N,3,f_channel), device=param.device), fq_out_dict["output_value"]],dim=1)
+-            condition = torch.cat([condition[:,frame_idx+x] for x in range(3)],dim=-1)
+-            active_factors = torch.sigmoid(kwargs["factors"])
+-            choose_idx = active_factors[:,0] >= 0.2
+-            if choose_idx is not None:
+-                esti_bits = self.entropy_models["time_features"](param[choose_idx][:,frame_idx] / self.scaling["time_features"], condition[choose_idx])
++            active_mask = kwargs.get("ap_active_mask", kwargs["factors"][:, 0] > 0)
++            active_mask = active_mask.to(param.device, dtype=torch.bool)
++            esti_parts = []
++            weight_parts = []
++            if kwargs.get("ap_quant", False):
++                class_mask = kwargs["ap_class_mask"].to(param.device, dtype=torch.bool)
++                families = (
++                    (active_mask & class_mask, float(self.scaling["time_features"]) * float(kwargs["q_ap_multiplier"])),
++                    (active_mask & ~class_mask, float(self.scaling["time_features"]) * float(kwargs["q_bg_multiplier"])),
++                )
+             else:
+-                esti_bits = self.entropy_models["time_features"](param[:,frame_idx] / self.scaling["time_features"], condition)
++                families = ((active_mask, float(self.scaling["time_features"])),)
++            for family_mask, family_q in families:
++                if not family_mask.any():
++                    continue
++                scaled_output = fq_out_dict["output_value"][family_mask] / family_q
++                padded = torch.cat(
++                    [torch.zeros((scaled_output.shape[0], 3, f_channel), device=param.device), scaled_output],
++                    dim=1,
++                )
++                condition = torch.cat([padded[:, frame_idx + x] for x in range(3)], dim=-1)
++                part = self.entropy_models["time_features"](
++                    param[family_mask][:, frame_idx] / family_q, condition
++                )
++                esti_parts.append(part)
++                weight_parts.append(int(family_mask.sum().item()))
++            if esti_parts:
++                total_weight = sum(weight_parts)
++                esti_bits = sum(
++                    part * weight for part, weight in zip(esti_parts, weight_parts)
++                ) / total_weight
++            else:
++                esti_bits = None
+             return fq_out_dict["output_value"].reshape(param.shape), esti_bits
+         else:
+-            return fq_out_dict["output_value"].reshape(param.shape), None
+\ No newline at end of file
++            return fq_out_dict["output_value"].reshape(param.shape), None
+diff --git a/tests/test_ap_gifstream_core.py b/tests/test_ap_gifstream_core.py
+index f2f3e58..6864893 100644
+--- a/tests/test_ap_gifstream_core.py
++++ b/tests/test_ap_gifstream_core.py
+@@ -9,11 +9,13 @@ import torch
+ from gsplat.compression.ap_gifstream import (
+     AP_VARIANTS,
+     AP_SCORE_SCHEMA,
++    build_equal_estimated_byte_allocation,
+     build_equal_stream_budget_allocation,
+     canonical_voxel_ids,
+     deterministic_zip_directory,
+     load_aligned_score_artifact,
+     pack_bool_mask,
++    tensor_mapping_sha256,
+     unpack_bool_mask,
+ )
+ from gsplat.compression.gifstream_end2end_compression import (
+@@ -61,16 +63,37 @@ class APGIFStreamCoreTest(unittest.TestCase):
+                 scene=np.asarray("flame_salmon_1"),
+                 voxel_size=np.asarray(0.1),
+                 frame_count=np.asarray(60),
++                variant=np.asarray("path-swap"),
++                protected_fraction=np.asarray(1 / 3),
++                q_ap_multiplier=np.asarray(0.5),
++                q_bg_multiplier=np.asarray(1.25),
++                random_seed=np.asarray(11),
+                 canonical_ids=np.asarray([[2, 0, 0], [0, 0, 0], [1, 0, 0]], dtype=np.int64),
+                 eligible=np.asarray([True, True, False]),
+                 path_score=np.asarray([20.0, 0.0, 10.0]),
+                 motion_score=np.asarray([2.0, 0.0, 1.0]),
++                allocation_score=np.asarray([20.0, 0.0, 10.0]),
++                estimated_time_bytes=np.asarray([7, 5, 6], dtype=np.int64),
++                official_retain_mask=np.asarray([True, True, True]),
++                official_factor0_mask=np.asarray([True, False, True]),
++                official_active_mask=np.asarray([True, False, True]),
++                ap_retain_mask=np.asarray([True, True, True]),
++                ap_active_mask=np.asarray([True, False, True]),
++                ap_class_mask=np.asarray([True, False, False]),
++                factor0_activation_value=np.asarray(0.125),
++                factor3_activation_value=np.asarray(1.0),
++                estimator_version=np.asarray("h007.conditional_gaussian_per_row_bits.v1"),
++                time_entropy_model_sha256=np.asarray("0" * 64),
++                time_feature_scaling=np.asarray(1.0),
++                time_entropy_model_frozen_after_freeze=np.asarray(True),
+             )
+-            score, eligible, audit = load_aligned_score_artifact(
+-                str(artifact), anchors, 0.1, "path", 11
++            score, eligible, estimated_bytes, allocation, audit = load_aligned_score_artifact(
++                str(artifact), anchors, 0.1, "path", 11, expected_variant="path-swap"
+             )
+         torch.testing.assert_close(score, torch.tensor([0.0, -torch.inf, 20.0], dtype=torch.float64))
+         self.assertEqual(eligible.tolist(), [True, False, True])
++        self.assertEqual(estimated_bytes.tolist(), [5, 6, 7])
++        self.assertEqual(allocation["ap_active_mask"].tolist(), [False, True, True])
+         self.assertEqual(audit["eligible_count"], 2)
+ 
+     def test_duplicate_canonical_ids_fail(self):
+@@ -97,6 +120,70 @@ class APGIFStreamCoreTest(unittest.TestCase):
+         restored = unpack_bool_mask(payload, mask.numel())
+         self.assertTrue(torch.equal(mask, restored))
+ 
++    def test_tensor_mapping_hash_is_order_invariant(self):
++        left = {
++            "b": torch.tensor([2.0]),
++            "a": torch.tensor([[1.0, 3.0]]),
++        }
++        right = {"a": left["a"].clone(), "b": left["b"].clone()}
++        self.assertEqual(tensor_mapping_sha256(left), tensor_mapping_sha256(right))
++
++    def test_exact_estimated_byte_swap(self):
++        ids = torch.tensor([[i, 0, 0] for i in range(7)], dtype=torch.int64)
++        official = torch.tensor([True, True, True, True, False, False, False])
++        scores = torch.tensor([0.0, 1.0, 2.0, 3.0, 100.0, 90.0, 80.0])
++        costs = torch.tensor([3, 5, 7, 11, 8, 10, 100], dtype=torch.int64)
++        active, ap_class, audit = build_equal_estimated_byte_allocation(
++            official,
++            scores,
++            torch.ones(7, dtype=torch.bool),
++            ids,
++            costs,
++            protected_fraction=2 / 7,
++            enable_swap=True,
++        )
++        self.assertEqual(torch.flatnonzero(ap_class).tolist(), [4, 5])
++        self.assertEqual(torch.flatnonzero(active & ~official).tolist(), [4, 5])
++        self.assertEqual(audit["promoted_estimated_bytes"], 18)
++        self.assertEqual(audit["demoted_estimated_bytes"], 18)
++
++    def test_temporal_mass_closes_after_whole_membership_swap(self):
++        ids = torch.tensor([[i, 0, 0] for i in range(4)], dtype=torch.int64)
++        official_active = torch.tensor([True, False, False, False])
++        ap_retain = torch.tensor([True, False, True, False])
++        starting_active = torch.tensor([True, False, False, False])
++        scores = torch.tensor([0.0, 1.0, 100.0, 2.0])
++        costs = torch.tensor([5, 7, 5, 11], dtype=torch.int64)
++        active, ap_class, audit = build_equal_estimated_byte_allocation(
++            official_active,
++            scores,
++            torch.ones(4, dtype=torch.bool),
++            ids,
++            costs,
++            protected_fraction=0.25,
++            enable_swap=True,
++            starting_active=starting_active,
++            retain_mask=ap_retain,
++        )
++        self.assertEqual(torch.flatnonzero(ap_class).tolist(), [2])
++        self.assertEqual(active.tolist(), [False, False, True, False])
++        self.assertFalse(bool(torch.any(active & ~ap_retain)))
++        self.assertEqual(audit["official_estimated_bytes"], 5)
++        self.assertEqual(audit["ap_estimated_bytes"], 5)
++
++    def test_estimated_byte_allocator_fails_without_exact_subset(self):
++        ids = torch.tensor([[i, 0, 0] for i in range(3)], dtype=torch.int64)
++        with self.assertRaisesRegex(ValueError, "no exact estimated-byte"):
++            build_equal_estimated_byte_allocation(
++                torch.tensor([True, False, False]),
++                torch.tensor([0.0, 100.0, 1.0]),
++                torch.ones(3, dtype=torch.bool),
++                ids,
++                torch.tensor([3, 5, 7], dtype=torch.int64),
++                protected_fraction=1 / 3,
++                enable_swap=True,
++            )
++
+     def test_two_class_quantized_ar_round_trip(self):
+         params = torch.tensor(
+             [

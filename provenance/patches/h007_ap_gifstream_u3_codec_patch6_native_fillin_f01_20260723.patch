@@ -1,0 +1,196 @@
+diff --git a/examples/simple_trainer_GIFStream.py b/examples/simple_trainer_GIFStream.py
+index b80f63e..2d22690 100644
+--- a/examples/simple_trainer_GIFStream.py
++++ b/examples/simple_trainer_GIFStream.py
+@@ -346,4 +346,14 @@ class Config:
+             "factors": 1/16,
+             "time_features": 2,
+         },
++        {
++            "anchors": None,
++            "scales": 0.036,
++            "quats": None,
++            "opacities": None,
++            "anchor_features": 1,
++            "offsets": 0.036,
++            "factors": 1/16,
++            "time_features": 1,
++        },
+     ]
+@@ -595,7 +595,7 @@ def _prepare_h007_runtime(cfg: Config, world_size: int) -> Optional[Dict[str, An
+     if int(cfg.rate) not in FROZEN_RATE_LAMBDAS or abs(
+         float(cfg.rd_lambda) - FROZEN_RATE_LAMBDAS[int(cfg.rate)]
+     ) > 1e-15:
+-        raise ValueError("H007 rate index/RD-lambda differs from the frozen four-point grid")
++        raise ValueError("H007 rate index/RD-lambda differs from the registered rate grid")
+     if cfg.ap_variant != "official" and cfg.continue_training:
+         raise ValueError("AP continuation is unsupported and rejected before Runner construction")
+     if not cfg.compression_sim or not cfg.entropy_model_opt:
+@@ -2448,8 +2459,8 @@ class Runner:
+     def _build_producer_receipt(
+         self, step: int, ap_training_receipt_payload: Optional[bytes]
+     ) -> Dict:
+         if self.ap_runtime_provenance is None:
+-            raise ValueError("official/AP producer lacks verified six-stage provenance")
++            raise ValueError("official/AP producer lacks verified registered provenance")
+         if self.h007_training_receipt is None or self.h007_training_receipt_payload is None:
+             raise ValueError("official/AP producer lacks its external frozen training receipt")
+         training_config = self._producer_training_config()
+@@ -2558,8 +2569,8 @@ class Runner:
+         if self.ap_runtime_provenance is None:
+             raise ValueError("official/AP compression lacks runtime provenance")
+         patch_chain = list(self.ap_runtime_provenance["patch_sha256"])
+-        if len(patch_chain) != 6:
+-            raise ValueError("official/AP compression lacks a verified six-stage runtime chain")
++        if len(patch_chain) != 7:
++            raise ValueError("official/AP compression lacks the registered seven-stage runtime chain")
+         decoder_config = {
+             "schema": DECODER_CONFIG_SCHEMA,
+             "codec_family": "GIFStream",
+diff --git a/examples/h007_clean_decode_gifstream.py b/examples/h007_clean_decode_gifstream.py
+index 8d0680f..7cb0334 100644
+--- a/examples/h007_clean_decode_gifstream.py
++++ b/examples/h007_clean_decode_gifstream.py
+@@ -240,15 +240,15 @@ def clean_decode(
+     if config.get("official_commit") != OFFICIAL_COMMIT:
+         raise ValueError("container official commit mismatch")
+     if provenance_manifest is None or provenance_manifest_sha256 is None:
+-        raise ValueError("all official/AP clean decodes require six-stage runtime provenance")
++        raise ValueError("all official/AP clean decodes require registered runtime provenance")
+     repo_root = Path(__file__).resolve().parents[1]
+     runtime_provenance = verify_runtime_provenance(
+         provenance_manifest,
+         repo_root,
+         provenance_manifest_sha256,
+     )
+-    if len(runtime_provenance.get("patch_sha256", [])) != 6:
+-        raise ValueError("clean decoder is not bound to the six-stage patch chain")
++    if len(runtime_provenance.get("patch_sha256", [])) != 7:
++        raise ValueError("clean decoder is not bound to the registered seven-stage patch chain")
+     counted_manifest = container / "preregistered_patch_chain_manifest.json"
+     external_payload = provenance_manifest.resolve().read_bytes()
+     if counted_manifest.read_bytes() != external_payload:
+diff --git a/gsplat/compression/h007_runtime_provenance.py b/gsplat/compression/h007_runtime_provenance.py
+index e9c790b..ca8c2c2 100644
+--- a/gsplat/compression/h007_runtime_provenance.py
++++ b/gsplat/compression/h007_runtime_provenance.py
+@@ -1,7 +1,7 @@
+ """Fail-closed runtime provenance for the H007 AP-GIFStream experiment.
+ 
+ The preregistration manifest deliberately lives outside the patched GIFStream
+-tree.  It binds the six patch payloads and a normalized post-apply source-tree
++tree.  It binds the registered patch payloads and a normalized post-apply source-tree
+ digest without making a source file contain its own hash.
+ """
+ 
+@@ -20,7 +20,7 @@ OFFICIAL_COMMIT = "c98486632e7dafd830740b1a1692bd08c48b96e3"
+ PATCH1_SHA256 = "65ecd8f1fe30fac5d5bce3aed295cfe04f0b0582f106efaf37489b005d2e431b"
+ PATCH2_SHA256 = "347e3fbb59cdab49160a0c5291ecbd375e2de37d6bf3dea3e927d07f0ed8a253"
+ PATCH2B_SHA256 = "537b7a6c1607204000f6d4ce198d60c0b69917e46cdd89e9d6fcc431d37af40b"
+-PATCH_STAGES = ("patch1", "patch2", "patch2b", "patch3", "patch4", "patch5")
++PATCH_STAGES = ("patch1", "patch2", "patch2b", "patch3", "patch4", "patch5", "patch6")
+ TREE_ROOTS = ("examples", "gsplat", "third_party")
+ TREE_ROOT_FILES: Tuple[str, ...] = ("setup.py",)
+ TREE_SUFFIXES = (".c", ".cc", ".cpp", ".cu", ".cuh", ".h", ".hpp", ".py")
+@@ -218,7 +218,7 @@ def provenance_manifest_template(
+ 
+     patch_paths_and_hashes = list(patch_paths_and_hashes)
+     if len(patch_paths_and_hashes) != len(PATCH_STAGES):
+-        raise ValueError("manifest template requires exactly six patch payloads")
++        raise ValueError("manifest template requires the registered patch count")
+     rows = []
+     for stage, (path, digest) in zip(PATCH_STAGES, patch_paths_and_hashes):
+         rows.append(
+diff --git a/gsplat/compression/h007_sequence_container.py b/gsplat/compression/h007_sequence_container.py
+index 794e6a5..614b456 100644
+--- a/gsplat/compression/h007_sequence_container.py
++++ b/gsplat/compression/h007_sequence_container.py
+@@ -60,6 +60,7 @@ FROZEN_RATE_LAMBDAS = {
+     1: 0.001,
+     2: 0.002,
+     3: 0.004,
++    4: 0.0009,
+ }
+ MIN_ADJACENT_RATE_BYTE_FRACTION = 0.05
+ ELIGIBILITY_RECOMPUTATION_SCHEMA = "h007.h_sota_eligibility_recomputation.v4"
+@@ -511,9 +512,9 @@ def _optimizer_state_dict(role: str) -> Dict[str, Any]:
+ 
+ def _expected_codec_scaling(rate: int) -> Dict[str, Any]:
+     if type(rate) is not int or rate not in FROZEN_RATE_LAMBDAS:
+-        raise ValueError("codec scaling rate is outside the frozen four-rate grid")
+-    scale = (0.02, 0.04, 0.06, 0.08)[rate]
+-    feature = (1, 1, 1.5, 2)[rate]
++        raise ValueError("codec scaling rate is outside the registered rate grid")
++    scale = (0.02, 0.04, 0.06, 0.08, 0.036)[rate]
++    feature = (1, 1, 1.5, 2, 1)[rate]
+     return {
+         "anchors": None,
+         "scales": scale,
+@@ -962,6 +963,6 @@ def _ap_score_npz_contract(
+         "runtime_manifest_sha256.npy": ("<U64", ()),
+         "normalized_code_tree_sha256.npy": ("<U64", ()),
+-        "patch_chain_sha256.npy": ("<U64", (4,)),
++        "patch_chain_sha256.npy": ("<U64", (7,)),
+         "path_definition.npy": (_unicode_scalar_descr(AP_PATH_DEFINITION), ()),
+         "motion_definition.npy": (_unicode_scalar_descr(AP_MOTION_DEFINITION), ()),
+         "estimated_byte_definition.npy": (
+@@ -2020,7 +2021,7 @@ def _validate_decoder_config_discrete_types(config: Mapping[str, Any]) -> None:
+     for name in DECODER_NONNEGATIVE_INT_FIELDS:
+         _nonnegative_int(config[name], f"decoder config {name}")
+     if config["rate"] not in FROZEN_RATE_LAMBDAS:
+-        raise ValueError("decoder config rate is outside the frozen four-point grid")
++        raise ValueError("decoder config rate is outside the registered rate grid")
+     camera_count = frozen_scene_camera_count(config["scene"])
+     if config["warm_camera_pose_index"] >= camera_count:
+         raise ValueError("decoder config warm camera pose is outside the frozen camera grid")
+@@ -2318,7 +2319,7 @@ def _validate_runtime_provenance_shape(value: Any, label: str) -> Dict[str, Any]
+         value["schema"] != "h007.ap_gifstream.runtime_provenance.v1"
+         or value["official_commit"] != OFFICIAL_COMMIT
+         or not isinstance(value["patch_sha256"], list)
+-        or len(value["patch_sha256"]) != 6
++        or len(value["patch_sha256"]) != 7
+         or not isinstance(tree, dict)
+         or set(tree) != tree_required
+         or tree["schema"] != "h007.normalized_code_tree.v1"
+@@ -2821,9 +2822,9 @@ def _validate_gifstream_decoder_closure(
+     ):
+         raise ValueError("GOP decoder config is not the frozen GIFStream decoder contract")
+     _validate_decoder_config_discrete_types(config)
+     patch_chain = config.get("patch_chain_sha256")
+-    if not isinstance(patch_chain, list) or len(patch_chain) != 6:
+-        raise ValueError("GIFStream GOP is not bound to the six-stage runtime")
++    if not isinstance(patch_chain, list) or len(patch_chain) != 7:
++        raise ValueError("GIFStream GOP is not bound to the registered seven-stage runtime")
+     for index, digest in enumerate(patch_chain):
+         _require_sha256(digest, f"patch-chain entry {index} SHA-256")
+     manifest_sha = _require_sha256(
+@@ -4350,7 +4351,7 @@ def _validate_h_sota_v4_recomputation(
+         runtime["schema"] != "h007.ap_gifstream.runtime_provenance.v1"
+         or runtime["official_commit"] != OFFICIAL_COMMIT
+         or not isinstance(patches, list)
+-        or len(patches) != 6
++        or len(patches) != 7
+         or not isinstance(tree, dict)
+         or set(tree)
+         != {
+@@ -4846,8 +4847,8 @@ def _validate_ordinary_rate_quality_evidence(
+     """Recompute eligibility from real data, code and nested-ZIP evidence.
+ 
+     The request JSON contains no trusted PASS flag.  This function opens every
+     referenced archive and every source RGB member, validates the active
+-    six-stage runtime, and recomputes the ordinary rate/quality accounting.
++    registered seven-stage runtime, and recomputes the ordinary rate/quality accounting.
+     """
+ 
+     evidence = _strict_canonical_json(payload, "ordinary rate-quality evidence")
+@@ -4916,8 +4917,8 @@ def _validate_ordinary_rate_quality_evidence(
+         runtime_repo_root,
+         runtime_sha,
+     )
+-    if len(runtime_receipt.get("patch_sha256", [])) != 6:
+-        raise ValueError("ordinary evidence does not bind the exact six-stage runtime")
++    if len(runtime_receipt.get("patch_sha256", [])) != 7:
++        raise ValueError("ordinary evidence does not bind the registered seven-stage runtime")
+     evaluator_relative = _nonempty_string(
+         evidence["evaluator_relative_path"], "ordinary evaluator relative path"
+     )

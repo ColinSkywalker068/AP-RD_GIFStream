@@ -1,0 +1,777 @@
+<title>AP-RD 方法讲解:从一条路径到一份码流</title>
+
+<style>
+:root{
+  --bg:#F4F7F7; --surface:#FFFFFF; --surface-2:#EAF0F0;
+  --ink:#0E1A1C; --ink-2:#3C4D50; --ink-3:#6A7B7E;
+  --rule:#D3DFE0; --rule-soft:#E6EDED;
+  --teal:#0E7C86; --teal-deep:#08454B; --teal-wash:#DCEDEF;
+  --flag:#B33F1C; --flag-pure:#DE5330; --flag-wash:#FAE4DC;
+  --carrier:#7C868F; --ghost:#D9E0E3;
+  --ok:#2C6B4F; --ok-wash:#DFEDE5;
+  --font-display:"Songti SC","Source Han Serif SC","Noto Serif CJK SC",Georgia,"Times New Roman",serif;
+  --font-body:-apple-system,BlinkMacSystemFont,"PingFang SC","Hiragino Sans GB","Microsoft YaHei","Helvetica Neue",Arial,sans-serif;
+  --font-mono:ui-monospace,"SF Mono",SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace;
+  --font-math:"STIX Two Math","Latin Modern Math","Cambria Math",Georgia,serif;
+}
+@media (prefers-color-scheme: dark){
+  :root{
+    --bg:#0A1315; --surface:#101F22; --surface-2:#16292D;
+    --ink:#E6EFEF; --ink-2:#AFC1C3; --ink-3:#7E9396;
+    --rule:#22383C; --rule-soft:#1A2C30;
+    --teal:#45B9C3; --teal-deep:#83D9DF; --teal-wash:#0D3438;
+    --flag:#FF8A63; --flag-pure:#FF7A55; --flag-wash:#3A1D14;
+    --carrier:#8A959C; --ghost:#2A383C; --ok:#6FBF92; --ok-wash:#132C22;
+  }
+}
+:root[data-theme="dark"]{
+  --bg:#0A1315; --surface:#101F22; --surface-2:#16292D;
+  --ink:#E6EFEF; --ink-2:#AFC1C3; --ink-3:#7E9396;
+  --rule:#22383C; --rule-soft:#1A2C30;
+  --teal:#45B9C3; --teal-deep:#83D9DF; --teal-wash:#0D3438;
+  --flag:#FF8A63; --flag-pure:#FF7A55; --flag-wash:#3A1D14;
+  --carrier:#8A959C; --ghost:#2A383C; --ok:#6FBF92; --ok-wash:#132C22;
+}
+:root[data-theme="light"]{
+  --bg:#F4F7F7; --surface:#FFFFFF; --surface-2:#EAF0F0;
+  --ink:#0E1A1C; --ink-2:#3C4D50; --ink-3:#6A7B7E;
+  --rule:#D3DFE0; --rule-soft:#E6EDED;
+  --teal:#0E7C86; --teal-deep:#08454B; --teal-wash:#DCEDEF;
+  --flag:#B33F1C; --flag-pure:#DE5330; --flag-wash:#FAE4DC;
+  --carrier:#7C868F; --ghost:#D9E0E3; --ok:#2C6B4F; --ok-wash:#DFEDE5;
+}
+
+.page{background:var(--bg); color:var(--ink); font-family:var(--font-body);
+  font-size:16px; line-height:1.8; -webkit-font-smoothing:antialiased;
+  padding:0 clamp(1.1rem,4vw,2.5rem) 6rem;}
+.wrap{max-width:940px; margin:0 auto;}
+.col{max-width:65ch;}
+
+.eyebrow{font-family:var(--font-mono); font-size:.72rem; letter-spacing:.13em;
+  text-transform:uppercase; color:var(--teal); margin:0;}
+h1{font-family:var(--font-display); font-weight:600; font-size:clamp(1.95rem,5.4vw,3.1rem);
+  line-height:1.22; letter-spacing:-.01em; text-wrap:balance; margin:.5rem 0 0;}
+h2{font-family:var(--font-display); font-weight:600; font-size:clamp(1.34rem,3.3vw,1.78rem);
+  line-height:1.34; text-wrap:balance; margin:0;}
+h3{font-family:var(--font-body); font-weight:650; font-size:1rem; line-height:1.5; margin:0;}
+p{margin:0;}
+.stand{font-size:clamp(1.02rem,2.2vw,1.16rem); color:var(--ink-2); max-width:57ch;
+  margin-top:1rem; text-wrap:pretty;}
+.lede{color:var(--ink-2);}
+strong{font-weight:650; color:var(--ink);}
+.sym{font-family:var(--font-math); font-size:1.07em;}
+code{font-family:var(--font-mono); font-size:.85em; background:var(--surface-2);
+  padding:.12em .38em; border-radius:3px; color:var(--ink-2);}
+
+header.masthead{padding:clamp(3rem,9vw,5.5rem) 0 clamp(2rem,5vw,3rem); border-bottom:1px solid var(--rule);}
+.meta{display:flex; flex-wrap:wrap; gap:.4rem 1.4rem; margin-top:1.8rem;
+  font-family:var(--font-mono); font-size:.74rem; color:var(--ink-3); letter-spacing:.03em;}
+
+/* contents */
+.toc{display:grid; gap:1px; background:var(--rule); border:1px solid var(--rule);
+  border-radius:2px; overflow:hidden; margin-top:2.4rem;
+  grid-template-columns:repeat(auto-fit,minmax(255px,1fr));}
+.toc a{background:var(--surface); padding:.95rem 1.1rem; text-decoration:none; color:inherit;
+  display:grid; grid-template-columns:2.7rem 1fr; align-items:baseline; gap:.5rem;}
+.toc a:hover{background:var(--surface-2);}
+.toc a:focus-visible{outline:2px solid var(--teal); outline-offset:-2px;}
+.toc .k{font-family:var(--font-mono); font-size:.78rem; color:var(--teal);}
+.toc .v{font-size:.9rem; line-height:1.5;}
+
+/* chapters */
+.chapter{display:grid; grid-template-columns:4.4rem 1fr; gap:0 1.5rem;
+  padding:clamp(2.8rem,7vw,4.4rem) 0; border-bottom:1px solid var(--rule-soft);}
+.chnum{font-family:var(--font-mono); font-size:.85rem; color:var(--teal);
+  padding-top:.55rem; letter-spacing:.04em;}
+.chbody{display:flex; flex-direction:column; gap:1.5rem; min-width:0;}
+.chhead{display:flex; flex-direction:column; gap:.85rem;}
+@media (max-width:660px){
+  .chapter{grid-template-columns:1fr; gap:.5rem;}
+  .chnum{padding-top:0;}
+}
+.stack{display:flex; flex-direction:column; gap:1.05rem;}
+
+figure{margin:0; display:flex; flex-direction:column; gap:.8rem;}
+.figbox{background:var(--surface); border:1px solid var(--rule); border-radius:3px;
+  padding:1.35rem clamp(.9rem,2.5vw,1.5rem);}
+figcaption{font-size:.85rem; color:var(--ink-3); line-height:1.68;
+  border-left:2px solid var(--rule); padding-left:.85rem; max-width:62ch;}
+svg{display:block; width:100%; height:auto;}
+.fig-wide{overflow-x:auto;}
+.fig-wide svg{min-width:530px;}
+.svg-label{font-family:var(--font-body); font-size:13px; fill:var(--ink-2);}
+.svg-small{font-family:var(--font-mono); font-size:11px; fill:var(--ink-3); letter-spacing:.02em;}
+.svg-sym{font-family:var(--font-math); font-size:15px; fill:var(--ink);}
+
+.note{background:var(--teal-wash); border-left:3px solid var(--teal);
+  padding:.95rem 1.2rem; border-radius:0 3px 3px 0; font-size:.94rem; line-height:1.72;}
+.note.warn{background:var(--flag-wash); border-left-color:var(--flag-pure);}
+.note.ok{background:var(--ok-wash); border-left-color:var(--ok);}
+.note .nt{display:block; font-family:var(--font-mono); font-size:.68rem; letter-spacing:.1em;
+  text-transform:uppercase; color:var(--teal); margin-bottom:.35rem;}
+.note.warn .nt{color:var(--flag);} .note.ok .nt{color:var(--ok);}
+
+.revs{margin-top:1.2rem; border:1px solid var(--teal); border-radius:3px;
+  background:var(--teal-wash); padding:1.05rem 1.2rem;}
+.revs .rt{font-family:var(--font-mono); font-size:.7rem; letter-spacing:.11em;
+  text-transform:uppercase; color:var(--teal); margin:0 0 .75rem;}
+.revs ul{list-style:none; margin:0; padding:0; display:flex; flex-direction:column; gap:.5rem;}
+.revs li{font-size:.88rem; line-height:1.65; color:var(--ink);
+  display:flex; gap:.6rem; flex-wrap:wrap; align-items:baseline;}
+.revs li > b{font-family:var(--font-mono); color:var(--teal); font-weight:600;}
+.revs li > span:nth-child(2){flex:1; min-width:15rem;}
+.st{font-family:var(--font-mono); font-size:.66rem; letter-spacing:.06em;
+  padding:.12rem .45rem; border-radius:2px; background:var(--surface);
+  color:var(--ink-3); border:1px solid var(--rule); white-space:nowrap;}
+
+.codebox{background:var(--surface); border:1px solid var(--rule); border-radius:3px;
+  padding:1rem 1.2rem; display:flex; flex-direction:column; gap:.55rem;}
+.codebox .ct{font-family:var(--font-mono); font-size:.68rem; letter-spacing:.1em;
+  text-transform:uppercase; color:var(--ink-3);}
+.codebox ul{list-style:none; margin:0; padding:0; display:flex; flex-direction:column; gap:.45rem;}
+.codebox li{font-family:var(--font-mono); font-size:.78rem; line-height:1.6; color:var(--ink-2);
+  overflow-wrap:anywhere;}
+.codebox li b{color:var(--teal); font-weight:600;}
+
+.pair{display:grid; grid-template-columns:repeat(auto-fit,minmax(240px,1fr)); gap:1rem;}
+.card{border:1px solid var(--rule); border-radius:3px; padding:1.05rem 1.15rem;
+  background:var(--surface); display:flex; flex-direction:column; gap:.55rem;}
+.card .ct{font-family:var(--font-mono); font-size:.68rem; letter-spacing:.1em;
+  text-transform:uppercase; color:var(--ink-3);}
+.card p{font-size:.88rem; color:var(--ink-2); line-height:1.68;}
+.card.bad{border-color:var(--flag-pure);} .card.bad .ct{color:var(--flag);}
+.card.good{border-color:var(--teal);} .card.good .ct{color:var(--teal);}
+
+ul.plain{list-style:none; padding:0; margin:0; display:flex; flex-direction:column; gap:.7rem;}
+ul.plain li{display:grid; grid-template-columns:auto 1fr; gap:.75rem;
+  font-size:.94rem; line-height:1.72; color:var(--ink-2);}
+ul.plain li::before{content:"—"; color:var(--teal); font-family:var(--font-mono);}
+ul.plain li b{color:var(--ink); font-weight:650;}
+
+ol.steps{list-style:none; counter-reset:s; padding:0; margin:0;
+  display:flex; flex-direction:column; gap:.7rem;}
+ol.steps li{counter-increment:s; display:grid; grid-template-columns:1.7rem 1fr; gap:.7rem;
+  font-size:.93rem; line-height:1.72; color:var(--ink-2);}
+ol.steps li::before{content:"(" counter(s) ")"; font-family:var(--font-mono);
+  font-size:.78rem; color:var(--teal); padding-top:.22rem;}
+
+footer.close{padding:clamp(2.6rem,7vw,4rem) 0 0;}
+</style>
+
+<div class="page">
+<div class="wrap">
+
+<header class="masthead">
+  <p class="eyebrow">方法讲解 · AP-RD</p>
+  <h1>从一条路径,到一份能被干净解码的码流</h1>
+  <p class="stand">每一节先说它要挡住什么失败,再说它怎么挡,最后对一眼代码里真正在跑的东西。绿色标注 = 五项待办任务在方法里的落点(编号同 HANDOVER.md §6)。</p>
+  <div class="meta">
+    <span>代码路径对应包内 GIFStream_APRD/</span>
+    <span>配套:HANDOVER.md · ONBOARDING.md</span>
+  </div>
+
+  <nav class="toc">
+    <a href="#s1"><span class="k">§1</span><span class="v">什么是"路径",为什么图像指标看不见它</span></a>
+    <a href="#s2"><span class="k">§2</span><span class="v">谁值得保护 —— 以及为什么必须先冻住</span></a>
+    <a href="#s3"><span class="k">§3</span><span class="v">把他们塞回去,但不许白拿名额</span></a>
+    <a href="#s4"><span class="k">§4</span><span class="v">让训练、编码、解码算出同一个东西</span></a>
+    <a href="#s5"><span class="k">§5</span><span class="v">训练时就把压缩后的路径拽回来</span></a>
+    <a href="#s6"><span class="k">§6</span><span class="v">交付的是码流,不是训练时的张量</span></a>
+  </nav>
+
+  <div class="revs">
+    <p class="rt">接手后的六项任务 · 编号同 HANDOVER.md §6 · 落点在正文绿色标注</p>
+    <ul>
+      <li><b>1</b><span>D_path 评估器:w<sub>i</sub>=1,π = 冻结参考动作量的中位数,加 0.5×–2× 敏感性扫描</span><span class="st">新代码</span></li>
+      <li><b>2</b><span>闭包消融:只保护 𝒫 vs 𝒫+邻居(n_knn 8→0),并实测 |𝒬|/|𝓗*|</span><span class="st">改配置重跑</span></li>
+      <li><b>3</b><span>donor 双键:动作量最低之中,再取 backbone 自估重要性最低</span><span class="st">小代码改动 + 重跑</span></li>
+      <li><b>4</b><span>写作注意:时间预算 DP 的两种失败分开陈述、分别报告</span><span class="st">写作</span></li>
+      <li><b>5</b><span>写作注意:一跳闭包只对一层解码器成立,L 层推广为 L 跳(k<sup>L</sup>)</span><span class="st">写作</span></li>
+      <li><b>6</b><span>写作定位:AP-RD 框架为主角,两个实例(minimal_codec 证原理 / GIFStream 证真实码流)+ 契约筛选表</span><span class="st">写作</span></li>
+    </ul>
+  </div>
+</header>
+
+<!-- ========== 1 ========== -->
+<section class="chapter" id="s1">
+  <div class="chnum">§1</div>
+  <div class="chbody">
+    <div class="chhead">
+      <h2>什么是"路径",为什么图像指标看不见它</h2>
+      <p class="lede">一个训练好的动态表示,由一堆有编号的元素组成。给定时间 <span class="sym">t</span>,解码器算出每个元素在那一刻的位置:</p>
+    </div>
+
+    <figure>
+      <div class="figbox fig-wide">
+        <svg viewBox="0 0 700 128" role="img" aria-label="路径解码公式:位置等于规范坐标加上解码器对时间、自身状态和邻居状态的函数">
+          <text x="10" y="52" class="svg-sym">x</text>
+          <text x="21" y="46" class="svg-small" fill="var(--ink)">t</text>
+          <text x="21" y="59" class="svg-small" fill="var(--ink)">i</text>
+          <text x="40" y="52" class="svg-label">=</text>
+          <rect x="58" y="30" width="86" height="34" rx="3" fill="var(--surface-2)" stroke="var(--rule)"/>
+          <text x="76" y="52" class="svg-sym">a</text>
+          <text x="87" y="57" class="svg-small" fill="var(--ink)">i</text>
+          <text x="98" y="52" class="svg-label">规范坐标</text>
+          <text x="152" y="52" class="svg-label">+</text>
+          <rect x="172" y="30" width="82" height="34" rx="3" fill="var(--teal-wash)" stroke="var(--teal)"/>
+          <text x="188" y="52" class="svg-sym" fill="var(--teal-deep)">Φ</text>
+          <text x="202" y="52" class="svg-label" fill="var(--teal-deep)">解码器</text>
+          <text x="262" y="52" class="svg-label">(</text>
+          <rect x="274" y="30" width="46" height="34" rx="3" fill="var(--surface-2)" stroke="var(--rule)"/>
+          <text x="288" y="52" class="svg-label">时间</text>
+          <rect x="328" y="30" width="76" height="34" rx="3" fill="var(--surface-2)" stroke="var(--rule)"/>
+          <text x="340" y="52" class="svg-label">自身状态</text>
+          <rect x="412" y="30" width="98" height="34" rx="3" fill="var(--surface-2)" stroke="var(--carrier)" stroke-dasharray="4 3"/>
+          <text x="424" y="52" class="svg-label">邻居的状态</text>
+          <text x="516" y="52" class="svg-label">)</text>
+          <path d="M461,68 v18" stroke="var(--carrier)" stroke-width="1.2" stroke-dasharray="3 3"/>
+          <text x="400" y="104" class="svg-small">← 记住这一项,§4 整节都在处理它</text>
+          <text x="10" y="20" class="svg-small">元素 i 在时刻 t 的位置</text>
+        </svg>
+      </div>
+      <figcaption>路径就是把同一个编号的元素在 t=1…T 上的位置连起来。注意它<strong>不是</strong>物理物体的轨迹 —— 它是表示自己的一条身份线。</figcaption>
+    </figure>
+
+    <p class="lede">现在是关键的一步。压缩的常规评价标准是<strong>渲染出来的图像</strong>像不像原图。问题是,图像指标对路径几乎是瞎的:</p>
+
+    <figure>
+      <div class="figbox fig-wide">
+        <svg viewBox="0 0 700 268" role="img" aria-label="两张像素相同的帧,底下的运动轨迹却完全不同">
+          <text x="12" y="18" class="svg-small">参考资产</text>
+          <text x="372" y="18" class="svg-small">某个解码结果</text>
+          <rect x="10" y="26" width="330" height="176" rx="4" fill="var(--surface-2)" stroke="var(--rule)"/>
+          <rect x="370" y="26" width="330" height="176" rx="4" fill="var(--surface-2)" stroke="var(--rule)"/>
+          <g id="trailsA"></g><g id="trailsB"></g><g id="dotsA"></g><g id="dotsB"></g>
+          <text x="10" y="228" class="svg-label">每个元素走过一整条路</text>
+          <text x="370" y="228" class="svg-label">几乎没动,直接出现在终点</text>
+          <text x="10" y="254" class="svg-small" fill="var(--teal)">这一帧的像素:两边完全相同 → PSNR / SSIM / LPIPS 一模一样</text>
+        </svg>
+      </div>
+      <figcaption>青色实心点是这一帧上每个元素的位置 —— 两边逐点相同。虚线是它们各自是<strong>怎么到那儿的</strong>。图像指标只看点,不看线。</figcaption>
+    </figure>
+
+    <p class="lede">所以方法另外定义了一个只看线的失真量。它有两项,第二项才是要紧的:</p>
+
+    <figure>
+      <div class="figbox fig-wide">
+        <svg viewBox="0 0 700 122" role="img" aria-label="路径失真由匹配身份的位置误差与缺失身份的罚项组成">
+          <text x="8" y="46" class="svg-sym" fill="var(--teal)">D</text>
+          <text x="24" y="51" class="svg-small" fill="var(--teal)">path</text>
+          <text x="62" y="47" class="svg-label">=</text>
+          <rect x="84" y="20" width="248" height="46" rx="3" fill="var(--teal-wash)" stroke="var(--teal)"/>
+          <text x="100" y="48" class="svg-label" fill="var(--teal-deep)">两边都有的元素:路径偏了多少</text>
+          <text x="346" y="47" class="svg-label">+</text>
+          <rect x="370" y="20" width="248" height="46" rx="3" fill="var(--flag-wash)" stroke="var(--flag-pure)"/>
+          <text x="386" y="48" class="svg-label" fill="var(--flag)">解码后不存在的元素:每个罚 π</text>
+          <text x="84" y="92" class="svg-small">在参考与解码资产的交集上算</text>
+          <text x="370" y="92" class="svg-small" fill="var(--flag)">分母始终是完整的身份全集</text>
+          <text x="370" y="110" class="svg-small">→ 删掉一个元素,它不会从记分牌上消失</text>
+        </svg>
+      </div>
+      <figcaption>第二项挡住的是一种很自然的作弊:把难压的元素直接删掉,平均误差就漂亮了。分母固定在完整全集,删掉只会让罚项上升。</figcaption>
+    </figure>
+
+    <div class="note ok">
+      <span class="nt">任务 1 · D_path 评估器(新代码)</span>
+      这个总分目前<strong>还没有评估器</strong> —— 现有评估只分项报告两个分量(逐身份路径误差、缺失动作质量),从未合成。任务 1 把它算出来:<strong>w<sub>i</sub>=1</strong>(均匀),<strong>π = 冻结参考集里动作量的中位数</strong> —— 只用参考资产计算,保持 outcome-blind;读法是"丢一个身份,代价等于一个典型身份的全部运动"。并扫 0.5×–2× 证明结论不随 π 翻转。
+    </div>
+
+    <div class="note">
+      <span class="nt">整篇要解的问题</span>
+      在<strong>码率不超预算、图像失真不超阈值</strong>的前提下,把上面那个路径失真压到最低。注意码率算的是<strong>实际落盘的完整档案大小</strong>,不是熵模型的内部估计 —— 掩码、表头、量化器参数、元数据,全都计进去。
+    </div>
+  </div>
+</section>
+
+<!-- ========== 2 ========== -->
+<section class="chapter" id="s2">
+  <div class="chnum">§2</div>
+  <div class="chbody">
+    <div class="chhead">
+      <h2>谁值得保护 —— 以及为什么必须先冻住</h2>
+      <p class="lede">在开始压缩之前,先把<strong>没压缩的参考资产</strong>解出来,量每个元素一共走了多远:把相邻两帧的位移长度全部加起来。这个数就是它的"路径动作量"。</p>
+    </div>
+
+    <figure>
+      <div class="figbox fig-wide">
+        <svg viewBox="0 0 700 176" role="img" aria-label="路径动作量等于逐帧位移长度之和,排序后取前若干比例作为受保护集">
+          <g id="actpath"></g>
+          <text x="18" y="24" class="svg-small">把每一小段的长度加起来 = 这个元素的动作量</text>
+          <line x1="352" y1="30" x2="352" y2="150" stroke="var(--rule)"/>
+          <g id="actbars"></g>
+          <line x1="437" y1="26" x2="437" y2="156" stroke="var(--flag-pure)" stroke-width="1.3" stroke-dasharray="3.5 3"/>
+          <text x="380" y="24" class="svg-sym" fill="var(--teal)">𝒫</text>
+          <text x="443" y="24" class="svg-small" fill="var(--flag)">前 ρ 比例的分界</text>
+          <text x="380" y="170" class="svg-small">← 动得多            动得少 →</text>
+        </svg>
+      </div>
+      <figcaption>按动作量降序排,取最前面的一撮,就是<strong>受保护集</strong>。并列由规范编号按字典序裁定 —— 这样在任何机器上排出来的名单都一样。</figcaption>
+    </figure>
+
+    <p class="lede">然后是这一节真正的重点:<strong>名单一排完就冻住</strong>,后面所有优化都不许再碰它。</p>
+
+    <figure>
+      <div class="figbox fig-wide">
+        <svg viewBox="0 0 700 132" role="img" aria-label="冻结点之前只用参考资产,之后才开始候选构造与编码">
+          <line x1="14" y1="62" x2="686" y2="62" stroke="var(--rule)" stroke-width="2"/>
+          <line x1="330" y1="26" x2="330" y2="98" stroke="var(--teal)" stroke-width="2"/>
+          <circle cx="330" cy="62" r="7" fill="var(--teal)"/>
+          <text x="298" y="20" class="svg-small" fill="var(--teal)">冻结点</text>
+          <text x="20" y="46" class="svg-label">只看没压缩的参考资产</text>
+          <text x="20" y="90" class="svg-small">解码参考路径 → 算动作量 → 排序 → 定下受保护集</text>
+          <text x="348" y="46" class="svg-label">才允许开始压缩</text>
+          <text x="348" y="90" class="svg-small">构造候选 → 编码 → 渲染 → 测码率与失真</text>
+          <path d="M330,110 Q470,124 620,112" fill="none" stroke="var(--flag-pure)" stroke-width="1.2" stroke-dasharray="3 3"/>
+          <path d="M330,110 l7,4.5 v-9 z" fill="var(--flag-pure)"/>
+          <text x="392" y="128" class="svg-small" fill="var(--flag)">这条回头路被切断了</text>
+        </svg>
+      </div>
+      <figcaption>如果允许回头改名单,你就能先看看哪些元素压完效果差、再把它们塞进受保护集 —— 那样赢的是选择规则,不是方法。切断这条路,选择规则就<strong>看不到任何候选的结果</strong>。</figcaption>
+    </figure>
+
+    <div class="note">
+      <span class="nt">这一节没做的事</span>
+      动作量<strong>只用来排序</strong>。它不估计可见性、不估计语义重要性、不估计渲染器敏感度,也不预测某个元素压完会错多少。它更不创造任何新的容量 —— 名单上的元素,得靠下一节从别处换出来。
+    </div>
+  </div>
+</section>
+
+<!-- ========== 3 ========== -->
+<section class="chapter" id="s3">
+  <div class="chnum">§3</div>
+  <div class="chbody">
+    <div class="chhead">
+      <h2>把他们塞回去,但不许白拿名额</h2>
+      <p class="lede">编码器按自己的标准做取舍,不理会动作量,所以受保护集里总有一部分被它删掉了。一个被删掉身份的路径,根本无从解起。于是要把它们放回去 —— 而放回去必须付账。</p>
+    </div>
+
+    <figure>
+      <div class="figbox fig-wide">
+        <svg viewBox="0 0 700 210" role="img" aria-label="等量交换:放回被删的受保护身份,同时踢出等量的低动作身份">
+          <g id="swapbig"></g>
+        </svg>
+      </div>
+      <figcaption>放回 <span class="sym">n</span> 个,就从"编码器保留的、合格的、且不在受保护集里"的元素中踢出 <span class="sym">n</span> 个 —— 排序用两把键:先取动作量最低,其中再取 backbone 自估重要性最低(任务 3 的目标设计;当前代码只有第一把键)。交换的是<strong>整条元素记录</strong> —— 每一个字段都跟着走,不是只搬一部分。</figcaption>
+    </figure>
+
+    <p class="lede">这里换的是"<strong>存不存在</strong>"。但还有第二种失败:元素活下来了,它的时间状态却是关着的 —— 存在,但不许动。所以同一套逻辑要再做一遍,这次换的是"<strong>允不允许动</strong>":</p>
+
+    <div class="pair">
+      <div class="card good">
+        <span class="ct">第一次交换 · 整元素</span>
+        <p>不变量是<strong>数量相等</strong>。保留几个元素,换完还是几个。因为每条元素记录结构相同,数量守恒就是结构分配守恒。</p>
+      </div>
+      <div class="card good">
+        <span class="ct">第二次交换 · 时间活跃度</span>
+        <p>不变量是<strong>估计的时间字节质量相等</strong>。用冻结的熵模型给每个元素估一个开销,换完之后总开销跟原来一致。</p>
+      </div>
+    </div>
+
+    <div class="note ok">
+      <span class="nt">任务 3 · 付账的一侧换成双键(待实现)</span>
+      当前代码只按动作量从低到高踢 —— 但动作量对可见性一无所知,可能踢掉<strong>静止却重要</strong>的元素(全局 D<sub>img</sub> ≤ τ 兜底,单个局部瑕疵未必触发)。任务 3 改为两把键:先动作量升序,再 <strong>backbone 自己的冻结重要性估计</strong>升序 —— 被踢的在两个意义上都最不值钱。仍是确定性排序、仍 outcome-blind。不要做成学习式选择(Gumbel-softmax 之类):从下游损失学出的选择器按构造就是 outcome-dependent,会拆掉 §2 的整条防线;留 future work。
+    </div>
+
+    <div class="note warn">
+      <span class="nt">这两条不变量都不等于字节相等</span>
+      它们是<strong>内部分配约束</strong>,用来保证候选不是靠多占资源赢的。最终码率永远以实际落盘的档案大小为准,每个候选都要真的走一遍干净解码才算数。凑不出交换对象时,这个操作点直接宣告不可行 —— 不会偷偷把数量涨上去。
+    </div>
+
+    <div class="note ok">
+      <span class="nt">写作注意(任务 4)· 那个"恰好相等"要照实说</span>
+      等式由一个<strong>可达子和 DP</strong> 精确凑出(带状态数上限)。它有两种失败:目标凑不出 = 数学上真不可行;状态数超帽 = 算力预算放弃。写 method 时把两者<strong>分开陈述、分别报告触发次数</strong>,不要合并成一句 "infeasible"。<strong>不建议放松成 ≤</strong>:代码实践中解得出,照实描述比削弱不变量更划算。
+    </div>
+
+    <div class="codebox">
+      <span class="ct">代码里长这样</span>
+      <ul>
+        <li><b>build_count_preserving_anchor_allocation</b> — 整元素交换,不变量 <code>exact_whole_anchor_retain_count</code></li>
+        <li><b>build_equal_estimated_byte_allocation</b> — 时间活跃度交换,不变量 <code>exact_frozen_integer_estimated_time_bytes</code>;内部 <code>exact_subset</code> 是一个可达子和 DP,带 parent 指针回溯</li>
+        <li><b>_lexicographic_rank</b> — 排序与并列裁定,规范编号是最终权威;donor 第二把键(backbone 重要性)将并入此处</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<!-- ========== 4 ========== -->
+<section class="chapter" id="s4">
+  <div class="chnum">§4</div>
+  <div class="chbody">
+    <div class="chhead">
+      <h2>让训练、编码、解码算出同一个东西</h2>
+      <p class="lede">把元素换回来还不够。如果这三个阶段从同一个身份推出了不同的坐标、不同的邻居、或不同的驱动值,那前面做的分配全是白搭。这一节立三条规矩。</p>
+    </div>
+
+    <h3>规矩一 · 身份是坐标的权威,不是反过来</h3>
+
+    <figure>
+      <div class="figbox fig-wide">
+        <svg viewBox="0 0 700 200" role="img" aria-label="错误做法从有损坐标反推身份,正确做法从精确身份重算坐标">
+          <text x="14" y="20" class="svg-small" fill="var(--flag)">✗ 如果存的是坐标</text>
+          <rect x="14" y="30" width="118" height="38" rx="3" fill="var(--surface-2)" stroke="var(--flag-pure)"/>
+          <text x="30" y="54" class="svg-label">存有损坐标</text>
+          <path d="M140,49 L176,49" stroke="var(--flag-pure)" stroke-width="1.3"/>
+          <path d="M176,49 l-7,-4 v8 z" fill="var(--flag-pure)"/>
+          <rect x="184" y="30" width="126" height="38" rx="3" fill="var(--surface-2)" stroke="var(--flag-pure)"/>
+          <text x="200" y="54" class="svg-label">解出来的坐标歪了</text>
+          <path d="M318,49 L354,49" stroke="var(--flag-pure)" stroke-width="1.3"/>
+          <path d="M354,49 l-7,-4 v8 z" fill="var(--flag-pure)"/>
+          <rect x="362" y="30" width="150" height="38" rx="3" fill="var(--flag-wash)" stroke="var(--flag-pure)"/>
+          <text x="378" y="54" class="svg-label" fill="var(--flag)">拿它去认身份 → 认错</text>
+          <text x="524" y="54" class="svg-label" fill="var(--flag)">整条路径接错人</text>
+
+          <text x="14" y="122" class="svg-small" fill="var(--teal)">✓ 方法的做法</text>
+          <rect x="14" y="132" width="118" height="38" rx="3" fill="var(--teal-wash)" stroke="var(--teal)"/>
+          <text x="30" y="156" class="svg-label" fill="var(--teal-deep)">存规范编号</text>
+          <path d="M140,151 L176,151" stroke="var(--teal)" stroke-width="1.3"/>
+          <path d="M176,151 l-7,-4 v8 z" fill="var(--teal)"/>
+          <rect x="184" y="132" width="126" height="38" rx="3" fill="var(--teal-wash)" stroke="var(--teal)"/>
+          <text x="200" y="156" class="svg-label" fill="var(--teal-deep)">精确恢复该编号</text>
+          <path d="M318,151 L354,151" stroke="var(--teal)" stroke-width="1.3"/>
+          <path d="M354,151 l-7,-4 v8 z" fill="var(--teal)"/>
+          <rect x="362" y="132" width="150" height="38" rx="3" fill="var(--teal-wash)" stroke="var(--teal)"/>
+          <text x="378" y="156" class="svg-label" fill="var(--teal-deep)">用编号重算坐标</text>
+          <text x="524" y="156" class="svg-label" fill="var(--teal-deep)">坐标精确,身份不乱</text>
+          <text x="14" y="192" class="svg-small">恢复编号所需的那点修正量,也算进码率里;编号撞车或映射不可逆,这次解码直接作废</text>
+        </svg>
+      </div>
+      <figcaption>方向反过来就崩:坐标有损,而身份必须精确。所以让精确的那一头当权威,由它去生成有损的那一头。</figcaption>
+    </figure>
+
+    <h3>规矩二 · 邻居图两端各自重建,不传边表</h3>
+
+    <figure>
+      <div class="figbox fig-wide">
+        <svg viewBox="0 0 700 178" role="img" aria-label="编码端与解码端用同一条确定性规则各自重建邻居图,只用摘要比对">
+          <g id="graphA"></g><g id="graphB"></g>
+          <text x="42" y="20" class="svg-small">编码端重建</text>
+          <text x="486" y="20" class="svg-small">解码端重建</text>
+          <rect x="248" y="60" width="204" height="46" rx="3" fill="var(--surface-2)" stroke="var(--rule)"/>
+          <text x="264" y="80" class="svg-label">同一条确定性规则</text>
+          <text x="264" y="98" class="svg-small">距离为主键,规范编号裁定并列</text>
+          <path d="M212,83 L244,83" stroke="var(--carrier)" stroke-width="1.3"/>
+          <path d="M488,83 L456,83" stroke="var(--carrier)" stroke-width="1.3"/>
+          <text x="248" y="132" class="svg-label" fill="var(--teal)">→ 边表不必传输,只传一个摘要供比对</text>
+          <text x="248" y="156" class="svg-small">摘要对不上 = 解码作废,不会悄悄用错的图往下算</text>
+        </svg>
+      </div>
+      <figcaption>规则只依赖已经计进码率的规范编号和一条固定排序,所以跟张量的行序无关 —— 两端换个顺序装载,也会排出同一张图。被交换掉的元素自然也不会作为"隐藏的邻居上下文"残留。</figcaption>
+    </figure>
+
+    <h3>规矩三 · 保护范围要扩到邻居,精度分两档</h3>
+
+    <p class="lede">回到 §1 那个公式里被虚线圈住的那一项:解码器算一个元素的位置时,<strong>要读它邻居的状态</strong>。所以只把受保护元素自己存细是没用的 —— 邻居存粗了,误差照样从那条路灌进来。</p>
+
+    <figure>
+      <div class="figbox fig-wide">
+        <svg viewBox="0 0 700 216" role="img" aria-label="保护范围是受保护集加它们的一跳邻居,该范围内用细量化步长">
+          <g id="closure"></g>
+          <text x="196" y="204" class="svg-small" fill="var(--teal)">保护范围 = 受保护集 ∪ 它们的一跳邻居</text>
+          <rect x="392" y="34" width="128" height="128" rx="3" fill="url(#fineP)" stroke="var(--teal)"/>
+          <ellipse cx="456" cy="98" rx="20" ry="11" transform="rotate(-18 456 98)" fill="var(--teal)" opacity=".85"/>
+          <rect x="552" y="34" width="128" height="128" rx="3" fill="url(#coarseP)" stroke="var(--rule)"/>
+          <ellipse cx="616" cy="98" rx="20" ry="11" transform="rotate(-18 616 98)" fill="var(--carrier)" opacity=".65"/>
+          <text x="392" y="26" class="svg-small" fill="var(--teal)">范围内:细步长</text>
+          <text x="552" y="26" class="svg-small">范围外:粗步长</text>
+          <text x="392" y="184" class="svg-label">两档步长作用在<tspan fill="var(--teal)">每一个</tspan>会进入解码器的通道组上</text>
+          <text x="392" y="204" class="svg-small">元素特征 / 时间特征 / 依赖与门控通道 —— 不是只管时间特征</text>
+          <defs>
+            <pattern id="fineP" width="10" height="10" patternUnits="userSpaceOnUse">
+              <path d="M10,0 L0,0 0,10" fill="none" stroke="var(--rule)" stroke-width=".7"/>
+            </pattern>
+            <pattern id="coarseP" width="26" height="26" patternUnits="userSpaceOnUse">
+              <path d="M26,0 L0,0 0,26" fill="none" stroke="var(--rule)" stroke-width=".7"/>
+            </pattern>
+          </defs>
+        </svg>
+      </div>
+      <figcaption>粗那一档是码率的调节旋钮 —— 要省字节就把它调粗。方法只要求一件事:细的那档不能比粗的那档更粗。</figcaption>
+    </figure>
+
+    <div class="note">
+      <span class="nt">一个容易漏掉的细节</span>
+      有些通道同时兼职承载"是否活跃""是否保留"这类<strong>类别状态</strong>。这些状态一律从计过数的掩码里恢复,<strong>绝不从有损数值的正负号去猜</strong> —— 数值可以歪,成员关系不能歪。
+    </div>
+
+    <div class="note ok">
+      <span class="nt">任务 2 + 写作注意(任务 5)· 闭包的证据与边界</span>
+      <strong>证据(任务 2):</strong>补消融「只保护 𝒫」vs「𝒫 + 邻居」(n_knn 8→0),并实测 |𝒬|/|𝓗*| 占比 —— 这是全方法最花码率的选择,必须有数字撑腰。<strong>边界(任务 5):</strong>一跳闭包只对一层解码器严格成立(本实现 L=1);L 层解码器推广为 L 跳,保护范围按 k<sup>L</sup> 增长 —— 写适用范围时写清,不要写成适用于任何编码器。
+    </div>
+
+    <div class="codebox">
+      <span class="ct">代码里长这样</span>
+      <ul>
+        <li><b>build_path_input_precision_mask(…, n_knn, …)</b> — 一跳扩张 + 两档精度掩码</li>
+        <li><b>dependency_rule</b> = <code>"protected-plus-one-hop-retained-knn"</code> — 这条规则字符串写进容器,解码端要核对</li>
+        <li><b>retained_knn_graph_sha256</b> / <b>deterministic_knn_indices</b> — 两端各自重建后比对摘要</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<!-- ========== 5 ========== -->
+<section class="chapter" id="s5">
+  <div class="chnum">§5</div>
+  <div class="chbody">
+    <div class="chhead">
+      <h2>训练时就把压缩后的路径拽回来</h2>
+      <p class="lede">分配和契约让受保护的路径<strong>解得出来</strong>,但没有约束它<strong>解出来跟原来像不像</strong>。所以训练时每一步解码两次,然后罚两者的差。</p>
+    </div>
+
+    <figure>
+      <div class="figbox fig-wide">
+        <svg viewBox="0 0 700 236" role="img" aria-label="两条分支:未压缩分支作为停梯度目标,压缩模拟分支被拉向它">
+          <rect x="14" y="26" width="250" height="66" rx="3" fill="var(--surface-2)" stroke="var(--rule)"/>
+          <text x="30" y="52" class="svg-label">分支一:当前未压缩的状态</text>
+          <text x="30" y="76" class="svg-small">用完整身份全集上的邻居图</text>
+          <rect x="14" y="144" width="250" height="66" rx="3" fill="var(--teal-wash)" stroke="var(--teal)"/>
+          <text x="30" y="170" class="svg-label" fill="var(--teal-deep)">分支二:同一步的压缩模拟</text>
+          <text x="30" y="194" class="svg-small">换过的支撑 + 两档量化 + 保留图</text>
+
+          <path d="M272,59 L322,59 L322,110 L352,110" fill="none" stroke="var(--carrier)" stroke-width="1.4" stroke-dasharray="4 3"/>
+          <path d="M272,177 L322,177 L322,126 L352,126" fill="none" stroke="var(--teal)" stroke-width="1.6"/>
+          <text x="280" y="48" class="svg-small">停梯度:当靶子,不被拉动</text>
+
+          <rect x="360" y="86" width="140" height="64" rx="3" fill="var(--flag-wash)" stroke="var(--flag-pure)"/>
+          <text x="376" y="112" class="svg-label" fill="var(--flag)">罚两条路径的差</text>
+          <text x="376" y="134" class="svg-small" fill="var(--flag)">按动作量加权</text>
+          <path d="M508,118 L544,118" stroke="var(--ink-3)" stroke-width="1.3"/>
+          <path d="M544,118 l-7,-4 v8 z" fill="var(--ink-3)"/>
+          <rect x="552" y="94" width="134" height="48" rx="3" fill="var(--surface-2)" stroke="var(--rule)"/>
+          <text x="568" y="116" class="svg-label">加进原本的损失</text>
+          <text x="568" y="134" class="svg-small">图像项 + 熵项 + 这一项</text>
+
+          <text x="14" y="232" class="svg-small">只在<tspan fill="var(--teal)">两条分支都存在</tspan>的元素上算 —— 换出去的元素没有压缩路径可对齐,它们由 §1 的罚项在最终指标里承担</text>
+        </svg>
+      </div>
+      <figcaption>参考路径在这里扮演的角色和 §2 不同:§2 用的是<strong>冻结的</strong>动作量,只管选人和加权;这里的靶子跟着<strong>当前</strong>的未压缩模型走,所以冻结之后渲染质量还能继续优化。最终评分则只在冻结的参考和干净解码结果之间量。</figcaption>
+    </figure>
+
+    <div class="note ok">
+      <span class="nt">写作要点 · 两个必须写清的训练事实</span>
+      λ<sub>path</sub> = 0.01;对齐损失<strong>每 50 步做一次、权重 ×50 补偿</strong> —— 时间平均等价于每步 0.01,但梯度是脉冲式的,不是持续的小拉力。写 method 时照实写;这也顺带解释了双分支解码的开销为什么可以接受。
+    </div>
+  </div>
+</section>
+
+<!-- ========== 6 ========== -->
+<section class="chapter" id="s6">
+  <div class="chnum">§6</div>
+  <div class="chbody">
+    <div class="chhead">
+      <h2>交付的是码流,不是训练时的张量</h2>
+      <p class="lede">整个方法最后落在一句话上:<strong>能从码流里重建出来的,才算数。</strong>训练时内存里有什么不重要。</p>
+    </div>
+
+    <figure>
+      <div class="figbox fig-wide">
+        <svg viewBox="0 0 700 150" role="img" aria-label="计入码率的完整内容清单">
+          <g id="strip"></g>
+          <text x="14" y="20" class="svg-small">这些全部计进码率 —— 没有一样是"内部状态所以不算"</text>
+          <text x="14" y="142" class="svg-label">邻居图的边表<tspan fill="var(--teal)">不必</tspan>传(规则确定性),但仍绑一个摘要供解码端核对</text>
+        </svg>
+      </div>
+      <figcaption>规范编号的修正量、保留与活跃成员关系、受保护与依赖范围的掩码、各通道组的量化器参数、契约表头 —— 每一样边角料都进码率。</figcaption>
+    </figure>
+
+    <p class="lede">而"干净解码器"的意思是:它<strong>只有</strong>码流和一份固定的解码器实现,拿不到冻结参考路径,也拿不到动作量分数。它做五件事:</p>
+
+    <ol class="steps">
+      <li>恢复每个元素唯一的规范编号,并由编号重算出权威坐标</li>
+      <li>恢复保留 / 活跃 / 受保护 / 依赖范围这四套成员关系</li>
+      <li>重建邻居图,并跟摘要核对</li>
+      <li>按记录下来的两档规则,解开每一个会进入解码器的通道组</li>
+      <li>调用原生的状态解码器,把路径算出来</li>
+    </ol>
+
+    <div class="note ok">
+      <span class="nt">这就是整篇的落点</span>
+      路径始终是<strong>解码出的原生状态的产物</strong>。方法从头到尾没有往表示里追加任何一条独立的轨迹流、任何一个路径坐标 —— 它做的全部事情,是让原本就存在的那条路径在压缩之后还站得住。
+    </div>
+
+    <div class="note ok">
+      <span class="nt">写作定位(任务 6)· 契约同时是适用性边界</span>
+      本节的契约回答"AP-RD 适用于谁":任何满足<strong>稳定唯一身份 + 确定性 identity-conditioned 解码器 + 可恢复身份映射</strong>的编码器。写作以 AP-RD 框架为主角,两个实例并列 —— <strong>实例一:极简透明编码器</strong>(<code>minimal_codec/</code>,逐高斯轨迹,数据集自带 3D GT,机制全透明)证明原理;<strong>实例二:GIFStream</strong>(完整学习编码器)证明在真实 SOTA 码流上成立。正文附契约筛选表(HANDOVER §2b,写前逐一核对各方法的身份机制),宿主选择理由一句话,第二个学习宿主放 future work。
+    </div>
+  </div>
+</section>
+
+<footer class="close">
+  <h2 style="margin-bottom:1.3rem;">六节串起来是一句话</h2>
+  <ul class="plain col">
+    <li><b>§1</b> 定义一个图像指标看不见的失真,并让删掉的元素无处可藏。</li>
+    <li><b>§2</b> 在看到任何压缩结果<strong>之前</strong>,定下谁值得保护。</li>
+    <li><b>§3</b> 把他们换回来,名额和估计开销都不许多占。</li>
+    <li><b>§4</b> 让三个阶段从同一个身份算出同一张图、同一组值。</li>
+    <li><b>§5</b> 训练时就把压缩后的路径拽回未压缩的那条上。</li>
+    <li><b>§6</b> 全部代价计进码流,再交给一个什么都不知道的解码器验收。</li>
+  </ul>
+  <p class="lede col" style="margin-top:1.8rem;">六项任务没有一项推翻这条链路:1、2 是"补上缺失的证据",3 是唯一的设计改进,4、5、6 是写作时的措辞边界与定位。完整定义、验收标准与执行顺序见 <code>HANDOVER.md §6</code> 与 <code>ONBOARDING.md</code>;可选的熵模型探索(带止损条件)也在 HANDOVER §6 末尾。</p>
+</footer>
+
+</div>
+</div>
+
+<script>
+(function(){
+  "use strict";
+  var NS="http://www.w3.org/2000/svg";
+  function el(t,a){var n=document.createElementNS(NS,t);for(var k in a)n.setAttribute(k,a[k]);return n;}
+  function txt(x,y,s,cls,fill){
+    var n=el("text",{x:x,y:y,"class":cls||"svg-small"});
+    if(fill)n.setAttribute("fill",fill);
+    n.textContent=s; return n;
+  }
+
+  /* ---- s1 same frame, different trails ---- */
+  (function(){
+    var A=document.getElementById("trailsA"),B=document.getElementById("trailsB"),
+        DA=document.getElementById("dotsA"),DB=document.getElementById("dotsB");
+    if(!A) return;
+    var ends=[[78,66],[148,128],[224,76],[160,170],[276,146]];
+    var longs=[[36,158],[70,44],[118,168],[258,52],[192,42]];
+    var ctrl =[[30,100],[128,60],[142,150],[186,74],[248,60]];
+    ends.forEach(function(p,i){
+      var s=longs[i],c=ctrl[i];
+      A.appendChild(el("path",{d:"M"+s[0]+","+s[1]+" Q"+c[0]+","+c[1]+" "+p[0]+","+p[1],
+        fill:"none",stroke:"var(--carrier)","stroke-width":"1.3","stroke-dasharray":"4 3"}));
+      A.appendChild(el("circle",{cx:s[0],cy:s[1],r:3,fill:"var(--ghost)"}));
+      /* the same endpoint, reached from almost nowhere */
+      var sx=p[0]-16, sy=p[1]+12;
+      B.appendChild(el("path",{d:"M"+(sx+360)+","+sy+" L"+(p[0]+360)+","+p[1],
+        fill:"none",stroke:"var(--flag-pure)","stroke-width":"1.3","stroke-dasharray":"4 3"}));
+      B.appendChild(el("circle",{cx:sx+360,cy:sy,r:3,fill:"var(--ghost)"}));
+      DA.appendChild(el("ellipse",{cx:p[0],cy:p[1],rx:11,ry:6,
+        transform:"rotate("+(-20+i*9)+" "+p[0]+" "+p[1]+")",fill:"var(--teal)"}));
+      DB.appendChild(el("ellipse",{cx:p[0]+360,cy:p[1],rx:11,ry:6,
+        transform:"rotate("+(-20+i*9)+" "+(p[0]+360)+" "+p[1]+")",fill:"var(--teal)"}));
+    });
+  })();
+
+  /* ---- s2 action path + ranked bars ---- */
+  (function(){
+    var g=document.getElementById("actpath");
+    if(!g) return;
+    var pts=[[26,124],[74,86],[122,104],[170,54],[224,78],[286,40]];
+    for(var i=0;i<pts.length-1;i++){
+      g.appendChild(el("line",{x1:pts[i][0],y1:pts[i][1],x2:pts[i+1][0],y2:pts[i+1][1],
+        stroke:"var(--teal)","stroke-width":"2"}));
+    }
+    pts.forEach(function(p,i){
+      g.appendChild(el("circle",{cx:p[0],cy:p[1],r:4,fill:"var(--teal)"}));
+      g.appendChild(txt(p[0]-4,p[1]+20,"t"+(i+1),"svg-small"));
+    });
+    g.appendChild(txt(26,158,"每段长度相加  →  这个元素的动作量","svg-label"));
+
+    var bars=document.getElementById("actbars");
+    var hs=[104,92,80,66,58,48,40,33,26,20,15,11,8];
+    hs.forEach(function(h,i){
+      bars.appendChild(el("rect",{x:378+i*20,y:150-h,width:14,height:h,rx:1,
+        fill:i<3?"var(--teal)":"var(--carrier)",opacity:i<3?"1":".5"}));
+    });
+    bars.appendChild(el("line",{x1:372,y1:150,x2:686,y2:150,stroke:"var(--rule)"}));
+  })();
+
+  /* ---- s3 big swap ---- */
+  (function(){
+    var g=document.getElementById("swapbig");
+    if(!g) return;
+    var R=9, cols=[40,68,96], rows=[52,78,104,130];
+    cols.forEach(function(x){rows.forEach(function(y){
+      g.appendChild(el("circle",{cx:x,cy:y,r:R,fill:"var(--carrier)",opacity:".5"}));
+    });});
+    g.appendChild(txt(30,32,"编码器给出的保留集","svg-label"));
+    g.appendChild(txt(30,164,"其中受保护的被删了几个","svg-small","var(--flag)"));
+
+    g.appendChild(el("path",{d:"M136,90 L182,90",stroke:"var(--ink-3)","stroke-width":"1.5",fill:"none"}));
+    g.appendChild(el("path",{d:"M182,90 l-8,-5 v10 z",fill:"var(--ink-3)"}));
+    g.appendChild(txt(132,76,"等量交换","svg-small"));
+
+    var c2=[230,258,286];
+    c2.forEach(function(x,ci){rows.forEach(function(y,ri){
+      var isNew=(ci===0&&ri<2);
+      g.appendChild(el("circle",{cx:x,cy:y,r:R,
+        fill:isNew?"var(--teal)":"var(--carrier)",opacity:isNew?"1":".5"}));
+    });});
+    g.appendChild(txt(222,32,"换完的保留集","svg-label"));
+    g.appendChild(txt(222,164,"总数一模一样","svg-small","var(--teal)"));
+
+    /* incoming */
+    g.appendChild(el("circle",{cx:370,cy:44,r:R,fill:"var(--teal)"}));
+    g.appendChild(el("circle",{cx:394,cy:44,r:R,fill:"var(--teal)"}));
+    g.appendChild(el("path",{d:"M356,50 Q320,58 250,58",fill:"none",stroke:"var(--teal)","stroke-width":"1.4"}));
+    g.appendChild(el("path",{d:"M250,58 l8,-4.5 v9 z",fill:"var(--teal)"}));
+    g.appendChild(txt(414,40,"+2  放回被删的受保护身份","svg-label","var(--teal-deep)"));
+    g.appendChild(txt(414,58,"它们的路径本来根本解不出来","svg-small"));
+
+    /* outgoing */
+    g.appendChild(el("circle",{cx:370,cy:140,r:R,fill:"none",stroke:"var(--flag-pure)",
+      "stroke-width":"1.8","stroke-dasharray":"3.5 3"}));
+    g.appendChild(el("circle",{cx:394,cy:140,r:R,fill:"none",stroke:"var(--flag-pure)",
+      "stroke-width":"1.8","stroke-dasharray":"3.5 3"}));
+    g.appendChild(el("path",{d:"M300,134 Q330,140 356,140",fill:"none",stroke:"var(--flag-pure)","stroke-width":"1.4"}));
+    g.appendChild(el("path",{d:"M356,140 l-8,-4.5 v9 z",fill:"var(--flag-pure)"}));
+    g.appendChild(txt(414,136,"−2  踢出「两把键都最低」的合格身份","svg-label","var(--flag)"));
+    g.appendChild(txt(414,154,"键一:动作量最低;键二:backbone 重要性最低","svg-small"));
+    g.appendChild(txt(414,170,"规范编号裁并列;受保护的永远不会被选中","svg-small"));
+
+    g.appendChild(txt(414,196,"名额不变 —— 这不是「少压一点」,是把同一份预算换个花法","svg-label"));
+  })();
+
+  /* ---- s4 twin graphs ---- */
+  (function(){
+    var A=document.getElementById("graphA"),B=document.getElementById("graphB");
+    if(!A) return;
+    var nodes=[[46,54],[104,40],[152,74],[92,104],[36,96],[130,120]];
+    var edges=[[0,1],[1,2],[0,3],[3,4],[2,5],[3,5],[0,4],[1,3]];
+    [[A,0],[B,470]].forEach(function(pair){
+      var g=pair[0],dx=pair[1];
+      edges.forEach(function(e){
+        g.appendChild(el("line",{x1:nodes[e[0]][0]+dx,y1:nodes[e[0]][1],
+          x2:nodes[e[1]][0]+dx,y2:nodes[e[1]][1],stroke:"var(--rule)","stroke-width":"1.2"}));
+      });
+      nodes.forEach(function(n,i){
+        g.appendChild(el("circle",{cx:n[0]+dx,cy:n[1],r:7,
+          fill:i===0?"var(--teal)":"var(--surface)",stroke:"var(--teal)","stroke-width":"1.6"}));
+      });
+    });
+  })();
+
+  /* ---- s4 closure ---- */
+  (function(){
+    var g=document.getElementById("closure");
+    if(!g) return;
+    var hub=[110,98];
+    g.appendChild(el("circle",{cx:hub[0],cy:hub[1],r:66,fill:"none",stroke:"var(--teal)",
+      "stroke-width":"1.3","stroke-dasharray":"4 4"}));
+    for(var i=0;i<7;i++){
+      var a=(i/7)*Math.PI*2-Math.PI/2;
+      var x=hub[0]+Math.cos(a)*46, y=hub[1]+Math.sin(a)*46;
+      g.appendChild(el("line",{x1:hub[0],y1:hub[1],x2:x,y2:y,stroke:"var(--rule)","stroke-width":"1.1"}));
+      g.appendChild(el("circle",{cx:x,cy:y,r:8,fill:"var(--surface)",stroke:"var(--teal)","stroke-width":"1.7"}));
+    }
+    g.appendChild(el("circle",{cx:hub[0],cy:hub[1],r:11,fill:"var(--teal)"}));
+    /* an outsider, coarse */
+    g.appendChild(el("circle",{cx:248,cy:150,r:8,fill:"var(--carrier)",opacity:".5"}));
+    g.appendChild(txt(196,26,"实心 = 受保护  空心 = 它的一跳邻居","svg-small"));
+    g.appendChild(txt(196,46,"解码器读邻居,所以邻居也必须存细","svg-label","var(--teal-deep)"));
+  })();
+
+  /* ---- s6 bitstream strip ---- */
+  (function(){
+    var g=document.getElementById("strip");
+    if(!g) return;
+    var items=["骨干模型流","规范编号修正","保留 / 活跃成员","受保护 / 范围掩码","量化器参数","契约表头"];
+    var x=14;
+    items.forEach(function(s,i){
+      var w=s.length*13+22;
+      g.appendChild(el("rect",{x:x,y:44,width:w,height:44,rx:3,
+        fill:i===0?"var(--surface-2)":"var(--teal-wash)",
+        stroke:i===0?"var(--rule)":"var(--teal)"}));
+      g.appendChild(txt(x+11,71,s,"svg-label",i===0?"var(--ink-2)":"var(--teal-deep)"));
+      x+=w+8;
+    });
+    g.appendChild(txt(14,110,"合计 = 实测码率  ← 唯一算数的那个数","svg-label","var(--teal)"));
+  })();
+})();
+</script>
