@@ -48,6 +48,7 @@ def deterministic_knn_indices(
     count: int,
     *,
     canonical_ids: Optional[Tensor] = None,
+    allow_duplicate_rows: bool = False,
 ) -> Tensor:
     """Return row-order-invariant KNN indices with an exact tie rule.
 
@@ -72,7 +73,10 @@ def deterministic_knn_indices(
         # an explicit voxel identity is unavailable during ordinary training.
         points64 = anchors.detach().to(torch.float64).cpu().numpy()
         unique = np.unique(points64, axis=0)
-        if unique.shape[0] != row_count:
+        if unique.shape[0] != row_count and not allow_duplicate_rows:
+            # Rendering-only callers may opt in to duplicates (the official
+            # codec's lossy anchor round-trip can collapse two anchors onto
+            # one voxel); the identity-bearing contract paths stay strict.
             raise ValueError("deterministic KNN requires unique anchor rows")
         identity = points64
     else:
@@ -102,8 +106,12 @@ def deterministic_knn_indices(
         delta = sorted_points[candidates] - sorted_points[row]
         squared_distance = np.einsum("ij,ij->i", delta, delta)
         candidate_ids = sorted_identity[candidates]
+        # The trailing candidate-index key only ever decides between rows the
+        # identity keys cannot separate (exact duplicates); with unique rows
+        # it is unreachable and the ranking is unchanged.
         ranked = np.lexsort(
             (
+                candidates,
                 candidate_ids[:, 2],
                 candidate_ids[:, 1],
                 candidate_ids[:, 0],

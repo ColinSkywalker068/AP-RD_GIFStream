@@ -179,6 +179,35 @@ class APGIFStreamCoreTest(unittest.TestCase):
         self.assertTrue(precision[protected].all())
         self.assertTrue(retain[codec_graph[retained_rows]].all())
 
+    def test_duplicate_anchor_rows_rejected_unless_rendering_opts_in(self):
+        anchors = torch.tensor(
+            [
+                [0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0],
+                [3.0, 3.0, 3.0],
+            ],
+            dtype=torch.float32,
+        )
+        with self.assertRaisesRegex(ValueError, "unique anchor rows"):
+            deterministic_knn_indices(anchors, 2)
+        graph = deterministic_knn_indices(anchors, 2, allow_duplicate_rows=True)
+        self.assertEqual(graph.shape, (5, 2))
+        self.assertFalse(bool((graph == torch.arange(5).unsqueeze(1)).any()))
+        # A duplicate row is its twin's nearest neighbor (distance zero), and
+        # the result is deterministic for a fixed row order.
+        self.assertEqual(graph[1, 0].item(), 2)
+        self.assertEqual(graph[2, 0].item(), 1)
+        again = deterministic_knn_indices(anchors, 2, allow_duplicate_rows=True)
+        self.assertTrue(torch.equal(graph, again))
+        # The identity-bearing contract path stays strict even with the flag.
+        ids = torch.tensor([[i, 0, 0] for i in [0, 1, 1, 3, 4]], dtype=torch.int64)
+        with self.assertRaisesRegex(ValueError, "not unique"):
+            deterministic_knn_indices(
+                anchors, 2, canonical_ids=ids, allow_duplicate_rows=True
+            )
+
     def test_retained_knn_graph_hash_is_row_order_independent(self):
         anchors = torch.tensor(
             [

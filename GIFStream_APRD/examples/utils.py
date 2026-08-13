@@ -331,7 +331,7 @@ def find_k_neighbors(input, k):
         distances: distances from each point to its k nearest neighbors
         indices: indices of the k nearest neighbors for each point
     """
-    indices = deterministic_knn_indices(input, int(k))
+    indices = deterministic_knn_indices(input, int(k), allow_duplicate_rows=True)
     neighbors = input[indices]
     distances = torch.linalg.vector_norm(input[:, None, :] - neighbors, dim=-1)
     return distances.to(dtype=input.dtype), indices
