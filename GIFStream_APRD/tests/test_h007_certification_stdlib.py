@@ -145,6 +145,8 @@ class H007CertificationStdlibTest(unittest.TestCase):
                         "8" * 64,
                         "9" * 64,
                         "a" * 64,
+                        "b" * 64,
+                        "c" * 64,
                     ],
                     "normalized_code_tree": {
                         "schema": "h007.normalized_code_tree.v1",
@@ -351,7 +353,7 @@ class H007CertificationStdlibTest(unittest.TestCase):
     def test_manual_case_without_generation_closure_is_rejected(self):
         stage = {
             "freeze": {"evaluator_sha256": "1" * 64},
-            "runtime_provenance": {"patch_sha256": ["a" * 64] * 9},
+            "runtime_provenance": {"patch_sha256": ["a" * 64] * 11},
         }
         sequence = {
             "archive_sha256": "2" * 64,

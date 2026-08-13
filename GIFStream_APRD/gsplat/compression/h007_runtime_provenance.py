@@ -30,6 +30,8 @@ PATCH_STAGES = (
     "patch6",
     "patch7",
     "patch8",
+    "patch9",
+    "patch10",
 )
 TREE_ROOTS = ("examples", "gsplat", "third_party")
 TREE_ROOT_FILES: Tuple[str, ...] = ("setup.py",)

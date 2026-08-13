@@ -194,7 +194,7 @@ def fixture_ap_meta(method="ap-gifstream-full"):
         "time_entropy_model_frozen_after_freeze": True,
         "runtime_manifest_sha256": digest,
         "normalized_code_tree_sha256": digest,
-        "patch_chain_sha256": [digest] * 9,
+        "patch_chain_sha256": [digest] * 11,
         "anchor_count": anchor_count,
         "eligible_count": 3,
     }
@@ -220,7 +220,7 @@ def fixture_ap_meta(method="ap-gifstream-full"):
         "schema": "h007.ap_gifstream.runtime_provenance.v1",
         "manifest_sha256": digest,
         "official_commit": sequence.OFFICIAL_COMMIT,
-        "patch_sha256": [digest] * 9,
+        "patch_sha256": [digest] * 11,
         "normalized_code_tree": {
             "schema": "h007.normalized_code_tree.v1",
             "normalization": "fixture",
@@ -910,7 +910,7 @@ class H007SequenceContainerTest(unittest.TestCase):
             "schema": "h007.ap_gifstream.runtime_provenance.v1",
             "manifest_sha256": hashlib.sha256(runtime_manifest.read_bytes()).hexdigest(),
             "official_commit": sequence.OFFICIAL_COMMIT,
-            "patch_sha256": ["a" * 64] * 9,
+            "patch_sha256": ["a" * 64] * 11,
             "normalized_code_tree": {
                 "schema": "h007.normalized_code_tree.v1",
                 "normalization": "sorted-posix-path+lf-bytes+uint64le-lengths",
@@ -1037,7 +1037,7 @@ class H007SequenceContainerTest(unittest.TestCase):
             "file_count": 1,
             "sha256": "a" * 64,
         }
-        patch_hashes = [f"{index:x}" * 64 for index in range(1, 10)]
+        patch_hashes = [f"{index:x}" * 64 for index in range(1, 12)]
         runtime_manifest_payload = sequence.canonical_json_bytes(
             {
                 "schema": "h007.ap_gifstream.patch_chain_manifest.v1",
@@ -1059,6 +1059,8 @@ class H007SequenceContainerTest(unittest.TestCase):
                             "patch6",
                             "patch7",
                             "patch8",
+                            "patch9",
+                            "patch10",
                         ),
                         patch_hashes,
                     )

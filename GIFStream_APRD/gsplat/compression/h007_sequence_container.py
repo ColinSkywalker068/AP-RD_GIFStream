@@ -43,6 +43,7 @@ DECODER_CONFIG_SCHEMA = "h007.gifstream_decoder_config.v3"
 ORDINARY_EVALUATOR_RELATIVE_PATH = "examples/h007_ordinary_rate_quality.py"
 SOURCE_DATA_SCHEMA = "h007.neur3d_source_data_manifest.v1"
 OFFICIAL_COMMIT = "c98486632e7dafd830740b1a1692bd08c48b96e3"
+PATCH_CHAIN_LENGTH = 11
 CONFIRMATORY_SCENES = (
     "coffee_martini",
     "cook_spinach",
@@ -973,7 +974,7 @@ def _ap_score_npz_contract(
         "time_entropy_model_frozen_after_freeze.npy": scalar_bool,
         "runtime_manifest_sha256.npy": ("<U64", ()),
         "normalized_code_tree_sha256.npy": ("<U64", ()),
-        "patch_chain_sha256.npy": ("<U64", (9,)),
+        "patch_chain_sha256.npy": ("<U64", (PATCH_CHAIN_LENGTH,)),
         "path_definition.npy": (_unicode_scalar_descr(AP_PATH_DEFINITION), ()),
         "motion_definition.npy": (_unicode_scalar_descr(AP_MOTION_DEFINITION), ()),
         "importance_definition.npy": (
@@ -2356,7 +2357,7 @@ def _validate_runtime_provenance_shape(value: Any, label: str) -> Dict[str, Any]
         value["schema"] != "h007.ap_gifstream.runtime_provenance.v1"
         or value["official_commit"] != OFFICIAL_COMMIT
         or not isinstance(value["patch_sha256"], list)
-        or len(value["patch_sha256"]) != 9
+        or len(value["patch_sha256"]) != PATCH_CHAIN_LENGTH
         or not isinstance(tree, dict)
         or set(tree) != tree_required
         or tree["schema"] != "h007.normalized_code_tree.v1"
@@ -2996,8 +2997,8 @@ def _validate_gifstream_decoder_closure(
         raise ValueError("GOP decoder config is not the frozen GIFStream decoder contract")
     _validate_decoder_config_discrete_types(config)
     patch_chain = config.get("patch_chain_sha256")
-    if not isinstance(patch_chain, list) or len(patch_chain) != 9:
-        raise ValueError("GIFStream GOP is not bound to the registered nine-stage runtime")
+    if not isinstance(patch_chain, list) or len(patch_chain) != PATCH_CHAIN_LENGTH:
+        raise ValueError("GIFStream GOP is not bound to the registered patch-chain runtime")
     for index, digest in enumerate(patch_chain):
         _require_sha256(digest, f"patch-chain entry {index} SHA-256")
     manifest_sha = _require_sha256(
@@ -3048,6 +3049,8 @@ def _validate_gifstream_decoder_closure(
             "patch6",
             "patch7",
             "patch8",
+            "patch9",
+            "patch10",
         ]
         or any(
             not isinstance(row, dict)
@@ -4557,7 +4560,7 @@ def validate_eligibility_recomputation_contract(
         runtime["schema"] != "h007.ap_gifstream.runtime_provenance.v1"
         or runtime["official_commit"] != OFFICIAL_COMMIT
         or not isinstance(patches, list)
-        or len(patches) != 9
+        or len(patches) != PATCH_CHAIN_LENGTH
         or not isinstance(tree, dict)
         or set(tree)
         != {
@@ -5123,8 +5126,8 @@ def _validate_ordinary_rate_quality_evidence(
         runtime_repo_root,
         runtime_sha,
     )
-    if len(runtime_receipt.get("patch_sha256", [])) != 9:
-        raise ValueError("ordinary evidence does not bind the registered nine-stage runtime")
+    if len(runtime_receipt.get("patch_sha256", [])) != PATCH_CHAIN_LENGTH:
+        raise ValueError("ordinary evidence does not bind the registered patch-chain runtime")
     evaluator_relative = _nonempty_string(
         evidence["evaluator_relative_path"], "ordinary evaluator relative path"
     )

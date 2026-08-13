@@ -86,6 +86,8 @@ class APGIFStreamCoreTest(unittest.TestCase):
                 "9" * 64,
                 "a" * 64,
                 "b" * 64,
+                "c" * 64,
+                "d" * 64,
             ],
             "normalized_code_tree": {"sha256": "5" * 64},
         }
@@ -392,6 +394,8 @@ class APGIFStreamCoreTest(unittest.TestCase):
                         "9" * 64,
                         "a" * 64,
                         "b" * 64,
+                        "c" * 64,
+                        "d" * 64,
                     ]
                 ),
             )

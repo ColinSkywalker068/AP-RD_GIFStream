@@ -1,4 +1,4 @@
-"""Stdlib-only tamper tests for the nine-stage H007 provenance contract."""
+"""Stdlib-only tamper tests for the H007 patch-chain provenance contract."""
 
 from __future__ import annotations
 
@@ -38,7 +38,7 @@ class H007RuntimeProvenanceStdlibTest(unittest.TestCase):
         (self.repo / "examples" / "fixture.py").write_text("VALUE = 1\n", encoding="utf-8")
         patch_dir = self.root / "patches"
         patch_dir.mkdir()
-        self.patch_payloads = [f"patch-{index}\n".encode() for index in range(1, 10)]
+        self.patch_payloads = [f"patch-{index}\n".encode() for index in range(1, 12)]
         self.patch_hashes = []
         rows = []
         for stage, payload in zip(provenance.PATCH_STAGES, self.patch_payloads):
@@ -77,7 +77,7 @@ class H007RuntimeProvenanceStdlibTest(unittest.TestCase):
                 self.manifest, self.repo, self.manifest_sha
             )
 
-    def test_clean_nine_stage_chain_is_accepted(self) -> None:
+    def test_clean_patch_chain_is_accepted(self) -> None:
         receipt = self._verify()
         self.assertEqual(receipt["patch_sha256"], self.patch_hashes)
         self.assertEqual(receipt["normalized_code_tree"]["file_count"], 2)
