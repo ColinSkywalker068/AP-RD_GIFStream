@@ -31,29 +31,33 @@ echo "$assets" | xargs -n1 -P4 -I{} bash -c '
     || { rm -f "$f.part"; echo "FAILED $f"; exit 1; }
 '
 
-# Reassemble the flame_salmon_1 split archive into a single zip.  Prefer a
-# real zip binary; fall back to plain concatenation, which unzip can process
-# with its zip-bomb heuristic disabled (the standard recipe for this dataset).
-if [ -f flame_salmon_1_split.z01 ] && [ ! -f flame_salmon_1_merged.zip ]; then
-  if command -v zip >/dev/null; then
-    zip -q -s 0 flame_salmon_1_split.zip --out flame_salmon_1_merged.zip
-  else
-    cat flame_salmon_1_split.z0* flame_salmon_1_split.zip > flame_salmon_1_joined.zip
-    mv flame_salmon_1_joined.zip flame_salmon_1_merged.zip
+# flame_salmon_1 ships as a multi-volume zip (.z01-.z03 + .zip); unzip cannot
+# process it reliably, so use the static 7zz binary, which reads split zip
+# volumes natively.  Self-heal: wipe any partial extraction and redo it.
+FS_DIR="$DATA_ROOT/flame_salmon_1"
+fs_cams=$(find "$FS_DIR" -maxdepth 1 -name 'cam*.mp4' 2>/dev/null | wc -l)
+if [ "${fs_cams:-0}" -lt 15 ]; then
+  rm -rf "$FS_DIR" flame_salmon_1_merged.zip flame_salmon_1_joined.zip \
+    "$ZIP_DIR/.extracted_flame_salmon_1_merged.zip"
+  SEVENZ="$SCRATCH_ROOT/bin/7zz"
+  if [ ! -x "$SEVENZ" ]; then
+    mkdir -p "$SCRATCH_ROOT/bin"
+    curl -fL --retry 5 -o "$TMPDIR/7z.tar.xz" \
+      https://github.com/ip7z/7zip/releases/download/24.09/7z2409-linux-x64.tar.xz
+    tar -xJf "$TMPDIR/7z.tar.xz" -C "$TMPDIR" 7zz
+    mv "$TMPDIR/7zz" "$SEVENZ" && chmod +x "$SEVENZ"
   fi
+  "$SEVENZ" x -y -o"$DATA_ROOT" flame_salmon_1_split.zip
 fi
 
-# Extract every scene (skip the split parts; use the merged archive instead).
-# unzip exits nonzero on concatenation warnings even when extraction succeeds,
-# so success is judged by the layout report below, not the exit code.
-export UNZIP_DISABLE_ZIPBOMB_DETECTION=TRUE
+# Extract the single-volume scenes.
 for z in *.zip; do
   case "$z" in
-    flame_salmon_1_split.zip|flame_salmon_1_joined.zip) continue ;;
+    flame_salmon_1_split.zip|flame_salmon_1_joined.zip|flame_salmon_1_merged.zip) continue ;;
   esac
   marker="$ZIP_DIR/.extracted_$z"
   [ -f "$marker" ] && continue
-  unzip -o -q "$z" -d "$DATA_ROOT" || echo "unzip exit $? for $z (warnings tolerated)"
+  unzip -o -q "$z" -d "$DATA_ROOT"
   touch "$marker"
 done
 
