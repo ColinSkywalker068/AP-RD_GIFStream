@@ -15,7 +15,7 @@ RATES="${RATES:-0}"
 GOPS="${GOPS:-0}"
 N_KNN="${N_KNN:-8}"
 # account:partition pairs to race with --test-only (earliest estimate wins).
-LANES="${LANES:-torch_pr_69_general:l40s_public torch_pr_69_general:h200_public torch_pr_926_general:l40s_public torch_pr_69_tandon_advanced:h200_tandon torch_pr_69_tandon_advanced:a100_tandon torch_pr_69_tandon_advanced:h100_tandon}"
+LANES="${LANES:-torch_pr_69_general:l40s_public torch_pr_69_general:h200_public torch_pr_926_general:l40s_public torch_pr_926_general:h200_public torch_pr_69_tandon_advanced:h200_tandon torch_pr_69_tandon_advanced:a100_tandon torch_pr_69_tandon_advanced:h100_tandon}"
 SBATCH_FILE="${SBATCH_FILE:-stage5_train.sbatch}"
 
 pick_lane() {
