@@ -1,3 +1,26 @@
+diff --git a/examples/h007_clean_decode_gifstream.py b/examples/h007_clean_decode_gifstream.py
+index 95b53a5..c6c9646 100644
+--- a/examples/h007_clean_decode_gifstream.py
++++ b/examples/h007_clean_decode_gifstream.py
+@@ -37,6 +37,7 @@ from gsplat.compression.h007_clean_runtime import (
+ )
+ from gsplat.compression.h007_runtime_provenance import verify_runtime_provenance
+ from gsplat.compression.h007_sequence_container import (
++    PATCH_CHAIN_LENGTH,
+     expected_gifstream_nets_keys,
+     frozen_camera_names,
+     validate_sequence_container,
+@@ -247,8 +248,8 @@ def clean_decode(
+         repo_root,
+         provenance_manifest_sha256,
+     )
+-    if len(runtime_provenance.get("patch_sha256", [])) != 9:
+-        raise ValueError("clean decoder is not bound to the registered nine-stage patch chain")
++    if len(runtime_provenance.get("patch_sha256", [])) != PATCH_CHAIN_LENGTH:
++        raise ValueError("clean decoder is not bound to the registered patch chain")
+     counted_manifest = container / "preregistered_patch_chain_manifest.json"
+     external_payload = provenance_manifest.resolve().read_bytes()
+     if counted_manifest.read_bytes() != external_payload:
 diff --git a/examples/h007_make_ap_edit_ids.py b/examples/h007_make_ap_edit_ids.py
 index a8f85d5..6d475e4 100644
 --- a/examples/h007_make_ap_edit_ids.py
@@ -12,7 +35,7 @@ index a8f85d5..6d475e4 100644
          if str(np.asarray(score["scene"]).item()) != "flame_salmon_1":
              raise ValueError("U3 edit selection is development-locked to flame_salmon_1")
 diff --git a/examples/simple_trainer_GIFStream.py b/examples/simple_trainer_GIFStream.py
-index e987d67..5b6b864 100644
+index e987d67..a752a81 100644
 --- a/examples/simple_trainer_GIFStream.py
 +++ b/examples/simple_trainer_GIFStream.py
 @@ -44,6 +44,7 @@ from gsplat.compression.ap_gifstream import (
@@ -23,7 +46,15 @@ index e987d67..5b6b864 100644
      file_byte_census,
      tensor_mapping_sha256,
      variant_spec,
-@@ -993,6 +994,18 @@ class Runner:
+@@ -63,6 +64,7 @@ from gsplat.compression.h007_path_contract import (
+ from gsplat.compression.h007_sequence_container import (
+     DECODER_CONFIG_SCHEMA,
+     FROZEN_RATE_LAMBDAS,
++    PATCH_CHAIN_LENGTH,
+     PRODUCER_RECEIPT_SCHEMA,
+     build_gifstream_payload_manifest,
+     canonicalize_gifstream_png_payloads,
+@@ -993,6 +995,18 @@ class Runner:
              reference_paths - self.splats["anchors"].detach()[:, None, :], dim=-1
          ).mean(dim=1)
          eligible = torch.isfinite(reference_paths).all(dim=(1, 2)) & torch.isfinite(path_score)
@@ -42,7 +73,7 @@ index e987d67..5b6b864 100644
          estimated_bytes = self.compression_sim_method.estimate_time_stream_bytes(
              self.splats["time_features"].detach()
          )
-@@ -1042,6 +1055,7 @@ class Runner:
+@@ -1042,6 +1056,7 @@ class Runner:
              ids,
              self.cfg.ap_protected_fraction,
              enable_swap=variant_spec(self.cfg.ap_variant).swap,
@@ -50,7 +81,7 @@ index e987d67..5b6b864 100644
          )
          official_active = official_factor0 & official_retain
          ap_starting_active = official_factor0 & ap_retain
-@@ -1055,6 +1069,7 @@ class Runner:
+@@ -1055,6 +1070,7 @@ class Runner:
              enable_swap=variant_spec(self.cfg.ap_variant).swap,
              starting_active=ap_starting_active,
              retain_mask=ap_retain,
@@ -58,7 +89,7 @@ index e987d67..5b6b864 100644
          )
          if not torch.equal(whole_class, ap_class):
              raise AssertionError("frozen whole and temporal AP classes disagree")
-@@ -1092,7 +1107,7 @@ class Runner:
+@@ -1092,7 +1108,7 @@ class Runner:
          factor3_value = float(positive3.min().item())
  
          self.ap_state = {
@@ -67,7 +98,7 @@ index e987d67..5b6b864 100644
              "scene": os.path.basename(os.path.normpath(self.cfg.data_dir)),
              "variant": self.cfg.ap_variant,
              "voxel_size": float(self.cfg.voxel_size),
-@@ -1101,6 +1116,7 @@ class Runner:
+@@ -1101,6 +1117,7 @@ class Runner:
              "scores": scores.detach(),
              "path_score": path_score.detach(),
              "motion_score": motion_score.detach(),
@@ -75,7 +106,7 @@ index e987d67..5b6b864 100644
              "estimated_time_bytes": estimated_bytes.detach(),
              "reference_paths": reference_paths.detach(),
              "official_retain_mask": official_retain.detach(),
-@@ -1161,6 +1177,7 @@ class Runner:
+@@ -1161,6 +1178,7 @@ class Runner:
              path_score=path_score.cpu().numpy().astype(np.float64, copy=False),
              motion_score=motion_score.cpu().numpy().astype(np.float64, copy=False),
              allocation_score=scores.cpu().numpy().astype(np.float64, copy=False),
@@ -83,7 +114,7 @@ index e987d67..5b6b864 100644
              estimated_time_bytes=estimated_bytes.cpu().numpy().astype(np.int64, copy=False),
              official_retain_mask=official_retain.cpu().numpy().astype(np.bool_, copy=False),
              official_factor0_mask=official_factor0.cpu().numpy().astype(np.bool_, copy=False),
-@@ -1185,6 +1202,9 @@ class Runner:
+@@ -1185,6 +1203,9 @@ class Runner:
              ),
              path_definition=np.asarray("sum_consecutive_euclidean_displacement"),
              motion_definition=np.asarray("mean_distance_from_canonical_anchor"),
@@ -93,7 +124,7 @@ index e987d67..5b6b864 100644
              estimated_byte_definition=np.asarray(
                  "ceil_deterministic_conditional_gaussian_bits_over_8"
              ),
-@@ -1263,7 +1283,7 @@ class Runner:
+@@ -1263,7 +1284,7 @@ class Runner:
              raise ValueError("AP checkpoint is missing frozen state or training receipt")
          state = checkpoint["ap_state"]
          receipt = checkpoint["ap_training_receipt"]
@@ -102,6 +133,17 @@ index e987d67..5b6b864 100644
              raise ValueError("unsupported AP training-state schema")
          if receipt.get("schema") != "h007.ap_training_receipt.v2":
              raise ValueError("unsupported AP training-receipt schema")
+@@ -2726,8 +2747,8 @@ class Runner:
+         if self.ap_runtime_provenance is None:
+             raise ValueError("official/AP compression lacks runtime provenance")
+         patch_chain = list(self.ap_runtime_provenance["patch_sha256"])
+-        if len(patch_chain) != 9:
+-            raise ValueError("official/AP compression lacks the registered nine-stage runtime chain")
++        if len(patch_chain) != PATCH_CHAIN_LENGTH:
++            raise ValueError("official/AP compression lacks the registered patch-chain runtime")
+         decoder_config = {
+             "schema": DECODER_CONFIG_SCHEMA,
+             "codec_family": "GIFStream",
 diff --git a/gsplat/compression/ap_gifstream.py b/gsplat/compression/ap_gifstream.py
 index 5bcd3b3..94cd274 100644
 --- a/gsplat/compression/ap_gifstream.py
@@ -385,6 +427,29 @@ index 5bcd3b3..94cd274 100644
      )
      audit = dict(audit)
      audit["official_retain_count"] = audit.pop("official_active_count")
+diff --git a/gsplat/compression/h007_certification.py b/gsplat/compression/h007_certification.py
+index 63d75d1..b73bd80 100644
+--- a/gsplat/compression/h007_certification.py
++++ b/gsplat/compression/h007_certification.py
+@@ -19,6 +19,7 @@ from pathlib import Path
+ from typing import Any, Dict, Mapping, Tuple
+ 
+ 
++PATCH_CHAIN_LENGTH = 11
+ STAGE02_SCHEMA = "h007.stage02_freeze.v3"
+ STAGE02_CONTRACT_SCHEMA = "h007.stage02_contract.v3"
+ REFERENCE_SCHEMA = "h007.hdown_final_reference_case.v3"
+@@ -273,8 +274,8 @@ def _verify_runtime(
+         repo_root,
+         require_sha256(provenance_manifest_sha256, "patch-chain manifest SHA-256"),
+     )
+-    if len(receipt.get("patch_sha256", [])) != 9:
+-        raise ValueError("Stage 02 requires the exact nine-stage runtime provenance")
++    if len(receipt.get("patch_sha256", [])) != PATCH_CHAIN_LENGTH:
++        raise ValueError("Stage 02 requires the exact registered patch-chain provenance")
+     return receipt
+ 
+ 
 diff --git a/gsplat/compression/h007_path_contract.py b/gsplat/compression/h007_path_contract.py
 index 81b5faf..26a85cf 100644
 --- a/gsplat/compression/h007_path_contract.py

@@ -33,7 +33,7 @@ esac
 DATA_DIR="$SCRATCH_ROOT/datasets/Neur3D/$SCENE"
 RESULT_DIR="$SCRATCH_ROOT/results/smoke/$SCENE/$VARIANT/r${RATE}"
 MANIFEST="$REPO_ROOT/provenance/h007_ap_gifstream_u3_patch_chain_patch10_dualkey_20260814.json"
-MANIFEST_SHA=bc8df49d43d4cf24e7d1b8fd9acc9b5da58ffe0190a5d2bdcf11797a3f2202bf
+MANIFEST_SHA=a15ae0b87cfc3b7777c4354e14716df8706e11627623181b53cbdc9434c3abdd
 
 export CUDA_HOME="$ENV_PREFIX"
 export PATH="$ENV_PREFIX/bin:$PATH"

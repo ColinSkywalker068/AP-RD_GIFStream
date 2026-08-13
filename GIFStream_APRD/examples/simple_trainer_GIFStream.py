@@ -64,6 +64,7 @@ from gsplat.compression.h007_path_contract import (
 from gsplat.compression.h007_sequence_container import (
     DECODER_CONFIG_SCHEMA,
     FROZEN_RATE_LAMBDAS,
+    PATCH_CHAIN_LENGTH,
     PRODUCER_RECEIPT_SCHEMA,
     build_gifstream_payload_manifest,
     canonicalize_gifstream_png_payloads,
@@ -2746,8 +2747,8 @@ class Runner:
         if self.ap_runtime_provenance is None:
             raise ValueError("official/AP compression lacks runtime provenance")
         patch_chain = list(self.ap_runtime_provenance["patch_sha256"])
-        if len(patch_chain) != 9:
-            raise ValueError("official/AP compression lacks the registered nine-stage runtime chain")
+        if len(patch_chain) != PATCH_CHAIN_LENGTH:
+            raise ValueError("official/AP compression lacks the registered patch-chain runtime")
         decoder_config = {
             "schema": DECODER_CONFIG_SCHEMA,
             "codec_family": "GIFStream",

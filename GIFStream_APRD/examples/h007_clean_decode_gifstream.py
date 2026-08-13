@@ -37,6 +37,7 @@ from gsplat.compression.h007_clean_runtime import (
 )
 from gsplat.compression.h007_runtime_provenance import verify_runtime_provenance
 from gsplat.compression.h007_sequence_container import (
+    PATCH_CHAIN_LENGTH,
     expected_gifstream_nets_keys,
     frozen_camera_names,
     validate_sequence_container,
@@ -247,8 +248,8 @@ def clean_decode(
         repo_root,
         provenance_manifest_sha256,
     )
-    if len(runtime_provenance.get("patch_sha256", [])) != 9:
-        raise ValueError("clean decoder is not bound to the registered nine-stage patch chain")
+    if len(runtime_provenance.get("patch_sha256", [])) != PATCH_CHAIN_LENGTH:
+        raise ValueError("clean decoder is not bound to the registered patch chain")
     counted_manifest = container / "preregistered_patch_chain_manifest.json"
     external_payload = provenance_manifest.resolve().read_bytes()
     if counted_manifest.read_bytes() != external_payload:

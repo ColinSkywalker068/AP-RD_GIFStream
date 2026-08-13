@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any, Dict, Mapping, Tuple
 
 
+PATCH_CHAIN_LENGTH = 11
 STAGE02_SCHEMA = "h007.stage02_freeze.v3"
 STAGE02_CONTRACT_SCHEMA = "h007.stage02_contract.v3"
 REFERENCE_SCHEMA = "h007.hdown_final_reference_case.v3"
@@ -273,8 +274,8 @@ def _verify_runtime(
         repo_root,
         require_sha256(provenance_manifest_sha256, "patch-chain manifest SHA-256"),
     )
-    if len(receipt.get("patch_sha256", [])) != 9:
-        raise ValueError("Stage 02 requires the exact nine-stage runtime provenance")
+    if len(receipt.get("patch_sha256", [])) != PATCH_CHAIN_LENGTH:
+        raise ValueError("Stage 02 requires the exact registered patch-chain provenance")
     return receipt
 
 
