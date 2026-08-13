@@ -58,36 +58,49 @@ git rev-parse HEAD | grep -q c98486632e7dafd830740b1a1692bd08c48b96e3 \
 
 mkdir -p "$RESULT_DIR"
 
-AP_FLAGS=(
+COMMON_FLAGS=(
+  --disable_viewer --data_factor 2 --render_traj_path ellipse
+  --data_dir "$DATA_DIR/" --result_dir "$RESULT_DIR"
+  --eval_steps 7000 30000 --save_steps 7000 30000
+  --compression_sim --entropy_model_opt --rd_lambda "$LAMBDA" --rate "$RATE"
+  --batch_size 1 --GOP_size 60 --knn --n_knn "$N_KNN" --start_frame "$START_FRAME"
   --ap_variant "$VARIANT"
   --ap_provenance_manifest "$MANIFEST"
   --ap_provenance_manifest_sha256 "$MANIFEST_SHA"
 )
 
 # 1) Compression-aware training (freeze happens at step 20000 for AP variants).
-"$PY" examples/simple_trainer_GIFStream.py "$TYPE" --disable_viewer \
-  --data_factor 2 --render_traj_path ellipse \
-  --data_dir "$DATA_DIR/" --result_dir "$RESULT_DIR" \
-  --eval_steps 7000 30000 --save_steps 7000 30000 \
-  --compression_sim --entropy_model_opt --rd_lambda "$LAMBDA" --rate "$RATE" \
-  --batch_size 1 --GOP_size 60 --knn --n_knn "$N_KNN" --start_frame "$START_FRAME" \
-  "${AP_FLAGS[@]}"
+"$PY" examples/simple_trainer_GIFStream.py "$TYPE" "${COMMON_FLAGS[@]}"
 
-# 2) Codec entry: end-to-end compression from the final checkpoint.
+# 2) Frozen training receipt (required by the codec entry, fail-closed).
+CKPT="$RESULT_DIR/ckpts/ckpt_29999_rank0.pt"
+CONFIG_JSON="$RESULT_DIR/producer_training_config.json"
+RECEIPT="$RESULT_DIR/frozen_training_receipt.json"
+"$PY" "$REPO_ROOT/hpc_setup/make_training_config.py" --output "$CONFIG_JSON" -- \
+  "$TYPE" "${COMMON_FLAGS[@]}"
+rm -f "$RECEIPT"
+"$PY" examples/h007_freeze_training_receipt.py \
+  --checkpoints "$CKPT" \
+  --training-config "$CONFIG_JSON" \
+  --provenance-manifest "$MANIFEST" \
+  --provenance-manifest-sha256 "$MANIFEST_SHA" \
+  --repo-root "$REPO_ROOT/GIFStream_APRD" \
+  --output "$RECEIPT"
+RECEIPT_SHA=$(sha256sum "$RECEIPT" | cut -d' ' -f1)
+echo "receipt sha256: $RECEIPT_SHA"
+
+# 3) Codec entry: end-to-end compression from the final checkpoint.
 SCORE_FLAGS=()
 if [ "$VARIANT" != "official" ]; then
   SCORE_PATH="$RESULT_DIR/ap_freeze/reference_scores_step20000.npz"
   test -f "$SCORE_PATH" || { echo "FATAL: frozen score artifact missing"; exit 1; }
   SCORE_FLAGS=(--ap_score_path "$SCORE_PATH")
 fi
-"$PY" examples/simple_trainer_GIFStream.py "$TYPE" --disable_viewer \
-  --data_factor 2 --render_traj_path ellipse \
-  --data_dir "$DATA_DIR/" --result_dir "$RESULT_DIR" \
-  --ckpt "$RESULT_DIR/ckpts/ckpt_29999_rank0.pt" \
-  --compression end2end --compression_sim --entropy_model_opt \
-  --rd_lambda "$LAMBDA" --rate "$RATE" \
-  --batch_size 1 --GOP_size 60 --knn --n_knn "$N_KNN" --start_frame "$START_FRAME" \
-  "${AP_FLAGS[@]}" "${SCORE_FLAGS[@]}"
+"$PY" examples/simple_trainer_GIFStream.py "$TYPE" "${COMMON_FLAGS[@]}" \
+  --ckpt "$CKPT" \
+  --h007_training_receipt "$RECEIPT" \
+  --h007_training_receipt_sha256 "$RECEIPT_SHA" \
+  --compression end2end "${SCORE_FLAGS[@]}"
 
 # 3) Artifact summary (the sequence container + clean decode need all 5 GOPs;
 # they run as a separate step once GOP_0..GOP_4 exist).

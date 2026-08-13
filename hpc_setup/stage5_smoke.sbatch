@@ -80,13 +80,32 @@ if [ "$VARIANT" != "official" ]; then
   ls -la "$RESULT_DIR/ap_freeze/"
 fi
 
+echo "=== SMOKE PHASE 1.5: frozen training receipt ==="
+CKPT="$RESULT_DIR/ckpts/ckpt_$((MAX_STEPS - 1))_rank0.pt"
+CONFIG_JSON="$RESULT_DIR/producer_training_config.json"
+RECEIPT="$RESULT_DIR/frozen_training_receipt.json"
+"$PY" "$REPO_ROOT/hpc_setup/make_training_config.py" --output "$CONFIG_JSON" -- \
+  "$TYPE" "${COMMON_FLAGS[@]}"
+rm -f "$RECEIPT"
+"$PY" examples/h007_freeze_training_receipt.py \
+  --checkpoints "$CKPT" \
+  --training-config "$CONFIG_JSON" \
+  --provenance-manifest "$MANIFEST" \
+  --provenance-manifest-sha256 "$MANIFEST_SHA" \
+  --repo-root "$REPO_ROOT/GIFStream_APRD" \
+  --output "$RECEIPT"
+RECEIPT_SHA=$(sha256sum "$RECEIPT" | cut -d' ' -f1)
+echo "receipt sha256: $RECEIPT_SHA"
+
 echo "=== SMOKE PHASE 2: end2end codec entry ==="
 SCORE_FLAGS=()
 if [ "$VARIANT" != "official" ]; then
   SCORE_FLAGS=(--ap_score_path "$RESULT_DIR/ap_freeze/reference_scores_step${FREEZE_STEP}.npz")
 fi
 "$PY" examples/simple_trainer_GIFStream.py "$TYPE" "${COMMON_FLAGS[@]}" \
-  --ckpt "$RESULT_DIR/ckpts/ckpt_$((MAX_STEPS - 1))_rank0.pt" \
+  --ckpt "$CKPT" \
+  --h007_training_receipt "$RECEIPT" \
+  --h007_training_receipt_sha256 "$RECEIPT_SHA" \
   --compression end2end "${SCORE_FLAGS[@]}"
 
 echo "=== SMOKE PHASE 3: deep artifact verification ==="
