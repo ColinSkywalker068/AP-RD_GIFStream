@@ -247,6 +247,7 @@ AP_SCORE_NPZ_MEMBERS = {
     "path_score.npy",
     "motion_score.npy",
     "allocation_score.npy",
+    "importance_score.npy",
     "estimated_time_bytes.npy",
     "official_retain_mask.npy",
     "official_factor0_mask.npy",
@@ -265,6 +266,7 @@ AP_SCORE_NPZ_MEMBERS = {
     "patch_chain_sha256.npy",
     "path_definition.npy",
     "motion_definition.npy",
+    "importance_definition.npy",
     "estimated_byte_definition.npy",
 }
 AP_SCORE_NPZ_ORDER = (
@@ -282,6 +284,7 @@ AP_SCORE_NPZ_ORDER = (
     "path_score.npy",
     "motion_score.npy",
     "allocation_score.npy",
+    "importance_score.npy",
     "estimated_time_bytes.npy",
     "official_retain_mask.npy",
     "official_factor0_mask.npy",
@@ -300,6 +303,7 @@ AP_SCORE_NPZ_ORDER = (
     "patch_chain_sha256.npy",
     "path_definition.npy",
     "motion_definition.npy",
+    "importance_definition.npy",
     "estimated_byte_definition.npy",
 )
 
@@ -325,12 +329,13 @@ AP_EDIT_IDS_NPZ_ORDER = (
     "selected_canonical_ids_sha256.npy",
     "path_score.npy",
 )
-AP_SCORE_SCHEMA = "h007.ap_scores.v2"
+AP_SCORE_SCHEMA = "h007.ap_scores.v3"
 AP_EDIT_IDS_SCHEMA = "h007.ap_edit_ids.v1"
 AP_EDIT_SELECTION = "top_path_score_intersection_official_and_ap_retained"
 AP_ESTIMATOR_VERSION = "h007.conditional_gaussian_per_row_bits.v1"
 AP_PATH_DEFINITION = "sum_consecutive_euclidean_displacement"
 AP_MOTION_DEFINITION = "mean_distance_from_canonical_anchor"
+AP_IMPORTANCE_DEFINITION = "backbone_blended_opacity_per_visit_prune_statistic"
 AP_ESTIMATED_BYTE_DEFINITION = (
     "ceil_deterministic_conditional_gaussian_bits_over_8"
 )
@@ -952,6 +957,7 @@ def _ap_score_npz_contract(
         "path_score.npy": vector_f8,
         "motion_score.npy": vector_f8,
         "allocation_score.npy": vector_f8,
+        "importance_score.npy": vector_f8,
         "estimated_time_bytes.npy": vector_i8,
         "official_retain_mask.npy": vector_bool,
         "official_factor0_mask.npy": vector_bool,
@@ -970,6 +976,10 @@ def _ap_score_npz_contract(
         "patch_chain_sha256.npy": ("<U64", (9,)),
         "path_definition.npy": (_unicode_scalar_descr(AP_PATH_DEFINITION), ()),
         "motion_definition.npy": (_unicode_scalar_descr(AP_MOTION_DEFINITION), ()),
+        "importance_definition.npy": (
+            _unicode_scalar_descr(AP_IMPORTANCE_DEFINITION),
+            (),
+        ),
         "estimated_byte_definition.npy": (
             _unicode_scalar_descr(AP_ESTIMATED_BYTE_DEFINITION),
             (),

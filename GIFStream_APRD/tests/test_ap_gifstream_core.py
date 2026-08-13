@@ -14,6 +14,7 @@ from gsplat.compression.ap_gifstream import (
     build_equal_stream_budget_allocation,
     canonical_voxel_ids,
     deterministic_zip_directory,
+    frozen_backbone_importance,
     load_aligned_score_artifact,
     pack_bool_mask,
     read_identity_corrections,
@@ -364,6 +365,7 @@ class APGIFStreamCoreTest(unittest.TestCase):
                 path_score=np.asarray([20.0, 0.0, 10.0]),
                 motion_score=np.asarray([2.0, 0.0, 1.0]),
                 allocation_score=np.asarray([20.0, 0.0, 10.0]),
+                importance_score=np.asarray([0.0, 0.0, 0.0]),
                 estimated_time_bytes=np.asarray([7, 5, 6], dtype=np.int64),
                 official_retain_mask=np.asarray([True, True, True]),
                 official_factor0_mask=np.asarray([True, False, True]),
@@ -389,6 +391,7 @@ class APGIFStreamCoreTest(unittest.TestCase):
                         "8" * 64,
                         "9" * 64,
                         "a" * 64,
+                        "b" * 64,
                     ]
                 ),
             )
@@ -425,6 +428,143 @@ class APGIFStreamCoreTest(unittest.TestCase):
         self.assertEqual(torch.nonzero(active & ~official).reshape(-1).tolist(), [4, 5])
         self.assertEqual(torch.nonzero(official & ~active).reshape(-1).tolist(), [0, 1])
         self.assertEqual(audit["promoted_count"], audit["demoted_count"])
+        self.assertEqual(audit["donor_ranking_keys"], ["score_asc", "canonical_id"])
+
+    def test_donor_dual_key_demotes_least_important_on_score_tie(self):
+        ids = torch.tensor([[i, 0, 0] for i in range(8)], dtype=torch.int64)
+        official = torch.tensor([True, True, True, True, False, False, False, False])
+        scores = torch.tensor([0.0, 0.0, 0.0, 3.0, 100.0, 90.0, 5.0, 4.0])
+        eligible = torch.ones(8, dtype=torch.bool)
+        importance = torch.tensor([5.0, 0.5, 1.0, 9.0, 0.0, 0.0, 0.0, 0.0])
+        active, ap_class, audit = build_equal_stream_budget_allocation(
+            official,
+            scores,
+            eligible,
+            ids,
+            protected_fraction=0.25,
+            enable_swap=True,
+            importance=importance,
+        )
+        self.assertEqual(int(active.sum()), int(official.sum()))
+        self.assertEqual(torch.nonzero(ap_class).reshape(-1).tolist(), [4, 5])
+        # Anchors 0, 1, 2 tie on motion; the two least important donors pay.
+        self.assertEqual(torch.nonzero(official & ~active).reshape(-1).tolist(), [1, 2])
+        self.assertEqual(audit["demoted_canonical_ids"], [[1, 0, 0], [2, 0, 0]])
+        self.assertEqual(
+            audit["donor_ranking_keys"],
+            ["score_asc", "backbone_importance_asc", "canonical_id"],
+        )
+
+    def test_donor_dual_key_tie_falls_back_to_canonical_ids(self):
+        ids = torch.tensor([[i, 0, 0] for i in range(8)], dtype=torch.int64)
+        official = torch.tensor([True, True, True, True, False, False, False, False])
+        scores = torch.tensor([0.0, 0.0, 0.0, 3.0, 100.0, 90.0, 5.0, 4.0])
+        eligible = torch.ones(8, dtype=torch.bool)
+        importance = torch.tensor([2.0, 2.0, 2.0, 9.0, 0.0, 0.0, 0.0, 0.0])
+        active, _, audit = build_equal_stream_budget_allocation(
+            official,
+            scores,
+            eligible,
+            ids,
+            protected_fraction=0.25,
+            enable_swap=True,
+            importance=importance,
+        )
+        # Both keys tie for anchors 0, 1, 2: the canonical ID adjudicates.
+        self.assertEqual(torch.nonzero(official & ~active).reshape(-1).tolist(), [0, 1])
+        self.assertEqual(audit["demoted_canonical_ids"], [[0, 0, 0], [1, 0, 0]])
+
+    def test_protected_class_selection_never_sees_importance(self):
+        ids = torch.tensor([[i, 0, 0] for i in range(8)], dtype=torch.int64)
+        official = torch.tensor([True, True, True, True, False, False, False, False])
+        scores = torch.tensor([10.0, 10.0, 10.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+        eligible = torch.ones(8, dtype=torch.bool)
+        importance = torch.tensor([0.1, 0.2, 99.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+        _, with_importance, _ = build_equal_stream_budget_allocation(
+            official,
+            scores,
+            eligible,
+            ids,
+            protected_fraction=0.25,
+            enable_swap=True,
+            importance=importance,
+        )
+        _, without_importance, _ = build_equal_stream_budget_allocation(
+            official, scores, eligible, ids, protected_fraction=0.25, enable_swap=True
+        )
+        # The top-score class boundary tie stays adjudicated by canonical ID
+        # alone; the outcome-blind selection rule never consumes importance.
+        self.assertTrue(torch.equal(with_importance, without_importance))
+        self.assertEqual(torch.nonzero(with_importance).reshape(-1).tolist(), [0, 1])
+
+    def test_equal_byte_swap_demotes_least_important_on_score_tie(self):
+        ids = torch.tensor([[i, 0, 0] for i in range(4)], dtype=torch.int64)
+        official_active = torch.tensor([True, True, True, False])
+        scores = torch.tensor([1.0, 1.0, 1.0, 100.0], dtype=torch.float64)
+        eligible = torch.ones(4, dtype=torch.bool)
+        estimated_bytes = torch.tensor([5, 5, 5, 5], dtype=torch.int64)
+        importance = torch.tensor([3.0, 0.5, 1.0, 0.0])
+        active, ap_class, audit = build_equal_estimated_byte_allocation(
+            official_active,
+            scores,
+            eligible,
+            ids,
+            estimated_bytes,
+            protected_fraction=0.25,
+            enable_swap=True,
+            importance=importance,
+        )
+        self.assertEqual(torch.nonzero(ap_class).reshape(-1).tolist(), [3])
+        # Anchors 0, 1, 2 tie on motion and cost; the least important one pays
+        # the promoted anchor's exact byte mass.
+        self.assertEqual(torch.nonzero(official_active & ~active).reshape(-1).tolist(), [1])
+        self.assertEqual(audit["demoted_canonical_ids"], [[1, 0, 0]])
+        self.assertEqual(audit["estimated_byte_delta"], 0)
+        self.assertEqual(
+            audit["donor_ranking_keys"],
+            ["score_asc", "backbone_importance_asc", "canonical_id"],
+        )
+
+    def test_frozen_backbone_importance_matches_prune_statistic(self):
+        opacity_accum = torch.tensor([[1.0, 3.0], [0.0, 0.0], [2.0, 2.0]])
+        anchor_demon = torch.tensor([[1.0, 1.0], [0.0, 0.0], [2.0, 2.0]])
+        importance = frozen_backbone_importance(
+            opacity_accum, anchor_demon, peak_ratio=0.1
+        )
+        # blended = 0.1 * max + 0.9 * mean over the GOP; normalized by visits;
+        # never-rendered anchors score exactly zero.
+        torch.testing.assert_close(
+            importance,
+            torch.tensor([1.05, 0.0, 0.5], dtype=torch.float64),
+        )
+        with self.assertRaisesRegex(ValueError, "same \\[N,GOP\\] shape"):
+            frozen_backbone_importance(opacity_accum, anchor_demon[:2])
+        with self.assertRaisesRegex(ValueError, "nonnegative"):
+            frozen_backbone_importance(-opacity_accum, anchor_demon)
+        with self.assertRaisesRegex(ValueError, "peak_ratio"):
+            frozen_backbone_importance(opacity_accum, anchor_demon, peak_ratio=1.5)
+
+    def test_donor_importance_must_be_finite_and_nonnegative(self):
+        ids = torch.tensor([[i, 0, 0] for i in range(4)], dtype=torch.int64)
+        official = torch.tensor([True, True, False, False])
+        scores = torch.tensor([1.0, 2.0, 3.0, 4.0])
+        eligible = torch.ones(4, dtype=torch.bool)
+        for bad in (
+            torch.tensor([1.0, -1.0, 0.0, 0.0]),
+            torch.tensor([1.0, float("nan"), 0.0, 0.0]),
+            torch.tensor([1.0, float("inf"), 0.0, 0.0]),
+            torch.tensor([1.0, 0.0, 0.0]),
+        ):
+            with self.assertRaisesRegex(ValueError, "donor importance"):
+                build_equal_stream_budget_allocation(
+                    official,
+                    scores,
+                    eligible,
+                    ids,
+                    protected_fraction=0.25,
+                    enable_swap=True,
+                    importance=bad,
+                )
 
     def test_mask_pack_round_trip(self):
         mask = torch.tensor([True, False, True, True, False, False, False, True, True])

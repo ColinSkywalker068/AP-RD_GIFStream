@@ -179,7 +179,7 @@ def fixture_ap_meta(method="ap-gifstream-full"):
         }
     digest = "a" * 64
     score = {
-        "schema": "h007.ap_scores.v2",
+        "schema": "h007.ap_scores.v3",
         "score_artifact": "score.npz",
         "score_artifact_sha256": digest,
         "ranking": sequence.AP_VARIANT_METADATA[method]["ranking"],

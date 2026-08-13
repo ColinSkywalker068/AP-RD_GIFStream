@@ -53,7 +53,7 @@ def main() -> None:
     ):
         raise ValueError("edit reference manifest selection/count mismatch")
     with np.load(args.score_artifact, allow_pickle=False) as score:
-        if str(np.asarray(score["schema"]).item()) != "h007.ap_scores.v2":
+        if str(np.asarray(score["schema"]).item()) != "h007.ap_scores.v3":
             raise ValueError("unsupported AP score schema")
         if str(np.asarray(score["scene"]).item()) != "flame_salmon_1":
             raise ValueError("U3 edit selection is development-locked to flame_salmon_1")

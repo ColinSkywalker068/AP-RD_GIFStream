@@ -23,7 +23,7 @@ import torch
 from torch import Tensor
 
 
-AP_SCORE_SCHEMA = "h007.ap_scores.v2"
+AP_SCORE_SCHEMA = "h007.ap_scores.v3"
 AP_META_SCHEMA_V5 = "h007.ap_gifstream.codec.v5"
 AP_META_SCHEMA = "h007.ap_gifstream.codec.v6"
 AP_IDENTITY_CORRECTION_SCHEMA = "h007.ap_identity_corrections.v1"
@@ -89,13 +89,68 @@ def tensor_mapping_sha256(values: Mapping[str, Tensor]) -> str:
     return digest.hexdigest()
 
 
-def _lexicographic_rank(ids: np.ndarray, scores: np.ndarray, descending: bool) -> np.ndarray:
+def _lexicographic_rank(
+    ids: np.ndarray,
+    scores: np.ndarray,
+    descending: bool,
+    secondary: Optional[np.ndarray] = None,
+) -> np.ndarray:
     if ids.ndim != 2 or ids.shape[1] != 3:
         raise ValueError("canonical IDs must be [N,3]")
     if scores.shape != (ids.shape[0],):
         raise ValueError("score length does not match canonical IDs")
     primary = -scores if descending else scores
-    return np.lexsort((ids[:, 2], ids[:, 1], ids[:, 0], primary))
+    if secondary is None:
+        return np.lexsort((ids[:, 2], ids[:, 1], ids[:, 0], primary))
+    if secondary.shape != (ids.shape[0],):
+        raise ValueError("secondary key length does not match canonical IDs")
+    tiebreak = -secondary if descending else secondary
+    return np.lexsort((ids[:, 2], ids[:, 1], ids[:, 0], tiebreak, primary))
+
+
+def frozen_backbone_importance(
+    opacity_accum: Tensor,
+    anchor_demon: Tensor,
+    peak_ratio: float = 0.1,
+) -> Tensor:
+    """The backbone's own pruning statistic, frozen as the donor tie-break key.
+
+    Mirrors the GIFStream densification prune criterion (peak/mean-blended
+    accumulated rendered opacity, normalized by accumulated visit count) up to
+    a constant GOP factor that cannot change any ordering.  The inputs are
+    backbone training statistics recorded before the AP freeze, so the
+    estimate never sees a compression outcome.  Anchors the backbone never
+    rendered score exactly zero.
+    """
+    if opacity_accum.ndim != 2 or anchor_demon.shape != opacity_accum.shape:
+        raise ValueError("opacity_accum/anchor_demon must share the same [N,GOP] shape")
+    if not (0.0 <= float(peak_ratio) <= 1.0):
+        raise ValueError("peak_ratio must be in [0,1]")
+    accum = opacity_accum.detach().to(dtype=torch.float64, device="cpu")
+    demon = anchor_demon.detach().to(dtype=torch.float64, device="cpu")
+    if not torch.isfinite(accum).all() or not torch.isfinite(demon).all():
+        raise ValueError("backbone importance statistics must be finite")
+    if torch.any(accum < 0) or torch.any(demon < 0):
+        raise ValueError("backbone importance statistics must be nonnegative")
+    blended = float(peak_ratio) * accum.max(dim=-1).values + (
+        1.0 - float(peak_ratio)
+    ) * accum.mean(dim=-1)
+    visits = demon.sum(dim=-1)
+    safe_visits = torch.where(visits > 0, visits, torch.ones_like(visits))
+    return torch.where(visits > 0, blended / safe_visits, torch.zeros_like(blended))
+
+
+def _validate_donor_secondary(
+    importance: Optional[Tensor], count: int
+) -> Optional[np.ndarray]:
+    if importance is None:
+        return None
+    if importance.ndim != 1 or importance.numel() != count:
+        raise ValueError("donor importance length does not match the anchor dimension")
+    importance_np = importance.detach().to(torch.float64).cpu().numpy()
+    if not np.isfinite(importance_np).all() or np.any(importance_np < 0):
+        raise ValueError("donor importance must be finite and nonnegative")
+    return importance_np
 
 
 def _rows_to_index(ids: np.ndarray) -> Dict[Tuple[int, int, int], int]:
@@ -121,9 +176,10 @@ def load_aligned_score_artifact(
     """Load a frozen reference-only score artifact and align by canonical ID.
 
     Required NPZ members are ``schema``, ``canonical_ids``, ``eligible``,
-    ``path_score``, ``motion_score``, ``allocation_score`` and
-    ``estimated_time_bytes``. Random rankings consume the score vector frozen
-    by training; they never regenerate a second RNG stream in the codec.
+    ``path_score``, ``motion_score``, ``allocation_score``,
+    ``importance_score`` and ``estimated_time_bytes``. Random rankings consume
+    the score vector frozen by training; they never regenerate a second RNG
+    stream in the codec.
     """
 
     current_ids = canonical_voxel_ids(anchors, voxel_size).cpu().numpy()
@@ -144,6 +200,7 @@ def load_aligned_score_artifact(
             "path_score",
             "motion_score",
             "allocation_score",
+            "importance_score",
             "estimated_time_bytes",
             "official_retain_mask",
             "official_factor0_mask",
@@ -207,6 +264,7 @@ def load_aligned_score_artifact(
             score_src = allocation_score_src
         else:
             raise ValueError(f"ranking {ranking!r} does not consume an AP score artifact")
+        importance_src = np.asarray(artifact["importance_score"], dtype=np.float64)
         byte_src = np.asarray(artifact["estimated_time_bytes"], dtype=np.int64)
         frozen_mask_src = {
             name: np.asarray(artifact[name], dtype=np.bool_)
@@ -239,9 +297,12 @@ def load_aligned_score_artifact(
         eligible_src.shape != (artifact_ids.shape[0],)
         or score_src.shape != (artifact_ids.shape[0],)
         or allocation_score_src.shape != (artifact_ids.shape[0],)
+        or importance_src.shape != (artifact_ids.shape[0],)
         or byte_src.shape != (artifact_ids.shape[0],)
     ):
         raise ValueError("malformed AP score artifact arrays")
+    if not np.isfinite(importance_src).all() or np.any(importance_src < 0):
+        raise ValueError("frozen backbone importance must be finite and nonnegative")
     for name, value in frozen_mask_src.items():
         if value.shape != (artifact_ids.shape[0],):
             raise ValueError(f"malformed frozen allocation mask: {name}")
@@ -282,6 +343,7 @@ def load_aligned_score_artifact(
 
     eligible = eligible_src[np.asarray(aligned_indices, dtype=np.int64)]
     score = score_src[np.asarray(aligned_indices, dtype=np.int64)]
+    importance = importance_src[np.asarray(aligned_indices, dtype=np.int64)]
     estimated_bytes = byte_src[np.asarray(aligned_indices, dtype=np.int64)]
     aligned_masks = {
         name: value[np.asarray(aligned_indices, dtype=np.int64)]
@@ -365,6 +427,9 @@ def load_aligned_score_artifact(
         torch.from_numpy(current_ids).to(device=anchors.device, dtype=torch.int64),
         protected_fraction,
         spec.swap,
+        importance=torch.from_numpy(importance).to(
+            device=anchors.device, dtype=torch.float64
+        ),
     )
     if not torch.equal(expected_retain, frozen_allocation["ap_retain_mask"]):
         raise ValueError("frozen whole-anchor allocation is not reproducible")
@@ -380,6 +445,9 @@ def load_aligned_score_artifact(
             frozen_allocation["official_factor0_mask"] & expected_retain
         ),
         retain_mask=expected_retain,
+        importance=torch.from_numpy(importance).to(
+            device=anchors.device, dtype=torch.float64
+        ),
     )
     if not torch.equal(expected_class, expected_temporal_class) or not torch.equal(
         expected_class, frozen_allocation["ap_class_mask"]
@@ -407,6 +475,7 @@ def build_equal_estimated_byte_allocation(
     starting_active: Optional[Tensor] = None,
     retain_mask: Optional[Tensor] = None,
     max_dp_states: int = 2_000_000,
+    importance: Optional[Tensor] = None,
 ) -> Tuple[Tensor, Tensor, Dict[str, Any]]:
     """Close final temporal membership to official estimated-byte mass.
 
@@ -415,6 +484,10 @@ def build_equal_estimated_byte_allocation(
     exact integer subset-sum promotes or demotes eligible unprotected rows until
     the official frozen byte mass is restored.  The final mask must be a subset
     of ``retain_mask``.  No count-based fallback is allowed.
+
+    ``importance`` (the frozen backbone importance estimate) only refines the
+    demotion-side candidate order: lowest score first, then lowest importance,
+    then canonical ID.  The protected-class selection never sees it.
     """
 
     n = official_active.numel()
@@ -449,6 +522,7 @@ def build_equal_estimated_byte_allocation(
     scores_np = scores.detach().to(torch.float64).cpu().numpy()
     ids_np = canonical_ids.detach().to(torch.int64).cpu().numpy()
     costs_np = estimated_bytes.detach().to(torch.int64).cpu().numpy()
+    importance_np = _validate_donor_secondary(importance, n)
     eligible_indices = np.flatnonzero(eligible_np)
     if eligible_indices.size == 0:
         raise ValueError("AP eligible universe is empty")
@@ -506,7 +580,12 @@ def build_equal_estimated_byte_allocation(
         )
         candidates = candidates[
             _lexicographic_rank(
-                ids_np[candidates], scores_np[candidates], descending=False
+                ids_np[candidates],
+                scores_np[candidates],
+                descending=False,
+                secondary=None
+                if importance_np is None
+                else importance_np[candidates],
             )
         ]
         output_np[exact_subset(candidates, current_total - target_total)] = False
@@ -545,6 +624,11 @@ def build_equal_estimated_byte_allocation(
         "estimated_byte_delta": final_total - target_total,
         "protected_fraction": float(protected_fraction),
         "budget_definition": "exact_frozen_integer_estimated_time_bytes",
+        "donor_ranking_keys": (
+            ["score_asc", "backbone_importance_asc", "canonical_id"]
+            if importance_np is not None
+            else ["score_asc", "canonical_id"]
+        ),
         "real_zip_match_still_required": True,
         "promoted_canonical_ids": ids_np[promoted].tolist(),
         "demoted_canonical_ids": ids_np[demoted].tolist(),
@@ -563,6 +647,7 @@ def build_equal_stream_budget_allocation(
     canonical_ids: Tensor,
     protected_fraction: float,
     enable_swap: bool,
+    importance: Optional[Tensor] = None,
 ) -> Tuple[Tensor, Tensor, Dict[str, Any]]:
     """Build a deterministic top-score class and count-exact promote/demote swap.
 
@@ -570,6 +655,10 @@ def build_equal_stream_budget_allocation(
     therefore preserves the exact number of active stream rows.  Entropy-coded
     byte equality is *not* inferred from this property; the actual deterministic
     ZIP feedback loop remains mandatory.
+
+    ``importance`` (the frozen backbone importance estimate) only refines the
+    donor order: lowest score demoted first, ties broken by lowest importance,
+    then canonical ID.  The protected-class selection never sees it.
     """
 
     for name, value in {
@@ -589,6 +678,7 @@ def build_equal_stream_budget_allocation(
     eligible_np = eligible.detach().to(torch.bool).cpu().numpy()
     scores_np = scores.detach().to(torch.float64).cpu().numpy()
     ids_np = canonical_ids.detach().to(torch.int64).cpu().numpy()
+    importance_np = _validate_donor_secondary(importance, n)
     eligible_indices = np.flatnonzero(eligible_np)
     if eligible_indices.size == 0:
         raise ValueError("AP eligible universe is empty")
@@ -609,9 +699,17 @@ def build_equal_stream_budget_allocation(
                 f"cannot preserve stream-row budget: {promoted.size} promotions but only "
                 f"{candidates.size} eligible demotion candidates"
             )
-        # Lowest score is demoted first; canonical ID is the deterministic tie break.
+        # Lowest score is demoted first; ties fall to the lowest frozen backbone
+        # importance, and the canonical ID is the final deterministic tie break.
         ranked_candidates = candidates[
-            _lexicographic_rank(ids_np[candidates], scores_np[candidates], descending=False)
+            _lexicographic_rank(
+                ids_np[candidates],
+                scores_np[candidates],
+                descending=False,
+                secondary=None
+                if importance_np is None
+                else importance_np[candidates],
+            )
         ]
         demoted = ranked_candidates[: promoted.size]
         output_np[promoted] = True
@@ -628,6 +726,11 @@ def build_equal_stream_budget_allocation(
         "demoted_count": int(demoted.size),
         "protected_fraction": float(protected_fraction),
         "budget_definition": "exact_active_temporal_stream_rows",
+        "donor_ranking_keys": (
+            ["score_asc", "backbone_importance_asc", "canonical_id"]
+            if importance_np is not None
+            else ["score_asc", "canonical_id"]
+        ),
         "entropy_byte_match_deferred_to_deterministic_zip": True,
         "promoted_canonical_ids": ids_np[promoted].tolist(),
         "demoted_canonical_ids": ids_np[demoted].tolist(),
@@ -646,6 +749,7 @@ def build_count_preserving_anchor_allocation(
     canonical_ids: Tensor,
     protected_fraction: float,
     enable_swap: bool,
+    importance: Optional[Tensor] = None,
 ) -> Tuple[Tensor, Tensor, Dict[str, Any]]:
     """Protect/swap whole anchors while preserving the exact retained count."""
     retain, ap_class, audit = build_equal_stream_budget_allocation(
@@ -655,6 +759,7 @@ def build_count_preserving_anchor_allocation(
         canonical_ids,
         protected_fraction,
         enable_swap,
+        importance=importance,
     )
     audit = dict(audit)
     audit["official_retain_count"] = audit.pop("official_active_count")

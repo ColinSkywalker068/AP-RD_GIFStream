@@ -44,6 +44,7 @@ from gsplat.compression.ap_gifstream import (
     build_count_preserving_anchor_allocation,
     build_equal_estimated_byte_allocation,
     deterministic_zip_directory,
+    frozen_backbone_importance,
     file_byte_census,
     tensor_mapping_sha256,
     variant_spec,
@@ -993,6 +994,18 @@ class Runner:
             reference_paths - self.splats["anchors"].detach()[:, None, :], dim=-1
         ).mean(dim=1)
         eligible = torch.isfinite(reference_paths).all(dim=(1, 2)) & torch.isfinite(path_score)
+        opacity_accum = self.strategy_state.get("opacity_accum")
+        anchor_demon = self.strategy_state.get("anchor_demon")
+        if opacity_accum is None or anchor_demon is None:
+            raise ValueError(
+                "AP freeze requires the backbone opacity statistics accumulated "
+                "during densification"
+            )
+        if opacity_accum.shape[0] != ids.shape[0]:
+            raise ValueError(
+                "backbone opacity statistics disagree with the frozen anchor count"
+            )
+        importance_score = frozen_backbone_importance(opacity_accum, anchor_demon)
         estimated_bytes = self.compression_sim_method.estimate_time_stream_bytes(
             self.splats["time_features"].detach()
         )
@@ -1042,6 +1055,7 @@ class Runner:
             ids,
             self.cfg.ap_protected_fraction,
             enable_swap=variant_spec(self.cfg.ap_variant).swap,
+            importance=importance_score,
         )
         official_active = official_factor0 & official_retain
         ap_starting_active = official_factor0 & ap_retain
@@ -1055,6 +1069,7 @@ class Runner:
             enable_swap=variant_spec(self.cfg.ap_variant).swap,
             starting_active=ap_starting_active,
             retain_mask=ap_retain,
+            importance=importance_score,
         )
         if not torch.equal(whole_class, ap_class):
             raise AssertionError("frozen whole and temporal AP classes disagree")
@@ -1092,7 +1107,7 @@ class Runner:
         factor3_value = float(positive3.min().item())
 
         self.ap_state = {
-            "schema": "h007.ap_training_state.v2",
+            "schema": "h007.ap_training_state.v3",
             "scene": os.path.basename(os.path.normpath(self.cfg.data_dir)),
             "variant": self.cfg.ap_variant,
             "voxel_size": float(self.cfg.voxel_size),
@@ -1101,6 +1116,7 @@ class Runner:
             "scores": scores.detach(),
             "path_score": path_score.detach(),
             "motion_score": motion_score.detach(),
+            "importance_score": importance_score.detach(),
             "estimated_time_bytes": estimated_bytes.detach(),
             "reference_paths": reference_paths.detach(),
             "official_retain_mask": official_retain.detach(),
@@ -1161,6 +1177,7 @@ class Runner:
             path_score=path_score.cpu().numpy().astype(np.float64, copy=False),
             motion_score=motion_score.cpu().numpy().astype(np.float64, copy=False),
             allocation_score=scores.cpu().numpy().astype(np.float64, copy=False),
+            importance_score=importance_score.cpu().numpy().astype(np.float64, copy=False),
             estimated_time_bytes=estimated_bytes.cpu().numpy().astype(np.int64, copy=False),
             official_retain_mask=official_retain.cpu().numpy().astype(np.bool_, copy=False),
             official_factor0_mask=official_factor0.cpu().numpy().astype(np.bool_, copy=False),
@@ -1185,6 +1202,9 @@ class Runner:
             ),
             path_definition=np.asarray("sum_consecutive_euclidean_displacement"),
             motion_definition=np.asarray("mean_distance_from_canonical_anchor"),
+            importance_definition=np.asarray(
+                "backbone_blended_opacity_per_visit_prune_statistic"
+            ),
             estimated_byte_definition=np.asarray(
                 "ceil_deterministic_conditional_gaussian_bits_over_8"
             ),
@@ -1263,7 +1283,7 @@ class Runner:
             raise ValueError("AP checkpoint is missing frozen state or training receipt")
         state = checkpoint["ap_state"]
         receipt = checkpoint["ap_training_receipt"]
-        if state.get("schema") != "h007.ap_training_state.v2":
+        if state.get("schema") != "h007.ap_training_state.v3":
             raise ValueError("unsupported AP training-state schema")
         if receipt.get("schema") != "h007.ap_training_receipt.v2":
             raise ValueError("unsupported AP training-receipt schema")

@@ -350,17 +350,22 @@ def normalize_factor_semantics(
     if not math.isfinite(activation) or activation < 0.1 or activation > 1.0:
         raise ValueError("factor0 activation value must be in [0.1,1]")
 
-    output = activated.clone()
-    output[:, :3] = torch.where(output[:, :3] < 0.1, 0.0, output[:, :3])
-    output[:, 0] = torch.where(
+    # Built column-wise without in-place writes: the in-place variant bumps the
+    # base tensor's version after torch.maximum saves its inputs, which kills
+    # the backward pass of the path-alignment loss.
+    thresholded = torch.where(activated[:, :3] < 0.1, 0.0, activated[:, :3])
+    factor0 = torch.where(
         active,
         torch.maximum(
-            output[:, 0],
-            torch.full_like(output[:, 0], activation),
+            thresholded[:, 0],
+            torch.full_like(thresholded[:, 0], activation),
         ),
-        torch.zeros_like(output[:, 0]),
+        torch.zeros_like(thresholded[:, 0]),
     )
-    output[:, 3] = real.to(dtype=output.dtype)
+    factor3 = real.to(dtype=activated.dtype)
+    output = torch.cat(
+        [factor0.unsqueeze(1), thresholded[:, 1:3], factor3.unsqueeze(1)], dim=1
+    )
     if not torch.equal(output[:, 0] > 0, active):
         raise AssertionError("factor0 reconstruction disagrees with active mask")
     if not torch.equal(output[:, 3] > 0, real):
