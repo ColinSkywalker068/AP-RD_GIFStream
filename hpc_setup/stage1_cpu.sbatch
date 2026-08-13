@@ -53,13 +53,17 @@ grep -v 'fused-ssim' "$REPO_ROOT/GIFStream_APRD/examples/requirements.txt" > "$T
 "$PY" -m pip install -r "$TMPDIR/reqs_cpu.txt" \
   -f https://data.pyg.org/whl/torch-2.6.0+cu124.html
 
-# 5) MLEntropy (pure C++, no GPU needed).  Always start from a clean build
-# dir -- a stale CMakeCache (e.g. rsynced from another machine) breaks cmake.
-cd "$REPO_ROOT/GIFStream_APRD/third_party/MLEntropy"
-rm -rf build && mkdir -p build && cd build
-"$ENV_PREFIX/bin/cmake" ../cpp -DCMAKE_BUILD_TYPE=Release \
+# 5) MLEntropy (pure C++, no GPU needed).  Build OUT of the source tree:
+# cmake downloads pybind11 sources into the build dir, and any in-tree build
+# pollutes the normalized code-tree hash that runtime provenance verifies.
+# The POST_BUILD step copies the .so files into entropy_models/ regardless.
+MLE_BUILD="$SCRATCH_ROOT/.builds/mlentropy"
+rm -rf "$MLE_BUILD" "$REPO_ROOT/GIFStream_APRD/third_party/MLEntropy/build"
+"$ENV_PREFIX/bin/cmake" -S "$REPO_ROOT/GIFStream_APRD/third_party/MLEntropy/cpp" \
+  -B "$MLE_BUILD" -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_POLICY_VERSION_MINIMUM=3.5 -DPYTHON_EXECUTABLE="$PY"
-make -j8
+make -C "$MLE_BUILD" -j8
+ls "$REPO_ROOT"/GIFStream_APRD/third_party/MLEntropy/entropy_models/MLCodec_*.so
 
 "$PY" -c "import torch, torch_scatter, scipy, cv2; print('stage1 imports OK', torch.__version__)"
 echo STAGE1_OK

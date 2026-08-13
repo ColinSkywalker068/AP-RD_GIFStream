@@ -13,6 +13,11 @@ source /scratch/yz11445/AP-RD_GIFStream/hpc_setup/env_common.sh
 
 export CUDA_HOME="$ENV_PREFIX"
 export PATH="$ENV_PREFIX/bin:$PATH"
+# conda-forge CUDA keeps headers/libs under targets/, which the host-compiler
+# half of the torch extension build does not search on its own.
+export CPATH="$ENV_PREFIX/targets/x86_64-linux/include${CPATH:+:$CPATH}"
+export LIBRARY_PATH="$ENV_PREFIX/targets/x86_64-linux/lib${LIBRARY_PATH:+:$LIBRARY_PATH}"
+export LD_LIBRARY_PATH="$ENV_PREFIX/targets/x86_64-linux/lib:$ENV_PREFIX/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 # Cover A100 (8.0), L40S/Ada (8.9), H100/H200 (9.0) so one build serves
 # whichever partition training lands on.
 export TORCH_CUDA_ARCH_LIST="8.0;8.9;9.0"

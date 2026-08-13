@@ -11,7 +11,9 @@ set -euxo pipefail
 source /scratch/yz11445/AP-RD_GIFStream/hpc_setup/env_common.sh
 
 DATA_ROOT="$SCRATCH_ROOT/datasets/Neur3D"
-ZIP_DIR="$DATA_ROOT/_zips"
+# Keep the archives OUTSIDE the dataset root: the preprocessing script treats
+# every child of DATA_ROOT as a scene directory.
+ZIP_DIR="$SCRATCH_ROOT/datasets/neur3d_zips"
 mkdir -p "$ZIP_DIR"
 cd "$ZIP_DIR"
 
