@@ -427,6 +427,21 @@ index 5bcd3b3..94cd274 100644
      )
      audit = dict(audit)
      audit["official_retain_count"] = audit.pop("official_active_count")
+diff --git a/gsplat/compression/gifstream_end2end_compression.py b/gsplat/compression/gifstream_end2end_compression.py
+index 110a888..a7e5696 100644
+--- a/gsplat/compression/gifstream_end2end_compression.py
++++ b/gsplat/compression/gifstream_end2end_compression.py
+@@ -895,7 +895,9 @@ class GIFStreamEnd2endCompression:
+                 int(path_contract["knn_count"]),
+                 canonical_ids=retained_ids,
+             )
+-            if not torch.equal(expected_knn, retained_knn) or not torch.equal(
++            if not _tensor_equal_device_agnostic(
++                expected_knn, retained_knn
++            ) or not _tensor_equal_device_agnostic(
+                 expected_path_mask, decoded_path_mask
+             ):
+                 raise ValueError(
 diff --git a/gsplat/compression/h007_certification.py b/gsplat/compression/h007_certification.py
 index 63d75d1..b73bd80 100644
 --- a/gsplat/compression/h007_certification.py

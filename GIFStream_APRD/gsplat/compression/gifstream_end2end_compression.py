@@ -895,7 +895,9 @@ class GIFStreamEnd2endCompression:
                 int(path_contract["knn_count"]),
                 canonical_ids=retained_ids,
             )
-            if not torch.equal(expected_knn, retained_knn) or not torch.equal(
+            if not _tensor_equal_device_agnostic(
+                expected_knn, retained_knn
+            ) or not _tensor_equal_device_agnostic(
                 expected_path_mask, decoded_path_mask
             ):
                 raise ValueError(
