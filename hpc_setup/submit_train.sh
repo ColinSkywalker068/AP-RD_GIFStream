@@ -14,25 +14,29 @@ VARIANTS="${VARIANTS:-official ap-gifstream-full}"
 RATES="${RATES:-0}"
 GOPS="${GOPS:-0}"
 N_KNN="${N_KNN:-8}"
-ACCOUNT="${ACCOUNT:-torch_pr_69_general}"
-PARTITIONS="${PARTITIONS:-l40s_public h200_public}"
+# account:partition pairs to race with --test-only (earliest estimate wins).
+LANES="${LANES:-torch_pr_69_general:l40s_public torch_pr_69_general:h200_public torch_pr_926_general:l40s_public torch_pr_69_tandon_advanced:h200_tandon torch_pr_69_tandon_advanced:a100_tandon torch_pr_69_tandon_advanced:h100_tandon}"
+SBATCH_FILE="${SBATCH_FILE:-stage5_train.sbatch}"
 
-pick_partition() {
+pick_lane() {
   local best="" best_time="9999-99-99T99:99:99"
-  for p in $PARTITIONS; do
-    local est
-    est=$(sbatch --test-only --account="$ACCOUNT" -p "$p" stage5_train.sbatch 2>&1 \
+  for lane in $LANES; do
+    local acct="${lane%%:*}" part="${lane##*:}" est
+    est=$(sbatch --test-only --account="$acct" -p "$part" "$SBATCH_FILE" 2>&1 \
       | grep -oP 'start at \K\S+' | head -1) || true
+    [ -n "${est:-}" ] && echo "  probe $lane -> $est" >&2
     if [ -n "${est:-}" ] && [[ "$est" < "$best_time" ]]; then
-      best_time="$est"; best="$p"
+      best_time="$est"; best="$lane"
     fi
   done
-  [ -n "$best" ] || { echo "no eligible partition" >&2; exit 1; }
+  [ -n "$best" ] || { echo "no eligible lane" >&2; exit 1; }
   echo "$best"
 }
 
-PARTITION=$(pick_partition)
-echo "partition: $PARTITION (account $ACCOUNT)"
+LANE=$(pick_lane)
+ACCOUNT="${LANE%%:*}"
+PARTITION="${LANE##*:}"
+echo "fastest lane: $PARTITION (account $ACCOUNT)"
 
 for variant in $VARIANTS; do
   for rate in $RATES; do
