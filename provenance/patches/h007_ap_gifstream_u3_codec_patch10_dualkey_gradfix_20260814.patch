@@ -643,6 +643,45 @@ index e949278..4988c1d 100644
      evaluator_relative = _nonempty_string(
          evidence["evaluator_relative_path"], "ordinary evaluator relative path"
      )
+diff --git a/gsplat/strategy/GIFStream.py b/gsplat/strategy/GIFStream.py
+index 559f0d8..6558308 100644
+--- a/gsplat/strategy/GIFStream.py
++++ b/gsplat/strategy/GIFStream.py
+@@ -262,6 +262,21 @@ class GIFStreamStrategy(Strategy):
+             remove_duplicates = ~remove_duplicates
+             candidate_anchor = selected_grid_coords_unique[remove_duplicates]*cur_size
+ 
++            # The deterministic path contract (and canonical voxel IDs) forbid
++            # exact-duplicate anchor rows.  The coarse-grid filter above cannot
++            # catch a candidate that lands float-exactly on an existing anchor
++            # from a different hierarchy level, so drop those collisions here.
++            if candidate_anchor.shape[0] > 0:
++                exact_dup_chunks = []
++                for j in range(0, params["anchors"].shape[0], 4096):
++                    exact_dup_chunks.append(
++                        (candidate_anchor.unsqueeze(1) == params["anchors"][j:j+4096].unsqueeze(0)).all(-1).any(-1)
++                    )
++                keep_exact = ~reduce(torch.logical_or, exact_dup_chunks)
++            else:
++                keep_exact = torch.zeros(0, dtype=torch.bool, device=candidate_anchor.device)
++            candidate_anchor = candidate_anchor[keep_exact]
++
+             new_anchors_count += candidate_anchor.shape[0]
+ 
+             if candidate_anchor.shape[0] > 0:
+@@ -281,9 +296,9 @@ class GIFStreamStrategy(Strategy):
+                 new_time_features = params["time_features"][original_indices]
+                 new_factors = params["factors"][original_indices]
+ 
+-                new_feat = scatter_max(new_feat, inverse_indices.unsqueeze(1).expand(-1, new_feat.size(1)), dim=0)[0][remove_duplicates]
+-                new_time_features = scatter_max(new_time_features, inverse_indices.unsqueeze(1).expand(-1, new_time_features.size(1)), dim=0)[0][remove_duplicates]
+-                new_factors = scatter_max(new_factors, inverse_indices.unsqueeze(1).expand(-1, new_factors.size(1)), dim=0)[0][remove_duplicates]
++                new_feat = scatter_max(new_feat, inverse_indices.unsqueeze(1).expand(-1, new_feat.size(1)), dim=0)[0][remove_duplicates][keep_exact]
++                new_time_features = scatter_max(new_time_features, inverse_indices.unsqueeze(1).expand(-1, new_time_features.size(1)), dim=0)[0][remove_duplicates][keep_exact]
++                new_factors = scatter_max(new_factors, inverse_indices.unsqueeze(1).expand(-1, new_factors.size(1)), dim=0)[0][remove_duplicates][keep_exact]
+ 
+                 new_offsets = torch.zeros_like(candidate_anchor).unsqueeze(dim=1).repeat([1,state["n_offsets"],1]).float().to(device)
+ 
 diff --git a/tests/test_ap_gifstream_core.py b/tests/test_ap_gifstream_core.py
 index 2e798c2..6d567a2 100644
 --- a/tests/test_ap_gifstream_core.py

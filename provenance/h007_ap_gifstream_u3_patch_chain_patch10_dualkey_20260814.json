@@ -11,7 +11,7 @@
    "third_party"
   ],
   "schema": "h007.normalized_code_tree.v1",
-  "sha256": "b22afd6561f2dbbd80287b9c5c69f931e2c2882a3dea545f1d826677558d7b35",
+  "sha256": "e70d58b9ab06259f1f2687f9a02de57a2338f4c75b0a475651e9e31cef60e4ed",
   "special_names": [
    "CMakeLists.txt"
   ],
@@ -80,7 +80,7 @@
   },
   {
    "path": "patches/h007_ap_gifstream_u3_codec_patch10_dualkey_gradfix_20260814.patch",
-   "sha256": "4b399d63bbe910075a6e9373c3bebb158dc81eb031d3c9868a0f30496c5b7ba7",
+   "sha256": "644647e04a2cd7aa9d047a396dd513ac73bf80127c97cc6b29bd4852c627859d",
    "stage": "patch10"
   }
  ],
