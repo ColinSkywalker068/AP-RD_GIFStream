@@ -22,38 +22,50 @@ assets=$(curl -fsSL --retry 5 \
 echo "$assets"
 test -n "$assets"
 
-# 4-way parallel download with resume; skip files already complete.
+# 4-way parallel download; skip files that already exist (all-or-nothing per
+# file: a failed curl leaves a partial file removed so the rerun refetches).
 echo "$assets" | xargs -n1 -P4 -I{} bash -c '
   f=$(basename "{}")
-  curl -fL -C - --retry 5 --retry-delay 15 -o "$f" "{}" || { echo "FAILED $f"; exit 1; }
+  [ -s "$f" ] && exit 0
+  curl -fL --retry 5 --retry-delay 15 -o "$f.part" "{}" && mv "$f.part" "$f" \
+    || { rm -f "$f.part"; echo "FAILED $f"; exit 1; }
 '
 
-# Reassemble the flame_salmon_1 split archive into a single zip.
+# Reassemble the flame_salmon_1 split archive into a single zip.  Prefer a
+# real zip binary; fall back to plain concatenation, which unzip can process
+# with its zip-bomb heuristic disabled (the standard recipe for this dataset).
 if [ -f flame_salmon_1_split.z01 ] && [ ! -f flame_salmon_1_merged.zip ]; then
   if command -v zip >/dev/null; then
     zip -q -s 0 flame_salmon_1_split.zip --out flame_salmon_1_merged.zip
   else
     cat flame_salmon_1_split.z0* flame_salmon_1_split.zip > flame_salmon_1_joined.zip
-    zip -q -FF flame_salmon_1_joined.zip --out flame_salmon_1_merged.zip || \
-      mv flame_salmon_1_joined.zip flame_salmon_1_merged.zip
+    mv flame_salmon_1_joined.zip flame_salmon_1_merged.zip
   fi
 fi
 
 # Extract every scene (skip the split parts; use the merged archive instead).
+# unzip exits nonzero on concatenation warnings even when extraction succeeds,
+# so success is judged by the layout report below, not the exit code.
+export UNZIP_DISABLE_ZIPBOMB_DETECTION=TRUE
 for z in *.zip; do
   case "$z" in
     flame_salmon_1_split.zip|flame_salmon_1_joined.zip) continue ;;
   esac
-  unzip -o -q "$z" -d "$DATA_ROOT"
+  marker="$ZIP_DIR/.extracted_$z"
+  [ -f "$marker" ] && continue
+  unzip -o -q "$z" -d "$DATA_ROOT" || echo "unzip exit $? for $z (warnings tolerated)"
+  touch "$marker"
 done
 
-# Report the layout: every scene directory with its camera count.
-for d in "$DATA_ROOT"/*/; do
-  [ -d "$d" ] || continue
-  case "$d" in */_zips/) continue ;; esac
-  n=$(find "$d" -maxdepth 1 -name 'cam*.mp4' | wc -l)
+# Verify the layout: every expected scene must have cameras + poses.
+fail=0
+for scene in coffee_martini cook_spinach cut_roasted_beef flame_salmon_1 flame_steak sear_steak; do
+  d="$DATA_ROOT/$scene"
+  n=$(find "$d" -maxdepth 1 -name 'cam*.mp4' 2>/dev/null | wc -l)
   p=$(ls "$d"/poses_bounds.npy 2>/dev/null | wc -l)
-  echo "SCENE $(basename "$d"): ${n} cameras, poses_bounds=${p}"
+  echo "SCENE $scene: ${n} cameras, poses_bounds=${p}"
+  if [ "$n" -lt 15 ] || [ "$p" -ne 1 ]; then fail=1; fi
 done
 du -sh "$DATA_ROOT" "$ZIP_DIR"
+[ "$fail" = 0 ] || { echo STAGE3_INCOMPLETE; exit 1; }
 echo STAGE3_OK
