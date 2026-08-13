@@ -53,9 +53,10 @@ grep -v 'fused-ssim' "$REPO_ROOT/GIFStream_APRD/examples/requirements.txt" > "$T
 "$PY" -m pip install -r "$TMPDIR/reqs_cpu.txt" \
   -f https://data.pyg.org/whl/torch-2.6.0+cu124.html
 
-# 5) MLEntropy (pure C++, no GPU needed).
+# 5) MLEntropy (pure C++, no GPU needed).  Always start from a clean build
+# dir -- a stale CMakeCache (e.g. rsynced from another machine) breaks cmake.
 cd "$REPO_ROOT/GIFStream_APRD/third_party/MLEntropy"
-mkdir -p build && cd build
+rm -rf build && mkdir -p build && cd build
 "$ENV_PREFIX/bin/cmake" ../cpp -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_POLICY_VERSION_MINIMUM=3.5 -DPYTHON_EXECUTABLE="$PY"
 make -j8
