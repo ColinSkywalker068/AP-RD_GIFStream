@@ -19,6 +19,7 @@ VARIANT="${VARIANT:-ap-gifstream-full}"
 RATE="${RATE:-0}"
 GOP_ID="${GOP_ID:-0}"
 N_KNN="${N_KNN:-8}"
+EXP_TAG="${EXP_TAG:-}"
 
 # Frozen rate grid (h007_sequence_container.FROZEN_RATE_LAMBDAS).
 case "$RATE" in
@@ -39,7 +40,7 @@ case "$SCENE" in
 esac
 
 DATA_DIR="$SCRATCH_ROOT/datasets/Neur3D/$SCENE"
-RESULT_DIR="$SCRATCH_ROOT/results/h007/$SCENE/$VARIANT/nknn${N_KNN}/GOP_${GOP_ID}/r${RATE}"
+RESULT_DIR="$SCRATCH_ROOT/results/h007/$SCENE/$VARIANT/nknn${N_KNN}/GOP_${GOP_ID}/r${RATE}${EXP_TAG:+_$EXP_TAG}"
 MANIFEST="$REPO_ROOT/provenance/h007_ap_gifstream_u3_patch_chain_patch10_dualkey_20260814.json"
 MANIFEST_SHA=8e6894607d06cc474daeda4da1829d7cfc2624e588941d3392e0d8c43528d1a9
 START_FRAME=$((GOP_ID * 60))
@@ -106,4 +107,4 @@ fi
 # they run as a separate step once GOP_0..GOP_4 exist).
 find "$RESULT_DIR" -maxdepth 2 \( -name '*.zip' -o -name '*.npz' -o -name '*.json' -o -name 'ckpt_*' \) | sort
 du -sh "$RESULT_DIR"
-echo "STAGE5_OK scene=$SCENE variant=$VARIANT rate=$RATE gop=$GOP_ID n_knn=$N_KNN"
+echo "STAGE5_OK scene=$SCENE variant=$VARIANT rate=$RATE gop=$GOP_ID n_knn=$N_KNN exp_tag=${EXP_TAG:-none}"

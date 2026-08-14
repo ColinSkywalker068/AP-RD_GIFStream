@@ -42,8 +42,8 @@ for variant in $VARIANTS; do
   for rate in $RATES; do
     for gop in $GOPS; do
       jid=$(sbatch --parsable --account="$ACCOUNT" -p "$PARTITION" \
-        --job-name="gif-${variant}-r${rate}-g${gop}" \
-        --export=ALL,SCENE="$SCENE",VARIANT="$variant",RATE="$rate",GOP_ID="$gop",N_KNN="$N_KNN" \
+        --job-name="gif-${variant}-r${rate}-g${gop}${EXP_TAG:+-$EXP_TAG}" \
+        --export=ALL,SCENE="$SCENE",VARIANT="$variant",RATE="$rate",GOP_ID="$gop",N_KNN="$N_KNN",EXP_TAG="${EXP_TAG:-}" \
         stage5_train.sbatch)
       echo "submitted $jid: scene=$SCENE variant=$variant rate=$rate gop=$gop n_knn=$N_KNN"
     done
