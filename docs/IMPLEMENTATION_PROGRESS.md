@@ -1,6 +1,6 @@
 # AP-RD / GIFStream — Implementation Progress
 
-Status as of 2026-08-14. Covers everything done since taking over the handover
+Status as of 2026-08-15. Covers everything done since taking over the handover
 (`4c2a73e`), on both machines:
 
 - **4090 workstation** (`asus4090`, `~/Research/AP-RD_GIFStream`) — development,
@@ -108,7 +108,8 @@ the duplicate-tolerant KNN behavior.
   `git diff 4c2a73e --relative=GIFStream_APRD` whenever the tree changes.
 - Current preregistered manifest:
   `provenance/h007_ap_gifstream_u3_patch_chain_patch10_dualkey_20260814.json`
-  - sha256 `8e6894607d06cc474daeda4da1829d7cfc2624e588941d3392e0d8c43528d1a9`
+  - sha256 `0be082abee342c090c91f06be1eda2228cba63a1806a1ab32f85f7bee6c55610`
+    (canonical JSON bytes — see pitfall #1)
   - normalized tree `399b4bb1…`, 645 files
 - Verified end-to-end on both machines: official GIFStream @ `c9848663` + all
   11 patches replays **bit-identically** to the working tree, and
