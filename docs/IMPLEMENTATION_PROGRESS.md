@@ -204,3 +204,151 @@ Results: `results/h007/flame_salmon_1/{official,ap-gifstream-full}/nknn8/GOP_0/r
 5. **Paper-time**: tasks 4/5/6; optional entropy-model transient diagnostic.
 6. Housekeeping: push access for the torch clone if desired (currently pushed
    from the 4090), deleting the `._*` cruft in `provenance/patches/`.
+
+---
+
+## 9. Pitfall catalog
+
+Everything that actually bit us, by category, as symptom → cause → resolution.
+Most of these are invisible until you hit them; all are now either fixed in
+code, encoded in the `hpc_setup/` scripts, or listed here as operating lore.
+
+### Provenance / contract pitfalls
+
+1. **Manifest bytes must be canonical JSON, not just correct JSON.**
+   Symptom: stage 6 rejects every archive ("manifest bytes are not canonical
+   JSON") after 40 training runs passed. Cause: the trainer embeds the
+   manifest's *raw file bytes* into each archive; the sequence container
+   demands `canonical_json_bytes` formatting, but every earlier check only
+   verifies the sha of whatever bytes exist — so a pretty-printed manifest
+   sails through training and fails at the very last consumer. Resolution:
+   canonicalize the file (content identical, new sha); officials only needed
+   codec re-mint, AP cells needed retraining (below). Note: the handover's own
+   patch8 manifest ends with a trailing newline and would fail the same check
+   — this path had never been exercised on real archives.
+2. **AP checkpoints pin the manifest sha at freeze time.** Any manifest change
+   (even byte formatting) orphans every AP checkpoint: restore fails closed
+   with "checkpoint AP runtime provenance differs from active preregistration".
+   That check is the tamper-proofing working as designed — the fix is
+   retraining, never weakening the check or editing checkpoints. Officials
+   don't pin the manifest and survive with a codec-only re-run (stage 5b).
+3. **In-tree builds poison the normalized tree hash.** MLEntropy's cmake
+   *downloads pybind11 sources into `build/`* (148 files matching the hashed
+   suffixes). Any in-tree build under `examples/gsplat/third_party` changes
+   the code-tree hash and kills provenance verification. All builds go
+   out-of-tree; the POST_BUILD step drops only `.so` files (not hashed) into
+   the tree.
+4. **The run tree must be a git checkout at the official commit** — the
+   trainer literally runs `git rev-parse HEAD` and compares to `c9848663`.
+   The handover ships no inner `.git`; transplant one from an official clone
+   and keep the AP work as uncommitted working-tree modifications.
+5. **The patch-chain length was pinned as literal `9` in five places**
+   (container ×3, trainer compression path, clean decoder, certification) plus
+   stage-name lists in two more. Adding patch stages means sweeping for every
+   pin — now centralized as `PATCH_CHAIN_LENGTH`, but future stages must still
+   update tests/fixtures and both stage-name lists.
+6. **`eval_scripts/223_*` and the export script pin `ap_training_state.v2`.**
+   They are frozen evaluators for the author's archived patch8-era runs and
+   reject v3 runs by design; new-run evaluation needs v3-aware counterparts.
+7. **AppleDouble `._*.patch` cruft** ships in `provenance/patches/` from the
+   handover's macOS packaging — glob patterns must filter it or patch
+   enumeration breaks.
+
+### Handed-over code defects (fixed via patch chain)
+
+8. **In-place autograd bug** in `normalize_factor_semantics`: clone +
+   column-writes invalidated `torch.maximum`'s saved tensors — the
+   path-alignment loss could never backprop, on any torch version. Rewritten
+   column-wise (bit-identical forward, 2000-trial check).
+9. **Stale test fixture** (8 vs 9 patch hashes) — the "all tests green"
+   handover claim was false as shipped.
+10. **Cross-device `torch.equal`** in the AP decompress closure check: decoded
+    anchors live on CPU, AP masks are read to GPU. The module's own
+    `_tensor_equal_device_agnostic` helper existed but wasn't used there.
+11. **Duplicate anchors, twice.** (a) Densification: a grow candidate can land
+    float-exactly on an existing anchor from a different hierarchy level —
+    upstream tolerates duplicates, the deterministic-KNN/canonical-ID
+    contracts don't; stochastic (GPU-nondeterministic), so it fires on some
+    runs and not others. Fixed with an exact-collision filter in the grow
+    step. (b) Official codec decode: the lossy anchor round-trip (16-bit PNG +
+    voxel re-round) can merge two anchors — inherent to that bitstream, so
+    render-time KNN opts into duplicates with a deterministic tie-break while
+    identity-bearing paths stay strict.
+12. **Upstream argparse crash** in `dataset_process/n3d_video_process.py`
+    (`type=bool` with `action='store_true'`) — the stock preprocessing script
+    cannot start; a minimally-fixed copy lives in `hpc_setup/`.
+
+### Method behavior that looks like a bug but is not
+
+13. **Byte-exact subset-sum infeasibility.** AP runs can die at the freeze
+    with "no exact estimated-byte adjustment subset" — one of the two
+    *documented* DP failure modes (HANDOVER task 4 requires reporting their
+    counts). Concentrated at high rates (coarser quantization → chunkier byte
+    costs; observed 2/10 at r2–r3, 0/10 at r0–r1). Feasibility is a fresh draw
+    per run (GPU nondeterminism), so a plain retry is legitimate; keep all
+    attempts in logs for honest reporting, and treat repeated failure of one
+    cell as a finding, not a nuisance.
+
+### Torch HPC operational pitfalls
+
+14. **`sbatch` requires `--account=torch_pr_*`** (the default `users`
+    association is invalid), and partition access is account-dependent:
+    general accounts see only `*_public`; `tandon_advanced` unlocks
+    `h200/a100/h100_tandon`. `QOSGrpGRES` pending reason = the account group's
+    GPU quota is exhausted.
+15. **`--test-only` estimates are worst-case and lane-dependent.** Every
+    l40s_public job so far started via backfill within minutes despite
+    multi-hour estimates, while "faster-looking" A100/H200 lanes sat in queue.
+    Racing lanes at submit time — and for urgent pairs, hedge-submitting two
+    lanes with distinct `EXP_TAG`s and cancelling the loser — has been the
+    fastest strategy. `EXP_TAG` exists precisely so parallel hedges cannot
+    collide on result paths.
+16. **conda-forge CUDA hides headers under `targets/x86_64-linux/`** — torch
+    extension builds need `CPATH`/`LIBRARY_PATH`/`LD_LIBRARY_PATH` pointed
+    there or `cuda_runtime_api.h` is not found (the nvidia-channel layout
+    doesn't have this problem).
+17. **Compute nodes lack `zip`, and unzip's concat trick corrupts split
+    archives silently** — it "extracted" flame_salmon with 7 of 19 cameras and
+    a warning-level exit code. Split zips need a real multi-volume extractor
+    (static `7zz`); verify extraction by counting content, never by exit code.
+18. **Never park working files inside a dataset root** — the preprocessing
+    script iterates every child of the root as a scene; a `_zips/` staging dir
+    crashed it instantly.
+19. **Don't rsync build dirs across machines** — a stale `CMakeCache.txt`
+    pointing at the source machine's paths breaks cmake with a confusing
+    error.
+20. **`.nfs* Device or resource busy` tracebacks in job logs are noise**
+    (NFS silly-rename during teardown of files still open) — never the actual
+    failure; keep scanning for the real error.
+21. **`scancel` can lag under RPC throttling** — a read-back immediately after
+    cancelling may still show the jobs PENDING; verify with a fresh `squeue`
+    before concluding a cancel failed (this false alarm nearly caused a
+    cancel of the *correct* batch).
+22. **Cluster-side schedule pins:** trainer smoke-scaling via `--steps_scaler`
+    does *not* scale `ap_freeze_step` or the `entropy_steps` dict (fixed
+    absolute values) — a naive scale-down silently skips entropy-model
+    training entirely. Override per key (`--entropy_steps.time_features N`,
+    tyro dict syntax) and keep the frozen phase ratios (1/3 entropy, 2/3
+    freeze).
+23. **The codec entry demands an external frozen training receipt**
+    (`h007_training_receipt` + sha) binding checkpoint bytes, producer config,
+    and runtime provenance; the producer config JSON must be regenerated
+    through the same tyro parse (`hpc_setup/make_training_config.py`; preset
+    literals drift-guarded against the trainer source).
+
+### Multi-machine / session pitfalls
+
+24. **GitHub identity and scopes:** the box's default `gh` login had pull-only
+    access; the first Colin token lacked write scope (403 on push despite
+    admin permissions). Also, `main`'s history was later rewritten for
+    authorship — after any rewrite, secondary clones (torch) diverge with
+    same-message/different-sha commits and need `git reset --hard origin/main`
+    (verify the content diff is empty first).
+25. **A backgrounded client restart can leave a live twin session** working
+    the same transcript — ours independently submitted a duplicate 20-job
+    batch to the same result paths. Check `ListAgents` after restarts, stand
+    twins down explicitly, and treat "who owns the cluster" as
+    single-writer state.
+26. **SSH `ControlPersist` counts from last use**, not first auth — a busy
+    control lane outlives its nominal 12h indefinitely; only idle gaps or
+    network drops kill it.
