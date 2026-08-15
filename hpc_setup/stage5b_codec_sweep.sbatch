@@ -82,12 +82,16 @@ for variant in $VARIANTS; do
       # run_compression rebuilds compression/ from scratch; clear stale outputs.
       rm -rf "$RESULT_DIR/compression" "$RESULT_DIR/compression_rank0.zip" \
         "$RESULT_DIR"/compression_rank0_*.json
-      "$PY" examples/simple_trainer_GIFStream.py "$TYPE" "${COMMON_FLAGS[@]}" \
+      if "$PY" examples/simple_trainer_GIFStream.py "$TYPE" "${COMMON_FLAGS[@]}" \
         --ckpt "$CKPT" \
         --h007_training_receipt "$RECEIPT" \
         --h007_training_receipt_sha256 "$RECEIPT_SHA" \
-        --compression end2end "${SCORE_FLAGS[@]}"
-      test -f "$RESULT_DIR/compression_rank0.zip" && ok=$((ok+1)) || fail=$((fail+1))
+        --compression end2end "${SCORE_FLAGS[@]}" \
+        && test -f "$RESULT_DIR/compression_rank0.zip"; then
+        ok=$((ok+1))
+      else
+        echo "CELL FAILED $variant r$rate g$gop"; fail=$((fail+1))
+      fi
     done
   done
 done
