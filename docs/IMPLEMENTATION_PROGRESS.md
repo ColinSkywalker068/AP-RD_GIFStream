@@ -353,3 +353,12 @@ code, encoded in the `hpc_setup/` scripts, or listed here as operating lore.
 26. **SSH `ControlPersist` counts from last use**, not first auth — a busy
     control lane outlives its nominal 12h indefinitely; only idle gaps or
     network drops kill it.
+27. **Entropy bitstreams are only same-architecture deterministic.** The clean
+    decoder re-encodes decoded symbols with decode-time CDFs (computed by the
+    entropy network on the decoding GPU) and demands a byte-exact match with
+    the archived stream. Cross-arch float drift (e.g. encode on H200, decode
+    on L40S) shifts quantized CDFs and trips the check ("entropy stream is not
+    the exact canonical re-encoding"). Rule: pin the entire encode→decode
+    artifact chain — codec entries, container builds, clean decodes, and any
+    future evaluation decodes — to ONE GPU architecture (we standardize on
+    `l40s_public`).
