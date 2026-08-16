@@ -21,7 +21,7 @@ GOPS="${GOPS:-0 1 2 3 4}"
 N_KNN="${N_KNN:-8}"
 EXP_TAG="${EXP_TAG:-}"
 MANIFEST="$REPO_ROOT/provenance/h007_ap_gifstream_u3_patch_chain_patch10_dualkey_20260814.json"
-MANIFEST_SHA=0be082abee342c090c91f06be1eda2228cba63a1806a1ab32f85f7bee6c55610
+MANIFEST_SHA=1c80343cb8286b37996345edd3a81122697c0af7d5fb4e8a2b11c9633ef9ed6b
 
 case "$SCENE" in
   flame_salmon_1) TYPE=neur3d_1 ;;

@@ -173,7 +173,13 @@ def instantiate_counted_models(
 def _knn_indices(anchors: Tensor, count: int) -> Tensor:
     if count <= 0 or anchors.shape[0] <= count:
         raise ValueError("counted KNN request exceeds decoded anchor population")
-    return deterministic_knn_indices(anchors, int(count))
+    # Rendering-only KNN over decoded anchors: the official codec's lossy
+    # anchor round-trip can collapse two anchors onto one position, so
+    # duplicates are tolerated here (deterministic candidate-index tie-break;
+    # a no-op for unique rows).  Identity-bearing contract paths stay strict.
+    return deterministic_knn_indices(
+        anchors, int(count), allow_duplicate_rows=True
+    )
 
 
 def counted_knn_indices(
