@@ -1,0 +1,57 @@
+{
+ "ap_training_receipt_schema": "h007.ap_training_receipt.v2",
+ "ap_training_state_schema": "h007.ap_training_state.v3",
+ "d_path": {
+  "pi_definition": "median_reference_action_over_eligible_frozen_reference",
+  "pi_sweep_multipliers": [
+   0.5,
+   1.0,
+   2.0
+  ],
+  "weights": "uniform_w_i_equals_1"
+ },
+ "expected_ap_receipt": {
+  "anchor_feature_background_multiplier": 1.0,
+  "anchor_feature_protected_multiplier": 0.25,
+  "factor_background_multiplier": 0.015625,
+  "factor_protected_multiplier": 0.00390625,
+  "freeze_step": 20000,
+  "path_contract_schema": "h007.ap_gifstream.path_contract.v1",
+  "path_dependency_rule": "protected-plus-one-hop-retained-knn",
+  "path_knn_count": 8,
+  "path_loss_every": 50,
+  "path_loss_lambda": 0.01,
+  "path_loss_reference": "current_raw_full_graph_vs_simulated_retained_graph_on_retained_rows",
+  "path_loss_required": true,
+  "protected_fraction": 0.05,
+  "q_ap_multiplier": 0.5,
+  "q_bg_multiplier": 1.25,
+  "random_seed": 11,
+  "scene": "flame_salmon_1",
+  "variant": "ap-gifstream-full"
+ },
+ "gop_count": 5,
+ "gop_size": 60,
+ "method": "ap-gifstream-full",
+ "official_method": "official",
+ "path_loss_steps": {
+  "start": 20000,
+  "step": 50,
+  "stop": 30000
+ },
+ "rates": {
+  "0": 0.0005,
+  "1": 0.001,
+  "2": 0.002,
+  "3": 0.004
+ },
+ "runtime": {
+  "last_patch_sha256": "6d1891c5fba822d1baebbcdeab840a96649da04e810ee80c67467a0e6c35480a",
+  "manifest_sha256": "1c80343cb8286b37996345edd3a81122697c0af7d5fb4e8a2b11c9633ef9ed6b",
+  "normalized_tree_sha256": "ed2f9c638f4dcdc0ac1a4432eac36d2dc204baeea4f45bb48be1396e60a4922b",
+  "patch_count": 11
+ },
+ "scene": "flame_salmon_1",
+ "schema": "h007.v3_campaign.flame_salmon.v1",
+ "training_step": 29999
+}
