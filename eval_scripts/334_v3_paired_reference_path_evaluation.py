@@ -291,13 +291,29 @@ def _audit_gop(
         if not math.isfinite(bbox_diagonal) or bbox_diagonal <= 0:
             raise ValueError("reference bounding-box penalty is invalid")
 
-        # Task-1 pi: median own-reference action over the frozen reference set
-        # (reference-only, outcome-blind), swept over campaign multipliers.
-        pi_base = float(np.median(reference_action))
-        if not math.isfinite(pi_base) or pi_base < 0:
-            raise ValueError("reference-action median is invalid")
+        # Task-1 pi, both readings of the handover's "motion quantity", each
+        # reference-only and outcome-blind, swept over campaign multipliers:
+        #   action = total own-reference trajectory length (path_score
+        #            semantics: "a typical identity's entire motion");
+        #   motion = mean distance of the own-reference path from the anchor
+        #            (motion_score semantics).
+        reference_motion = (
+            torch.linalg.vector_norm(
+                reference_paths - ref_splats["anchors"][:, None, :], dim=-1
+            )
+            .mean(dim=1)
+            .detach().cpu().numpy().astype(np.float64, copy=False)
+        )
+        pi_bases = {
+            "action": float(np.median(reference_action)),
+            "motion": float(np.median(reference_motion)),
+        }
+        for name, value in pi_bases.items():
+            if not math.isfinite(value) or value < 0:
+                raise ValueError(f"reference {name} median is invalid")
         pi_values = {
-            f"x{multiplier:g}": pi_base * float(multiplier)
+            f"{name}_x{multiplier:g}": base * float(multiplier)
+            for name, base in pi_bases.items()
             for multiplier in pi_multipliers
         }
 
@@ -319,8 +335,11 @@ def _audit_gop(
             "legacy_missing_identity_penalty_rule": (
                 "own-reference-anchor-bounding-box-diagonal"
             ),
-            "d_path_pi_rule": "median-own-reference-action-of-frozen-reference-set",
-            "d_path_pi_base": pi_base,
+            "d_path_pi_rule": {
+                "action": "median-own-reference-total-path-length",
+                "motion": "median-own-reference-mean-anchor-distance",
+            },
+            "d_path_pi_bases": pi_bases,
             "d_path_pi_values": {k: v for k, v in pi_values.items()},
             "d_path_weight_rule": "uniform_w_i_equals_1",
             "knn_policy": AP_KNN_POLICY if method == ap_method_name else OFFICIAL_KNN_POLICY,
@@ -410,7 +429,9 @@ def main() -> int:
     ap_method = str(campaign["method"])
     official_method = str(campaign["official_method"])
     multipliers = [float(m) for m in campaign["d_path"]["pi_sweep_multipliers"]]
-    pi_labels = [f"x{m:g}" for m in multipliers]
+    pi_labels = [
+        f"{name}_x{m:g}" for name in ("action", "motion") for m in multipliers
+    ]
     runtime = bind_runtime(args.repo_root.resolve(strict=True))
 
     methods: Dict[str, Any] = {}
@@ -430,10 +451,10 @@ def main() -> int:
                 ap_method, multipliers, args.device,
             )
             print(
-                f"[334v3]   pi_base={row['d_path_pi_base']:.6g} "
+                f"[334v3]   pi_bases={ {k: round(v, 6) for k, v in row['d_path_pi_bases'].items()} } "
                 f"pi_values={ {k: round(v, 6) for k, v in row['d_path_pi_values'].items()} } "
                 f"global_missing={row['global']['missing_identity_count']} "
-                f"global_d_path(x1)={row['global']['d_path'].get('x1', {}).get('d_path')}",
+                f"global_d_path(action_x1)={row['global']['d_path'].get('action_x1', {}).get('d_path')}",
                 flush=True,
             )
             rows.append(row)
@@ -466,6 +487,12 @@ def main() -> int:
         direction[subset] = {
             "ap_improves_at": signs,
             "conclusion_direction_stable_across_pi_sweep": len(set(signs.values())) == 1,
+            "stable_within_action_definition": len(
+                {v for k, v in signs.items() if k.startswith("action_")}
+            ) == 1,
+            "stable_within_motion_definition": len(
+                {v for k, v in signs.items() if k.startswith("motion_")}
+            ) == 1,
         }
 
     payload = {
