@@ -1,4 +1,5 @@
 {
+ "ablation": "task2_zero_hop_closure",
  "ap_training_receipt_schema": "h007.ap_training_receipt.v2",
  "ap_training_state_schema": "h007.ap_training_state.v3",
  "d_path": {
@@ -17,7 +18,7 @@
   "factor_protected_multiplier": 0.00390625,
   "freeze_step": 20000,
   "path_contract_schema": "h007.ap_gifstream.path_contract.v1",
-  "path_dependency_rule": "protected-plus-one-hop-retained-knn",
+  "path_dependency_rule": "protected-only-zero-hop",
   "path_knn_count": 8,
   "path_loss_every": 50,
   "path_loss_lambda": 0.01,

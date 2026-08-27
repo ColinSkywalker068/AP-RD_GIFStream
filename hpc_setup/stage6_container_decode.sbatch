@@ -21,7 +21,7 @@ N_KNN="${N_KNN:-8}"
 EXP_TAG="${EXP_TAG:-}"
 SEED=20260715   # frozen ap_compression_seed shared by every producer
 MANIFEST="$REPO_ROOT/provenance/h007_ap_gifstream_u3_patch_chain_patch10_dualkey_20260814.json"
-MANIFEST_SHA=1c80343cb8286b37996345edd3a81122697c0af7d5fb4e8a2b11c9633ef9ed6b
+MANIFEST_SHA=dac0239f405b40510db566677700700df2f6ada777fd6d015b5a31e308d7407e
 
 export CUDA_HOME="$ENV_PREFIX"
 export PATH="$ENV_PREFIX/bin:$PATH"

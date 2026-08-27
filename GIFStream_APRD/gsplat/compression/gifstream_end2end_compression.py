@@ -33,8 +33,11 @@ from gsplat.compression.h007_path_contract import (
     ANCHOR_FEATURE_PROTECTED_MULTIPLIER,
     FACTOR_BACKGROUND_MULTIPLIER,
     FACTOR_PROTECTED_MULTIPLIER,
+    DEPENDENCY_RULES,
     PATH_CONTRACT_SCHEMA,
     build_path_input_precision_mask,
+    dependency_rule_for,
+    zero_hop_from_rule,
     normalize_factor_semantics,
     reconstruct_ap_factors,
     retained_knn_graph_sha256,
@@ -311,6 +314,7 @@ class GIFStreamEnd2endCompression:
                 ap_retain,
                 int(ap_cfg["n_knn"]),
                 canonical_ids=canonical_ids,
+                zero_hop=bool(ap_cfg.get("zero_hop_closure", False)),
             )
             retained_rows = torch.nonzero(
                 ap_retain, as_tuple=False
@@ -614,7 +618,9 @@ class GIFStreamEnd2endCompression:
                     "knn_rule": (
                         "retained-canonical-radius-complete-distance+lexicographic-id"
                     ),
-                    "dependency_rule": "protected-plus-one-hop-retained-knn",
+                    "dependency_rule": dependency_rule_for(
+                        bool(ap_cfg.get("zero_hop_closure", False))
+                    ),
                     "retained_knn_graph_sha256": path_knn_graph_sha256,
                     "canonical_anchor_reconstruction": True,
                     "factor_protected_multiplier": FACTOR_PROTECTED_MULTIPLIER,
@@ -698,8 +704,7 @@ class GIFStreamEnd2endCompression:
             if (
                 not isinstance(path_contract, dict)
                 or path_contract.get("schema") != PATH_CONTRACT_SCHEMA
-                or path_contract.get("dependency_rule")
-                != "protected-plus-one-hop-retained-knn"
+                or path_contract.get("dependency_rule") not in DEPENDENCY_RULES
                 or not isinstance(
                     path_contract.get("retained_knn_graph_sha256"), str
                 )
@@ -894,6 +899,9 @@ class GIFStreamEnd2endCompression:
                 torch.ones_like(decoded_class_mask),
                 int(path_contract["knn_count"]),
                 canonical_ids=retained_ids,
+                zero_hop=zero_hop_from_rule(
+                    str(path_contract["dependency_rule"])
+                ),
             )
             if not _tensor_equal_device_agnostic(
                 expected_knn, retained_knn

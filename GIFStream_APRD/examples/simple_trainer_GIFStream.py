@@ -52,6 +52,8 @@ from gsplat.compression.ap_gifstream import (
 from gsplat.compression.h007_runtime_provenance import verify_runtime_provenance
 from gsplat.compression.h007_path_contract import (
     ANCHOR_FEATURE_BACKGROUND_MULTIPLIER,
+    dependency_rule_for,
+    zero_hop_from_rule,
     ANCHOR_FEATURE_PROTECTED_MULTIPLIER,
     FACTOR_BACKGROUND_MULTIPLIER,
     FACTOR_PROTECTED_MULTIPLIER,
@@ -304,6 +306,9 @@ class Config:
     ap_q_ap_multiplier: float = 0.5
     ap_q_bg_multiplier: float = 1.25
     ap_compression_seed: int = 20260715
+    # Task-2 ablation: protect only the protected set itself (no one-hop
+    # closure).  Decode KNN geometry is unchanged.
+    ap_zero_hop_closure: bool = False
     ap_freeze_step: int = 20_000
     ap_path_loss_lambda: float = 0.01
     ap_path_loss_every: int = 50
@@ -558,6 +563,7 @@ def producer_training_config(cfg: Config) -> Dict[str, Union[str, int, float, bo
         "app_opt": bool(cfg.app_opt),
         "compression_sim": bool(cfg.compression_sim),
         "entropy_model_opt": bool(cfg.entropy_model_opt),
+        "ap_zero_hop_closure": bool(cfg.ap_zero_hop_closure),
     }
 
 
@@ -780,6 +786,7 @@ class Runner:
                         "q_ap_multiplier": cfg.ap_q_ap_multiplier,
                         "q_bg_multiplier": cfg.ap_q_bg_multiplier,
                         "n_knn": int(cfg.n_knn),
+                        "zero_hop_closure": bool(cfg.ap_zero_hop_closure),
                         "compression_seed": cfg.ap_compression_seed,
                         "provenance_manifest_path": cfg.ap_provenance_manifest,
                         "provenance_manifest_sha256": cfg.ap_provenance_manifest_sha256,
@@ -1082,6 +1089,7 @@ class Runner:
             ap_retain,
             int(self.cfg.n_knn),
             canonical_ids=ids,
+            zero_hop=bool(self.cfg.ap_zero_hop_closure),
         )
         (
             self.ap_codec_knn_indices,
@@ -1127,6 +1135,12 @@ class Runner:
             "ap_active_mask": ap_active.detach(),
             "ap_class_mask": ap_class.detach(),
             "ap_path_input_mask": path_input_mask.detach(),
+            "path_dependency_rule": dependency_rule_for(
+                bool(self.cfg.ap_zero_hop_closure)
+            ),
+            "path_input_fraction_of_retained": float(
+                path_input_mask.sum().item()
+            ) / float(ap_retain.sum().item()),
             "path_contract_schema": PATH_CONTRACT_SCHEMA,
             "path_knn_graph_sha256": path_knn_graph_sha256,
             "factor0_activation_value": factor0_value,
@@ -1311,6 +1325,12 @@ class Runner:
             restored["ap_retain_mask"],
             int(self.cfg.n_knn),
             canonical_ids=ids,
+            zero_hop=zero_hop_from_rule(
+                restored.get(
+                    "path_dependency_rule",
+                    "protected-plus-one-hop-retained-knn",
+                )
+            ),
         )
         if not torch.equal(expected_path_mask, restored["ap_path_input_mask"]):
             raise ValueError("restored AP path-input closure is not reproducible")
@@ -1400,7 +1420,10 @@ class Runner:
             raise ValueError("AP retained-KNN graph changed before compression")
         expected_path_fields = {
             "path_contract_schema": PATH_CONTRACT_SCHEMA,
-            "path_dependency_rule": "protected-plus-one-hop-retained-knn",
+            "path_dependency_rule": state.get(
+                "path_dependency_rule",
+                "protected-plus-one-hop-retained-knn",
+            ),
             "path_knn_count": int(self.cfg.n_knn),
             "path_knn_graph_sha256": graph_sha256,
             "factor_protected_multiplier": FACTOR_PROTECTED_MULTIPLIER,
@@ -2106,7 +2129,10 @@ class Runner:
                 "time_entropy_model_frozen_after_freeze": True,
                 "factor_membership_columns_frozen": [0, 3],
                 "path_contract_schema": PATH_CONTRACT_SCHEMA,
-                "path_dependency_rule": "protected-plus-one-hop-retained-knn",
+                "path_dependency_rule": self.ap_state.get(
+                    "path_dependency_rule",
+                    "protected-plus-one-hop-retained-knn",
+                ),
                 "path_knn_count": int(cfg.n_knn),
                 "path_knn_graph_sha256": self.ap_state[
                     "path_knn_graph_sha256"

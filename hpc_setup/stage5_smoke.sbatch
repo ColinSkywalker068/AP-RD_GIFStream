@@ -19,6 +19,7 @@ source /scratch/yz11445/AP-RD_GIFStream/hpc_setup/env_common.sh
 SCENE="${SCENE:-flame_salmon_1}"
 VARIANT="${VARIANT:-ap-gifstream-full}"
 RATE="${RATE:-0}"
+ZERO_HOP="${ZERO_HOP:-0}"
 LAMBDA=0.0005
 MAX_STEPS=3000          # 30000 * 0.1 via --steps_scaler
 FREEZE_STEP=2000        # keeps the frozen 2/3 ratio (real: 20000/30000)
@@ -32,8 +33,11 @@ esac
 
 DATA_DIR="$SCRATCH_ROOT/datasets/Neur3D/$SCENE"
 RESULT_DIR="$SCRATCH_ROOT/results/smoke/$SCENE/$VARIANT/r${RATE}"
+if [ "$ZERO_HOP" = "1" ]; then
+  RESULT_DIR="${RESULT_DIR}_zerohop"
+fi
 MANIFEST="$REPO_ROOT/provenance/h007_ap_gifstream_u3_patch_chain_patch10_dualkey_20260814.json"
-MANIFEST_SHA=1c80343cb8286b37996345edd3a81122697c0af7d5fb4e8a2b11c9633ef9ed6b
+MANIFEST_SHA=dac0239f405b40510db566677700700df2f6ada777fd6d015b5a31e308d7407e
 
 export CUDA_HOME="$ENV_PREFIX"
 export PATH="$ENV_PREFIX/bin:$PATH"
@@ -70,6 +74,9 @@ COMMON_FLAGS=(
   --ap_provenance_manifest "$MANIFEST"
   --ap_provenance_manifest_sha256 "$MANIFEST_SHA"
 )
+if [ "$ZERO_HOP" = "1" ]; then
+  COMMON_FLAGS+=(--ap_zero_hop_closure)
+fi
 
 echo "=== SMOKE PHASE 1: training ($MAX_STEPS steps, freeze @ $FREEZE_STEP) ==="
 "$PY" examples/simple_trainer_GIFStream.py "$TYPE" "${COMMON_FLAGS[@]}"

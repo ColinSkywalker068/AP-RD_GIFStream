@@ -133,6 +133,21 @@ def deterministic_knn_indices(
     return output
 
 
+DEPENDENCY_RULE_ONE_HOP = "protected-plus-one-hop-retained-knn"
+DEPENDENCY_RULE_ZERO_HOP = "protected-only-zero-hop"
+DEPENDENCY_RULES = (DEPENDENCY_RULE_ONE_HOP, DEPENDENCY_RULE_ZERO_HOP)
+
+
+def dependency_rule_for(zero_hop: bool) -> str:
+    return DEPENDENCY_RULE_ZERO_HOP if zero_hop else DEPENDENCY_RULE_ONE_HOP
+
+
+def zero_hop_from_rule(rule: str) -> bool:
+    if rule not in DEPENDENCY_RULES:
+        raise ValueError(f"unknown path dependency rule: {rule!r}")
+    return rule == DEPENDENCY_RULE_ZERO_HOP
+
+
 def build_path_input_precision_mask(
     anchors: Tensor,
     protected_mask: Tensor,
@@ -140,8 +155,15 @@ def build_path_input_precision_mask(
     count: int,
     *,
     canonical_ids: Optional[Tensor] = None,
+    zero_hop: bool = False,
 ) -> Tuple[Tensor, Tensor]:
-    """Expand protected rows to the one-hop retained KNN dependency closure."""
+    """Expand protected rows to the retained KNN dependency closure.
+
+    ``zero_hop=True`` is the task-2 ablation: the protection scope is the
+    protected set itself (no neighbor expansion).  The retained KNN graph is
+    still built and returned unchanged -- decode geometry and the graph
+    contract are identical in both modes; only the precision scope differs.
+    """
 
     row_count = int(anchors.shape[0])
     protected = _validate_row_mask(
@@ -160,7 +182,7 @@ def build_path_input_precision_mask(
     )
     retained_protected = protected[retained_rows]
     precision_retained = retained_protected.clone()
-    if torch.any(retained_protected):
+    if not zero_hop and torch.any(retained_protected):
         neighbor_rows = retained_knn[retained_protected].reshape(-1)
         precision_retained[neighbor_rows] = True
     precision = torch.zeros(row_count, dtype=torch.bool, device=anchors.device)

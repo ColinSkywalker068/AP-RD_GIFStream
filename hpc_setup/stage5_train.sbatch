@@ -20,6 +20,7 @@ RATE="${RATE:-0}"
 GOP_ID="${GOP_ID:-0}"
 N_KNN="${N_KNN:-8}"
 EXP_TAG="${EXP_TAG:-}"
+ZERO_HOP="${ZERO_HOP:-0}"
 
 # Frozen rate grid (h007_sequence_container.FROZEN_RATE_LAMBDAS).
 case "$RATE" in
@@ -42,7 +43,7 @@ esac
 DATA_DIR="$SCRATCH_ROOT/datasets/Neur3D/$SCENE"
 RESULT_DIR="$SCRATCH_ROOT/results/h007/$SCENE/$VARIANT/nknn${N_KNN}/GOP_${GOP_ID}/r${RATE}${EXP_TAG:+_$EXP_TAG}"
 MANIFEST="$REPO_ROOT/provenance/h007_ap_gifstream_u3_patch_chain_patch10_dualkey_20260814.json"
-MANIFEST_SHA=1c80343cb8286b37996345edd3a81122697c0af7d5fb4e8a2b11c9633ef9ed6b
+MANIFEST_SHA=dac0239f405b40510db566677700700df2f6ada777fd6d015b5a31e308d7407e
 START_FRAME=$((GOP_ID * 60))
 
 export CUDA_HOME="$ENV_PREFIX"
@@ -69,6 +70,9 @@ COMMON_FLAGS=(
   --ap_provenance_manifest "$MANIFEST"
   --ap_provenance_manifest_sha256 "$MANIFEST_SHA"
 )
+if [ "$ZERO_HOP" = "1" ]; then
+  COMMON_FLAGS+=(--ap_zero_hop_closure)
+fi
 
 # 1) Compression-aware training (freeze happens at step 20000 for AP variants).
 "$PY" examples/simple_trainer_GIFStream.py "$TYPE" "${COMMON_FLAGS[@]}"
@@ -107,4 +111,4 @@ fi
 # they run as a separate step once GOP_0..GOP_4 exist).
 find "$RESULT_DIR" -maxdepth 2 \( -name '*.zip' -o -name '*.npz' -o -name '*.json' -o -name 'ckpt_*' \) | sort
 du -sh "$RESULT_DIR"
-echo "STAGE5_OK scene=$SCENE variant=$VARIANT rate=$RATE gop=$GOP_ID n_knn=$N_KNN exp_tag=${EXP_TAG:-none}"
+echo "STAGE5_OK scene=$SCENE variant=$VARIANT rate=$RATE gop=$GOP_ID n_knn=$N_KNN exp_tag=${EXP_TAG:-none} zero_hop=$ZERO_HOP"

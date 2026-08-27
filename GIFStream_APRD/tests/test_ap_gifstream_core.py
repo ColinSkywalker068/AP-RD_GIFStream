@@ -42,6 +42,8 @@ from gsplat.compression.gifstream_end2end_compression import (
 from gsplat.compression.h007_path_contract import (
     build_codec_knn_indices,
     build_path_input_precision_mask,
+    dependency_rule_for,
+    zero_hop_from_rule,
     deterministic_knn_indices,
     reconstruct_ap_factors,
     retained_knn_graph_sha256,
@@ -207,6 +209,37 @@ class APGIFStreamCoreTest(unittest.TestCase):
             deterministic_knn_indices(
                 anchors, 2, canonical_ids=ids, allow_duplicate_rows=True
             )
+
+    def test_zero_hop_closure_protects_only_the_protected_set(self):
+        anchors = torch.tensor(
+            [[float(index), 0.0, 0.0] for index in range(7)],
+            dtype=torch.float32,
+        )
+        ids = anchors.to(torch.int64)
+        retain = torch.tensor([True, False, True, True, True, True, False])
+        protected = torch.tensor([False, False, False, True, False, False, False])
+        one_hop, graph_one = build_path_input_precision_mask(
+            anchors, protected, retain, 2, canonical_ids=ids
+        )
+        zero_hop, graph_zero = build_path_input_precision_mask(
+            anchors, protected, retain, 2, canonical_ids=ids, zero_hop=True
+        )
+        # Identical graph (decode geometry unchanged); scope shrinks to the
+        # protected set exactly; one-hop remains a superset.
+        self.assertTrue(torch.equal(graph_one, graph_zero))
+        self.assertTrue(torch.equal(zero_hop, protected & retain))
+        self.assertTrue(bool((zero_hop & ~one_hop).sum() == 0))
+        self.assertGreater(int(one_hop.sum()), int(zero_hop.sum()))
+        self.assertEqual(
+            dependency_rule_for(True), "protected-only-zero-hop"
+        )
+        self.assertEqual(
+            dependency_rule_for(False), "protected-plus-one-hop-retained-knn"
+        )
+        self.assertTrue(zero_hop_from_rule("protected-only-zero-hop"))
+        self.assertFalse(zero_hop_from_rule("protected-plus-one-hop-retained-knn"))
+        with self.assertRaisesRegex(ValueError, "unknown path dependency rule"):
+            zero_hop_from_rule("bogus")
 
     def test_retained_knn_graph_hash_is_row_order_independent(self):
         anchors = torch.tensor(

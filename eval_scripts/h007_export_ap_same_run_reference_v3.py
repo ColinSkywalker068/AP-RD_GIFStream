@@ -356,7 +356,7 @@ def validate_campaign_contract(
         "knn_count": int(EXPECTED_AP_RECEIPT["path_knn_count"]),
         "knn_rule":
             "retained-canonical-radius-complete-distance+lexicographic-id",
-        "dependency_rule": "protected-plus-one-hop-retained-knn",
+        "dependency_rule": str(EXPECTED_AP_RECEIPT["path_dependency_rule"]),
         "retained_knn_graph_sha256": graph_sha,
         "canonical_anchor_reconstruction": True,
         "factor_protected_multiplier": float(EXPECTED_AP_RECEIPT["factor_protected_multiplier"]),

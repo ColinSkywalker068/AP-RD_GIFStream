@@ -1,5 +1,5 @@
 diff --git a/examples/h007_clean_decode_gifstream.py b/examples/h007_clean_decode_gifstream.py
-index 95b53a5..c6c9646 100644
+index 95b53a5..535f5c4 100644
 --- a/examples/h007_clean_decode_gifstream.py
 +++ b/examples/h007_clean_decode_gifstream.py
 @@ -37,6 +37,7 @@ from gsplat.compression.h007_clean_runtime import (
@@ -21,6 +21,18 @@ index 95b53a5..c6c9646 100644
      counted_manifest = container / "preregistered_patch_chain_manifest.json"
      external_payload = provenance_manifest.resolve().read_bytes()
      if counted_manifest.read_bytes() != external_payload:
+@@ -351,7 +352,10 @@ def clean_decode(
+             receipt.get("path_contract_schema")
+             != "h007.ap_gifstream.path_contract.v1"
+             or receipt.get("path_dependency_rule")
+-            != "protected-plus-one-hop-retained-knn"
++            not in (
++                "protected-plus-one-hop-retained-knn",
++                "protected-only-zero-hop",
++            )
+         ):
+             raise ValueError("counted AP receipt lacks the Patch8 path contract")
+         if receipt.get("runtime_provenance") != runtime_provenance:
 diff --git a/examples/h007_make_ap_edit_ids.py b/examples/h007_make_ap_edit_ids.py
 index a8f85d5..6d475e4 100644
 --- a/examples/h007_make_ap_edit_ids.py
@@ -35,7 +47,7 @@ index a8f85d5..6d475e4 100644
          if str(np.asarray(score["scene"]).item()) != "flame_salmon_1":
              raise ValueError("U3 edit selection is development-locked to flame_salmon_1")
 diff --git a/examples/simple_trainer_GIFStream.py b/examples/simple_trainer_GIFStream.py
-index e987d67..a752a81 100644
+index e987d67..a4214d8 100644
 --- a/examples/simple_trainer_GIFStream.py
 +++ b/examples/simple_trainer_GIFStream.py
 @@ -44,6 +44,7 @@ from gsplat.compression.ap_gifstream import (
@@ -46,7 +58,16 @@ index e987d67..a752a81 100644
      file_byte_census,
      tensor_mapping_sha256,
      variant_spec,
-@@ -63,6 +64,7 @@ from gsplat.compression.h007_path_contract import (
+@@ -51,6 +52,8 @@ from gsplat.compression.ap_gifstream import (
+ from gsplat.compression.h007_runtime_provenance import verify_runtime_provenance
+ from gsplat.compression.h007_path_contract import (
+     ANCHOR_FEATURE_BACKGROUND_MULTIPLIER,
++    dependency_rule_for,
++    zero_hop_from_rule,
+     ANCHOR_FEATURE_PROTECTED_MULTIPLIER,
+     FACTOR_BACKGROUND_MULTIPLIER,
+     FACTOR_PROTECTED_MULTIPLIER,
+@@ -63,6 +66,7 @@ from gsplat.compression.h007_path_contract import (
  from gsplat.compression.h007_sequence_container import (
      DECODER_CONFIG_SCHEMA,
      FROZEN_RATE_LAMBDAS,
@@ -54,7 +75,33 @@ index e987d67..a752a81 100644
      PRODUCER_RECEIPT_SCHEMA,
      build_gifstream_payload_manifest,
      canonicalize_gifstream_png_payloads,
-@@ -993,6 +995,18 @@ class Runner:
+@@ -302,6 +306,9 @@ class Config:
+     ap_q_ap_multiplier: float = 0.5
+     ap_q_bg_multiplier: float = 1.25
+     ap_compression_seed: int = 20260715
++    # Task-2 ablation: protect only the protected set itself (no one-hop
++    # closure).  Decode KNN geometry is unchanged.
++    ap_zero_hop_closure: bool = False
+     ap_freeze_step: int = 20_000
+     ap_path_loss_lambda: float = 0.01
+     ap_path_loss_every: int = 50
+@@ -556,6 +563,7 @@ def producer_training_config(cfg: Config) -> Dict[str, Union[str, int, float, bo
+         "app_opt": bool(cfg.app_opt),
+         "compression_sim": bool(cfg.compression_sim),
+         "entropy_model_opt": bool(cfg.entropy_model_opt),
++        "ap_zero_hop_closure": bool(cfg.ap_zero_hop_closure),
+     }
+ 
+ 
+@@ -778,6 +786,7 @@ class Runner:
+                         "q_ap_multiplier": cfg.ap_q_ap_multiplier,
+                         "q_bg_multiplier": cfg.ap_q_bg_multiplier,
+                         "n_knn": int(cfg.n_knn),
++                        "zero_hop_closure": bool(cfg.ap_zero_hop_closure),
+                         "compression_seed": cfg.ap_compression_seed,
+                         "provenance_manifest_path": cfg.ap_provenance_manifest,
+                         "provenance_manifest_sha256": cfg.ap_provenance_manifest_sha256,
+@@ -993,6 +1002,18 @@ class Runner:
              reference_paths - self.splats["anchors"].detach()[:, None, :], dim=-1
          ).mean(dim=1)
          eligible = torch.isfinite(reference_paths).all(dim=(1, 2)) & torch.isfinite(path_score)
@@ -73,7 +120,7 @@ index e987d67..a752a81 100644
          estimated_bytes = self.compression_sim_method.estimate_time_stream_bytes(
              self.splats["time_features"].detach()
          )
-@@ -1042,6 +1056,7 @@ class Runner:
+@@ -1042,6 +1063,7 @@ class Runner:
              ids,
              self.cfg.ap_protected_fraction,
              enable_swap=variant_spec(self.cfg.ap_variant).swap,
@@ -81,7 +128,7 @@ index e987d67..a752a81 100644
          )
          official_active = official_factor0 & official_retain
          ap_starting_active = official_factor0 & ap_retain
-@@ -1055,6 +1070,7 @@ class Runner:
+@@ -1055,6 +1077,7 @@ class Runner:
              enable_swap=variant_spec(self.cfg.ap_variant).swap,
              starting_active=ap_starting_active,
              retain_mask=ap_retain,
@@ -89,7 +136,15 @@ index e987d67..a752a81 100644
          )
          if not torch.equal(whole_class, ap_class):
              raise AssertionError("frozen whole and temporal AP classes disagree")
-@@ -1092,7 +1108,7 @@ class Runner:
+@@ -1066,6 +1089,7 @@ class Runner:
+             ap_retain,
+             int(self.cfg.n_knn),
+             canonical_ids=ids,
++            zero_hop=bool(self.cfg.ap_zero_hop_closure),
+         )
+         (
+             self.ap_codec_knn_indices,
+@@ -1092,7 +1116,7 @@ class Runner:
          factor3_value = float(positive3.min().item())
  
          self.ap_state = {
@@ -98,7 +153,7 @@ index e987d67..a752a81 100644
              "scene": os.path.basename(os.path.normpath(self.cfg.data_dir)),
              "variant": self.cfg.ap_variant,
              "voxel_size": float(self.cfg.voxel_size),
-@@ -1101,6 +1117,7 @@ class Runner:
+@@ -1101,6 +1125,7 @@ class Runner:
              "scores": scores.detach(),
              "path_score": path_score.detach(),
              "motion_score": motion_score.detach(),
@@ -106,7 +161,20 @@ index e987d67..a752a81 100644
              "estimated_time_bytes": estimated_bytes.detach(),
              "reference_paths": reference_paths.detach(),
              "official_retain_mask": official_retain.detach(),
-@@ -1161,6 +1178,7 @@ class Runner:
+@@ -1110,6 +1135,12 @@ class Runner:
+             "ap_active_mask": ap_active.detach(),
+             "ap_class_mask": ap_class.detach(),
+             "ap_path_input_mask": path_input_mask.detach(),
++            "path_dependency_rule": dependency_rule_for(
++                bool(self.cfg.ap_zero_hop_closure)
++            ),
++            "path_input_fraction_of_retained": float(
++                path_input_mask.sum().item()
++            ) / float(ap_retain.sum().item()),
+             "path_contract_schema": PATH_CONTRACT_SCHEMA,
+             "path_knn_graph_sha256": path_knn_graph_sha256,
+             "factor0_activation_value": factor0_value,
+@@ -1161,6 +1192,7 @@ class Runner:
              path_score=path_score.cpu().numpy().astype(np.float64, copy=False),
              motion_score=motion_score.cpu().numpy().astype(np.float64, copy=False),
              allocation_score=scores.cpu().numpy().astype(np.float64, copy=False),
@@ -114,7 +182,7 @@ index e987d67..a752a81 100644
              estimated_time_bytes=estimated_bytes.cpu().numpy().astype(np.int64, copy=False),
              official_retain_mask=official_retain.cpu().numpy().astype(np.bool_, copy=False),
              official_factor0_mask=official_factor0.cpu().numpy().astype(np.bool_, copy=False),
-@@ -1185,6 +1203,9 @@ class Runner:
+@@ -1185,6 +1217,9 @@ class Runner:
              ),
              path_definition=np.asarray("sum_consecutive_euclidean_displacement"),
              motion_definition=np.asarray("mean_distance_from_canonical_anchor"),
@@ -124,7 +192,7 @@ index e987d67..a752a81 100644
              estimated_byte_definition=np.asarray(
                  "ceil_deterministic_conditional_gaussian_bits_over_8"
              ),
-@@ -1263,7 +1284,7 @@ class Runner:
+@@ -1263,7 +1298,7 @@ class Runner:
              raise ValueError("AP checkpoint is missing frozen state or training receipt")
          state = checkpoint["ap_state"]
          receipt = checkpoint["ap_training_receipt"]
@@ -133,7 +201,44 @@ index e987d67..a752a81 100644
              raise ValueError("unsupported AP training-state schema")
          if receipt.get("schema") != "h007.ap_training_receipt.v2":
              raise ValueError("unsupported AP training-receipt schema")
-@@ -2726,8 +2747,8 @@ class Runner:
+@@ -1290,6 +1325,12 @@ class Runner:
+             restored["ap_retain_mask"],
+             int(self.cfg.n_knn),
+             canonical_ids=ids,
++            zero_hop=zero_hop_from_rule(
++                restored.get(
++                    "path_dependency_rule",
++                    "protected-plus-one-hop-retained-knn",
++                )
++            ),
+         )
+         if not torch.equal(expected_path_mask, restored["ap_path_input_mask"]):
+             raise ValueError("restored AP path-input closure is not reproducible")
+@@ -1379,7 +1420,10 @@ class Runner:
+             raise ValueError("AP retained-KNN graph changed before compression")
+         expected_path_fields = {
+             "path_contract_schema": PATH_CONTRACT_SCHEMA,
+-            "path_dependency_rule": "protected-plus-one-hop-retained-knn",
++            "path_dependency_rule": state.get(
++                "path_dependency_rule",
++                "protected-plus-one-hop-retained-knn",
++            ),
+             "path_knn_count": int(self.cfg.n_knn),
+             "path_knn_graph_sha256": graph_sha256,
+             "factor_protected_multiplier": FACTOR_PROTECTED_MULTIPLIER,
+@@ -2085,7 +2129,10 @@ class Runner:
+                 "time_entropy_model_frozen_after_freeze": True,
+                 "factor_membership_columns_frozen": [0, 3],
+                 "path_contract_schema": PATH_CONTRACT_SCHEMA,
+-                "path_dependency_rule": "protected-plus-one-hop-retained-knn",
++                "path_dependency_rule": self.ap_state.get(
++                    "path_dependency_rule",
++                    "protected-plus-one-hop-retained-knn",
++                ),
+                 "path_knn_count": int(cfg.n_knn),
+                 "path_knn_graph_sha256": self.ap_state[
+                     "path_knn_graph_sha256"
+@@ -2726,8 +2773,8 @@ class Runner:
          if self.ap_runtime_provenance is None:
              raise ValueError("official/AP compression lacks runtime provenance")
          patch_chain = list(self.ap_runtime_provenance["patch_sha256"])
@@ -441,12 +546,57 @@ index 5bcd3b3..94cd274 100644
      audit = dict(audit)
      audit["official_retain_count"] = audit.pop("official_active_count")
 diff --git a/gsplat/compression/gifstream_end2end_compression.py b/gsplat/compression/gifstream_end2end_compression.py
-index 110a888..a7e5696 100644
+index 110a888..b32305f 100644
 --- a/gsplat/compression/gifstream_end2end_compression.py
 +++ b/gsplat/compression/gifstream_end2end_compression.py
-@@ -895,7 +895,9 @@ class GIFStreamEnd2endCompression:
+@@ -33,8 +33,11 @@ from gsplat.compression.h007_path_contract import (
+     ANCHOR_FEATURE_PROTECTED_MULTIPLIER,
+     FACTOR_BACKGROUND_MULTIPLIER,
+     FACTOR_PROTECTED_MULTIPLIER,
++    DEPENDENCY_RULES,
+     PATH_CONTRACT_SCHEMA,
+     build_path_input_precision_mask,
++    dependency_rule_for,
++    zero_hop_from_rule,
+     normalize_factor_semantics,
+     reconstruct_ap_factors,
+     retained_knn_graph_sha256,
+@@ -311,6 +314,7 @@ class GIFStreamEnd2endCompression:
+                 ap_retain,
+                 int(ap_cfg["n_knn"]),
+                 canonical_ids=canonical_ids,
++                zero_hop=bool(ap_cfg.get("zero_hop_closure", False)),
+             )
+             retained_rows = torch.nonzero(
+                 ap_retain, as_tuple=False
+@@ -614,7 +618,9 @@ class GIFStreamEnd2endCompression:
+                     "knn_rule": (
+                         "retained-canonical-radius-complete-distance+lexicographic-id"
+                     ),
+-                    "dependency_rule": "protected-plus-one-hop-retained-knn",
++                    "dependency_rule": dependency_rule_for(
++                        bool(ap_cfg.get("zero_hop_closure", False))
++                    ),
+                     "retained_knn_graph_sha256": path_knn_graph_sha256,
+                     "canonical_anchor_reconstruction": True,
+                     "factor_protected_multiplier": FACTOR_PROTECTED_MULTIPLIER,
+@@ -698,8 +704,7 @@ class GIFStreamEnd2endCompression:
+             if (
+                 not isinstance(path_contract, dict)
+                 or path_contract.get("schema") != PATH_CONTRACT_SCHEMA
+-                or path_contract.get("dependency_rule")
+-                != "protected-plus-one-hop-retained-knn"
++                or path_contract.get("dependency_rule") not in DEPENDENCY_RULES
+                 or not isinstance(
+                     path_contract.get("retained_knn_graph_sha256"), str
+                 )
+@@ -894,8 +899,13 @@ class GIFStreamEnd2endCompression:
+                 torch.ones_like(decoded_class_mask),
                  int(path_contract["knn_count"]),
                  canonical_ids=retained_ids,
++                zero_hop=zero_hop_from_rule(
++                    str(path_contract["dependency_rule"])
++                ),
              )
 -            if not torch.equal(expected_knn, retained_knn) or not torch.equal(
 +            if not _tensor_equal_device_agnostic(
@@ -498,7 +648,7 @@ index d414afd..55e5872 100644
  
  def counted_knn_indices(
 diff --git a/gsplat/compression/h007_path_contract.py b/gsplat/compression/h007_path_contract.py
-index 81b5faf..f0e3d6f 100644
+index 81b5faf..3d6aca3 100644
 --- a/gsplat/compression/h007_path_contract.py
 +++ b/gsplat/compression/h007_path_contract.py
 @@ -48,6 +48,7 @@ def deterministic_knn_indices(
@@ -534,7 +684,55 @@ index 81b5faf..f0e3d6f 100644
                  candidate_ids[:, 2],
                  candidate_ids[:, 1],
                  candidate_ids[:, 0],
-@@ -350,17 +358,22 @@ def normalize_factor_semantics(
+@@ -125,6 +133,21 @@ def deterministic_knn_indices(
+     return output
+ 
+ 
++DEPENDENCY_RULE_ONE_HOP = "protected-plus-one-hop-retained-knn"
++DEPENDENCY_RULE_ZERO_HOP = "protected-only-zero-hop"
++DEPENDENCY_RULES = (DEPENDENCY_RULE_ONE_HOP, DEPENDENCY_RULE_ZERO_HOP)
++
++
++def dependency_rule_for(zero_hop: bool) -> str:
++    return DEPENDENCY_RULE_ZERO_HOP if zero_hop else DEPENDENCY_RULE_ONE_HOP
++
++
++def zero_hop_from_rule(rule: str) -> bool:
++    if rule not in DEPENDENCY_RULES:
++        raise ValueError(f"unknown path dependency rule: {rule!r}")
++    return rule == DEPENDENCY_RULE_ZERO_HOP
++
++
+ def build_path_input_precision_mask(
+     anchors: Tensor,
+     protected_mask: Tensor,
+@@ -132,8 +155,15 @@ def build_path_input_precision_mask(
+     count: int,
+     *,
+     canonical_ids: Optional[Tensor] = None,
++    zero_hop: bool = False,
+ ) -> Tuple[Tensor, Tensor]:
+-    """Expand protected rows to the one-hop retained KNN dependency closure."""
++    """Expand protected rows to the retained KNN dependency closure.
++
++    ``zero_hop=True`` is the task-2 ablation: the protection scope is the
++    protected set itself (no neighbor expansion).  The retained KNN graph is
++    still built and returned unchanged -- decode geometry and the graph
++    contract are identical in both modes; only the precision scope differs.
++    """
+ 
+     row_count = int(anchors.shape[0])
+     protected = _validate_row_mask(
+@@ -152,7 +182,7 @@ def build_path_input_precision_mask(
+     )
+     retained_protected = protected[retained_rows]
+     precision_retained = retained_protected.clone()
+-    if torch.any(retained_protected):
++    if not zero_hop and torch.any(retained_protected):
+         neighbor_rows = retained_knn[retained_protected].reshape(-1)
+         precision_retained[neighbor_rows] = True
+     precision = torch.zeros(row_count, dtype=torch.bool, device=anchors.device)
+@@ -350,17 +380,22 @@ def normalize_factor_semantics(
      if not math.isfinite(activation) or activation < 0.1 or activation > 1.0:
          raise ValueError("factor0 activation value must be in [0.1,1]")
  
@@ -578,18 +776,38 @@ index c041b03..5d04dc6 100644
  TREE_ROOTS = ("examples", "gsplat", "third_party")
  TREE_ROOT_FILES: Tuple[str, ...] = ("setup.py",)
 diff --git a/gsplat/compression/h007_sequence_container.py b/gsplat/compression/h007_sequence_container.py
-index e949278..4988c1d 100644
+index e949278..f86c92a 100644
 --- a/gsplat/compression/h007_sequence_container.py
 +++ b/gsplat/compression/h007_sequence_container.py
-@@ -43,6 +43,7 @@ DECODER_CONFIG_SCHEMA = "h007.gifstream_decoder_config.v3"
+@@ -43,6 +43,11 @@ DECODER_CONFIG_SCHEMA = "h007.gifstream_decoder_config.v3"
  ORDINARY_EVALUATOR_RELATIVE_PATH = "examples/h007_ordinary_rate_quality.py"
  SOURCE_DATA_SCHEMA = "h007.neur3d_source_data_manifest.v1"
  OFFICIAL_COMMIT = "c98486632e7dafd830740b1a1692bd08c48b96e3"
 +PATCH_CHAIN_LENGTH = 11
++AP_DEPENDENCY_RULES = (
++    "protected-plus-one-hop-retained-knn",
++    "protected-only-zero-hop",
++)
  CONFIRMATORY_SCENES = (
      "coffee_martini",
      "cook_spinach",
-@@ -247,6 +248,7 @@ AP_SCORE_NPZ_MEMBERS = {
+@@ -186,6 +191,7 @@ PRODUCER_TRAINING_CONFIG_FIELDS = {
+     "app_opt",
+     "compression_sim",
+     "entropy_model_opt",
++    "ap_zero_hop_closure",
+ }
+ 
+ DECODER_POSITIVE_INT_FIELDS = (
+@@ -230,6 +236,7 @@ PRODUCER_TRAINING_BOOL_FIELDS = (
+     "app_opt",
+     "compression_sim",
+     "entropy_model_opt",
++    "ap_zero_hop_closure",
+ )
+ 
+ AP_SCORE_NPZ_MEMBERS = {
+@@ -247,6 +254,7 @@ AP_SCORE_NPZ_MEMBERS = {
      "path_score.npy",
      "motion_score.npy",
      "allocation_score.npy",
@@ -597,7 +815,7 @@ index e949278..4988c1d 100644
      "estimated_time_bytes.npy",
      "official_retain_mask.npy",
      "official_factor0_mask.npy",
-@@ -265,6 +267,7 @@ AP_SCORE_NPZ_MEMBERS = {
+@@ -265,6 +273,7 @@ AP_SCORE_NPZ_MEMBERS = {
      "patch_chain_sha256.npy",
      "path_definition.npy",
      "motion_definition.npy",
@@ -605,7 +823,7 @@ index e949278..4988c1d 100644
      "estimated_byte_definition.npy",
  }
  AP_SCORE_NPZ_ORDER = (
-@@ -282,6 +285,7 @@ AP_SCORE_NPZ_ORDER = (
+@@ -282,6 +291,7 @@ AP_SCORE_NPZ_ORDER = (
      "path_score.npy",
      "motion_score.npy",
      "allocation_score.npy",
@@ -613,7 +831,7 @@ index e949278..4988c1d 100644
      "estimated_time_bytes.npy",
      "official_retain_mask.npy",
      "official_factor0_mask.npy",
-@@ -300,6 +304,7 @@ AP_SCORE_NPZ_ORDER = (
+@@ -300,6 +310,7 @@ AP_SCORE_NPZ_ORDER = (
      "patch_chain_sha256.npy",
      "path_definition.npy",
      "motion_definition.npy",
@@ -621,7 +839,7 @@ index e949278..4988c1d 100644
      "estimated_byte_definition.npy",
  )
  
-@@ -325,12 +330,13 @@ AP_EDIT_IDS_NPZ_ORDER = (
+@@ -325,12 +336,13 @@ AP_EDIT_IDS_NPZ_ORDER = (
      "selected_canonical_ids_sha256.npy",
      "path_score.npy",
  )
@@ -636,7 +854,7 @@ index e949278..4988c1d 100644
  AP_ESTIMATED_BYTE_DEFINITION = (
      "ceil_deterministic_conditional_gaussian_bits_over_8"
  )
-@@ -952,6 +958,7 @@ def _ap_score_npz_contract(
+@@ -952,6 +964,7 @@ def _ap_score_npz_contract(
          "path_score.npy": vector_f8,
          "motion_score.npy": vector_f8,
          "allocation_score.npy": vector_f8,
@@ -644,7 +862,7 @@ index e949278..4988c1d 100644
          "estimated_time_bytes.npy": vector_i8,
          "official_retain_mask.npy": vector_bool,
          "official_factor0_mask.npy": vector_bool,
-@@ -967,9 +974,13 @@ def _ap_score_npz_contract(
+@@ -967,9 +980,13 @@ def _ap_score_npz_contract(
          "time_entropy_model_frozen_after_freeze.npy": scalar_bool,
          "runtime_manifest_sha256.npy": ("<U64", ()),
          "normalized_code_tree_sha256.npy": ("<U64", ()),
@@ -659,7 +877,17 @@ index e949278..4988c1d 100644
          "estimated_byte_definition.npy": (
              _unicode_scalar_descr(AP_ESTIMATED_BYTE_DEFINITION),
              (),
-@@ -2346,7 +2357,7 @@ def _validate_runtime_provenance_shape(value: Any, label: str) -> Dict[str, Any]
+@@ -2230,8 +2247,7 @@ def _validate_ap_training_receipt_contract(
+         != "current_raw_full_graph_vs_simulated_retained_graph_on_retained_rows"
+         or receipt["path_contract_schema"]
+         != "h007.ap_gifstream.path_contract.v1"
+-        or receipt["path_dependency_rule"]
+-        != "protected-plus-one-hop-retained-knn"
++        or receipt["path_dependency_rule"] not in AP_DEPENDENCY_RULES
+         or sha256_bytes(payload) != _require_sha256(
+             expected_sha256, "counted AP training receipt SHA-256"
+         )
+@@ -2346,7 +2362,7 @@ def _validate_runtime_provenance_shape(value: Any, label: str) -> Dict[str, Any]
          value["schema"] != "h007.ap_gifstream.runtime_provenance.v1"
          or value["official_commit"] != OFFICIAL_COMMIT
          or not isinstance(value["patch_sha256"], list)
@@ -668,7 +896,17 @@ index e949278..4988c1d 100644
          or not isinstance(tree, dict)
          or set(tree) != tree_required
          or tree["schema"] != "h007.normalized_code_tree.v1"
-@@ -2986,8 +2997,8 @@ def _validate_gifstream_decoder_closure(
+@@ -2658,8 +2674,7 @@ def _required_gifstream_streams(meta: Mapping[str, Any], method: str) -> Dict[st
+             }
+             or path_contract["schema"]
+             != "h007.ap_gifstream.path_contract.v1"
+-            or path_contract["dependency_rule"]
+-            != "protected-plus-one-hop-retained-knn"
++            or path_contract["dependency_rule"] not in AP_DEPENDENCY_RULES
+             or path_contract["knn_rule"]
+             != "retained-canonical-radius-complete-distance+lexicographic-id"
+             or path_contract["canonical_anchor_reconstruction"] is not True
+@@ -2986,8 +3001,8 @@ def _validate_gifstream_decoder_closure(
          raise ValueError("GOP decoder config is not the frozen GIFStream decoder contract")
      _validate_decoder_config_discrete_types(config)
      patch_chain = config.get("patch_chain_sha256")
@@ -679,7 +917,7 @@ index e949278..4988c1d 100644
      for index, digest in enumerate(patch_chain):
          _require_sha256(digest, f"patch-chain entry {index} SHA-256")
      manifest_sha = _require_sha256(
-@@ -3038,6 +3049,8 @@ def _validate_gifstream_decoder_closure(
+@@ -3038,6 +3053,8 @@ def _validate_gifstream_decoder_closure(
              "patch6",
              "patch7",
              "patch8",
@@ -688,7 +926,7 @@ index e949278..4988c1d 100644
          ]
          or any(
              not isinstance(row, dict)
-@@ -4547,7 +4560,7 @@ def validate_eligibility_recomputation_contract(
+@@ -4547,7 +4564,7 @@ def validate_eligibility_recomputation_contract(
          runtime["schema"] != "h007.ap_gifstream.runtime_provenance.v1"
          or runtime["official_commit"] != OFFICIAL_COMMIT
          or not isinstance(patches, list)
@@ -697,7 +935,7 @@ index e949278..4988c1d 100644
          or not isinstance(tree, dict)
          or set(tree)
          != {
-@@ -5113,8 +5126,8 @@ def _validate_ordinary_rate_quality_evidence(
+@@ -5113,8 +5130,8 @@ def _validate_ordinary_rate_quality_evidence(
          runtime_repo_root,
          runtime_sha,
      )
@@ -748,7 +986,7 @@ index 559f0d8..6558308 100644
                  new_offsets = torch.zeros_like(candidate_anchor).unsqueeze(dim=1).repeat([1,state["n_offsets"],1]).float().to(device)
  
 diff --git a/tests/test_ap_gifstream_core.py b/tests/test_ap_gifstream_core.py
-index 2e798c2..ed26aca 100644
+index 2e798c2..f3a1099 100644
 --- a/tests/test_ap_gifstream_core.py
 +++ b/tests/test_ap_gifstream_core.py
 @@ -14,6 +14,7 @@ from gsplat.compression.ap_gifstream import (
@@ -759,7 +997,16 @@ index 2e798c2..ed26aca 100644
      load_aligned_score_artifact,
      pack_bool_mask,
      read_identity_corrections,
-@@ -85,6 +86,8 @@ class APGIFStreamCoreTest(unittest.TestCase):
+@@ -41,6 +42,8 @@ from gsplat.compression.gifstream_end2end_compression import (
+ from gsplat.compression.h007_path_contract import (
+     build_codec_knn_indices,
+     build_path_input_precision_mask,
++    dependency_rule_for,
++    zero_hop_from_rule,
+     deterministic_knn_indices,
+     reconstruct_ap_factors,
+     retained_knn_graph_sha256,
+@@ -85,6 +88,8 @@ class APGIFStreamCoreTest(unittest.TestCase):
                  "9" * 64,
                  "a" * 64,
                  "b" * 64,
@@ -768,7 +1015,7 @@ index 2e798c2..ed26aca 100644
              ],
              "normalized_code_tree": {"sha256": "5" * 64},
          }
-@@ -176,6 +179,35 @@ class APGIFStreamCoreTest(unittest.TestCase):
+@@ -176,6 +181,66 @@ class APGIFStreamCoreTest(unittest.TestCase):
          self.assertTrue(precision[protected].all())
          self.assertTrue(retain[codec_graph[retained_rows]].all())
  
@@ -801,10 +1048,41 @@ index 2e798c2..ed26aca 100644
 +                anchors, 2, canonical_ids=ids, allow_duplicate_rows=True
 +            )
 +
++    def test_zero_hop_closure_protects_only_the_protected_set(self):
++        anchors = torch.tensor(
++            [[float(index), 0.0, 0.0] for index in range(7)],
++            dtype=torch.float32,
++        )
++        ids = anchors.to(torch.int64)
++        retain = torch.tensor([True, False, True, True, True, True, False])
++        protected = torch.tensor([False, False, False, True, False, False, False])
++        one_hop, graph_one = build_path_input_precision_mask(
++            anchors, protected, retain, 2, canonical_ids=ids
++        )
++        zero_hop, graph_zero = build_path_input_precision_mask(
++            anchors, protected, retain, 2, canonical_ids=ids, zero_hop=True
++        )
++        # Identical graph (decode geometry unchanged); scope shrinks to the
++        # protected set exactly; one-hop remains a superset.
++        self.assertTrue(torch.equal(graph_one, graph_zero))
++        self.assertTrue(torch.equal(zero_hop, protected & retain))
++        self.assertTrue(bool((zero_hop & ~one_hop).sum() == 0))
++        self.assertGreater(int(one_hop.sum()), int(zero_hop.sum()))
++        self.assertEqual(
++            dependency_rule_for(True), "protected-only-zero-hop"
++        )
++        self.assertEqual(
++            dependency_rule_for(False), "protected-plus-one-hop-retained-knn"
++        )
++        self.assertTrue(zero_hop_from_rule("protected-only-zero-hop"))
++        self.assertFalse(zero_hop_from_rule("protected-plus-one-hop-retained-knn"))
++        with self.assertRaisesRegex(ValueError, "unknown path dependency rule"):
++            zero_hop_from_rule("bogus")
++
      def test_retained_knn_graph_hash_is_row_order_independent(self):
          anchors = torch.tensor(
              [
-@@ -364,6 +396,7 @@ class APGIFStreamCoreTest(unittest.TestCase):
+@@ -364,6 +429,7 @@ class APGIFStreamCoreTest(unittest.TestCase):
                  path_score=np.asarray([20.0, 0.0, 10.0]),
                  motion_score=np.asarray([2.0, 0.0, 1.0]),
                  allocation_score=np.asarray([20.0, 0.0, 10.0]),
@@ -812,7 +1090,7 @@ index 2e798c2..ed26aca 100644
                  estimated_time_bytes=np.asarray([7, 5, 6], dtype=np.int64),
                  official_retain_mask=np.asarray([True, True, True]),
                  official_factor0_mask=np.asarray([True, False, True]),
-@@ -389,6 +422,9 @@ class APGIFStreamCoreTest(unittest.TestCase):
+@@ -389,6 +455,9 @@ class APGIFStreamCoreTest(unittest.TestCase):
                          "8" * 64,
                          "9" * 64,
                          "a" * 64,
@@ -822,7 +1100,7 @@ index 2e798c2..ed26aca 100644
                      ]
                  ),
              )
-@@ -425,6 +461,143 @@ class APGIFStreamCoreTest(unittest.TestCase):
+@@ -425,6 +494,143 @@ class APGIFStreamCoreTest(unittest.TestCase):
          self.assertEqual(torch.nonzero(active & ~official).reshape(-1).tolist(), [4, 5])
          self.assertEqual(torch.nonzero(official & ~active).reshape(-1).tolist(), [0, 1])
          self.assertEqual(audit["promoted_count"], audit["demoted_count"])
@@ -1017,10 +1295,18 @@ index 5deeee8..ccb2ef8 100644
          self.assertEqual(receipt["patch_sha256"], self.patch_hashes)
          self.assertEqual(receipt["normalized_code_tree"]["file_count"], 2)
 diff --git a/tests/test_h007_sequence_container.py b/tests/test_h007_sequence_container.py
-index 7de074e..cbd91fa 100644
+index 7de074e..ba68b4e 100644
 --- a/tests/test_h007_sequence_container.py
 +++ b/tests/test_h007_sequence_container.py
-@@ -179,7 +179,7 @@ def fixture_ap_meta(method="ap-gifstream-full"):
+@@ -45,6 +45,7 @@ TRAINING_CONFIG = {
+     "app_opt": False,
+     "compression_sim": True,
+     "entropy_model_opt": True,
++    "ap_zero_hop_closure": False,
+ }
+ TRAINING_CONFIG_SHA = hashlib.sha256(
+     sequence.canonical_json_bytes(TRAINING_CONFIG)
+@@ -179,7 +180,7 @@ def fixture_ap_meta(method="ap-gifstream-full"):
          }
      digest = "a" * 64
      score = {
@@ -1029,7 +1315,7 @@ index 7de074e..cbd91fa 100644
          "score_artifact": "score.npz",
          "score_artifact_sha256": digest,
          "ranking": sequence.AP_VARIANT_METADATA[method]["ranking"],
-@@ -194,7 +194,7 @@ def fixture_ap_meta(method="ap-gifstream-full"):
+@@ -194,7 +195,7 @@ def fixture_ap_meta(method="ap-gifstream-full"):
          "time_entropy_model_frozen_after_freeze": True,
          "runtime_manifest_sha256": digest,
          "normalized_code_tree_sha256": digest,
@@ -1038,7 +1324,7 @@ index 7de074e..cbd91fa 100644
          "anchor_count": anchor_count,
          "eligible_count": 3,
      }
-@@ -220,7 +220,7 @@ def fixture_ap_meta(method="ap-gifstream-full"):
+@@ -220,7 +221,7 @@ def fixture_ap_meta(method="ap-gifstream-full"):
          "schema": "h007.ap_gifstream.runtime_provenance.v1",
          "manifest_sha256": digest,
          "official_commit": sequence.OFFICIAL_COMMIT,
@@ -1047,7 +1333,7 @@ index 7de074e..cbd91fa 100644
          "normalized_code_tree": {
              "schema": "h007.normalized_code_tree.v1",
              "normalization": "fixture",
-@@ -910,7 +910,7 @@ class H007SequenceContainerTest(unittest.TestCase):
+@@ -910,7 +911,7 @@ class H007SequenceContainerTest(unittest.TestCase):
              "schema": "h007.ap_gifstream.runtime_provenance.v1",
              "manifest_sha256": hashlib.sha256(runtime_manifest.read_bytes()).hexdigest(),
              "official_commit": sequence.OFFICIAL_COMMIT,
@@ -1056,7 +1342,7 @@ index 7de074e..cbd91fa 100644
              "normalized_code_tree": {
                  "schema": "h007.normalized_code_tree.v1",
                  "normalization": "sorted-posix-path+lf-bytes+uint64le-lengths",
-@@ -1037,7 +1037,7 @@ class H007SequenceContainerTest(unittest.TestCase):
+@@ -1037,7 +1038,7 @@ class H007SequenceContainerTest(unittest.TestCase):
              "file_count": 1,
              "sha256": "a" * 64,
          }
@@ -1065,7 +1351,7 @@ index 7de074e..cbd91fa 100644
          runtime_manifest_payload = sequence.canonical_json_bytes(
              {
                  "schema": "h007.ap_gifstream.patch_chain_manifest.v1",
-@@ -1059,6 +1059,8 @@ class H007SequenceContainerTest(unittest.TestCase):
+@@ -1059,6 +1060,8 @@ class H007SequenceContainerTest(unittest.TestCase):
                              "patch6",
                              "patch7",
                              "patch8",

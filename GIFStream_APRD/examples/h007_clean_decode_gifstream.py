@@ -352,7 +352,10 @@ def clean_decode(
             receipt.get("path_contract_schema")
             != "h007.ap_gifstream.path_contract.v1"
             or receipt.get("path_dependency_rule")
-            != "protected-plus-one-hop-retained-knn"
+            not in (
+                "protected-plus-one-hop-retained-knn",
+                "protected-only-zero-hop",
+            )
         ):
             raise ValueError("counted AP receipt lacks the Patch8 path contract")
         if receipt.get("runtime_provenance") != runtime_provenance:

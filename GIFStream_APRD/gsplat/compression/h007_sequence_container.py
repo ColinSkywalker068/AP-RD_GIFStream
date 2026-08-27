@@ -44,6 +44,10 @@ ORDINARY_EVALUATOR_RELATIVE_PATH = "examples/h007_ordinary_rate_quality.py"
 SOURCE_DATA_SCHEMA = "h007.neur3d_source_data_manifest.v1"
 OFFICIAL_COMMIT = "c98486632e7dafd830740b1a1692bd08c48b96e3"
 PATCH_CHAIN_LENGTH = 11
+AP_DEPENDENCY_RULES = (
+    "protected-plus-one-hop-retained-knn",
+    "protected-only-zero-hop",
+)
 CONFIRMATORY_SCENES = (
     "coffee_martini",
     "cook_spinach",
@@ -187,6 +191,7 @@ PRODUCER_TRAINING_CONFIG_FIELDS = {
     "app_opt",
     "compression_sim",
     "entropy_model_opt",
+    "ap_zero_hop_closure",
 }
 
 DECODER_POSITIVE_INT_FIELDS = (
@@ -231,6 +236,7 @@ PRODUCER_TRAINING_BOOL_FIELDS = (
     "app_opt",
     "compression_sim",
     "entropy_model_opt",
+    "ap_zero_hop_closure",
 )
 
 AP_SCORE_NPZ_MEMBERS = {
@@ -2241,8 +2247,7 @@ def _validate_ap_training_receipt_contract(
         != "current_raw_full_graph_vs_simulated_retained_graph_on_retained_rows"
         or receipt["path_contract_schema"]
         != "h007.ap_gifstream.path_contract.v1"
-        or receipt["path_dependency_rule"]
-        != "protected-plus-one-hop-retained-knn"
+        or receipt["path_dependency_rule"] not in AP_DEPENDENCY_RULES
         or sha256_bytes(payload) != _require_sha256(
             expected_sha256, "counted AP training receipt SHA-256"
         )
@@ -2669,8 +2674,7 @@ def _required_gifstream_streams(meta: Mapping[str, Any], method: str) -> Dict[st
             }
             or path_contract["schema"]
             != "h007.ap_gifstream.path_contract.v1"
-            or path_contract["dependency_rule"]
-            != "protected-plus-one-hop-retained-knn"
+            or path_contract["dependency_rule"] not in AP_DEPENDENCY_RULES
             or path_contract["knn_rule"]
             != "retained-canonical-radius-complete-distance+lexicographic-id"
             or path_contract["canonical_anchor_reconstruction"] is not True

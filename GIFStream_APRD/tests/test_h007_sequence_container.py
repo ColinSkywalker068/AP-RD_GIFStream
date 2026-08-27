@@ -45,6 +45,7 @@ TRAINING_CONFIG = {
     "app_opt": False,
     "compression_sim": True,
     "entropy_model_opt": True,
+    "ap_zero_hop_closure": False,
 }
 TRAINING_CONFIG_SHA = hashlib.sha256(
     sequence.canonical_json_bytes(TRAINING_CONFIG)
