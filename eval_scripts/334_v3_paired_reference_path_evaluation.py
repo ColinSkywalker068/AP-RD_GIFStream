@@ -186,7 +186,7 @@ def _audit_gop(
     reference_bundle: Path,
     candidate_bundle: Path,
     method: str,
-    ap_method_name: str,
+    is_ap: bool,
     pi_multipliers: Sequence[float],
     device_name: str,
 ) -> Dict[str, Any]:
@@ -200,7 +200,7 @@ def _audit_gop(
             return None
         count = int(config["n_knn"])
         anchors = splats["anchors"]
-        if method == ap_method_name:
+        if is_ap:
             return deterministic_knn_indices(anchors, count, canonical_ids=ids)
         if count <= 0 or anchors.shape[0] <= count:
             raise ValueError("counted KNN request exceeds decoded anchor population")
@@ -222,7 +222,7 @@ def _audit_gop(
                 raise ValueError(f"candidate/reference configuration differs: {key}")
         voxel_size = float(ref_config["voxel_size"])
         reference_ids = canonical_ids(ref_splats["anchors"], voxel_size)
-        if method == ap_method_name:
+        if is_ap:
             manifest = json.loads(
                 (candidate_bundle / "clean_decode_manifest.json").read_text()
             )
@@ -347,13 +347,13 @@ def _audit_gop(
             "d_path_pi_bases": pi_bases,
             "d_path_pi_values": {k: v for k, v in pi_values.items()},
             "d_path_weight_rule": "uniform_w_i_equals_1",
-            "knn_policy": AP_KNN_POLICY if method == ap_method_name else OFFICIAL_KNN_POLICY,
+            "knn_policy": AP_KNN_POLICY if is_ap else OFFICIAL_KNN_POLICY,
             "top10_rule": (
                 "top-ceil-10%-own-reference-path-length-with-canonical-ID-tie-break"
             ),
             "candidate_canonical_id_source": (
                 "exact-restored-container-sidecar"
-                if method == ap_method_name
+                if is_ap
                 else "decoded-anchor-round-to-own-reference-voxel-size"
             ),
             "candidate_identity_resolution_rule": (
@@ -423,6 +423,20 @@ def main() -> int:
     parser.add_argument("--ap-decode-root", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--device", default="cuda:0")
+    parser.add_argument(
+        "--official-slot-method", default=None,
+        help="method name for the first (baseline) slot; default: campaign official_method",
+    )
+    parser.add_argument(
+        "--official-slot-is-ap", action="store_true",
+        help="treat the baseline slot as an AP-type method (identity sidecars, AP KNN)",
+    )
+    parser.add_argument(
+        "--ap-slot-method", default=None,
+        help="method name for the second slot; default: campaign method",
+    )
+    parser.add_argument("--official-decode-tag", default="")
+    parser.add_argument("--ap-decode-tag", default="")
     args = parser.parse_args()
     if args.output.exists():
         raise FileExistsError(args.output)
@@ -431,8 +445,8 @@ def main() -> int:
     if str(args.rate) not in campaign["rates"]:
         raise ValueError(f"rate {args.rate} outside campaign grid")
     gop_count = int(campaign["gop_count"])
-    ap_method = str(campaign["method"])
-    official_method = str(campaign["official_method"])
+    ap_method = str(args.ap_slot_method or campaign["method"])
+    official_method = str(args.official_slot_method or campaign["official_method"])
     multipliers = [float(m) for m in campaign["d_path"]["pi_sweep_multipliers"]]
     pi_labels = [
         f"{name}_x{m:g}"
@@ -442,20 +456,33 @@ def main() -> int:
     runtime = bind_runtime(args.repo_root.resolve(strict=True))
 
     methods: Dict[str, Any] = {}
-    for method, ref_root, decode_root in (
-        (official_method, args.official_reference_root, args.official_decode_root),
-        (ap_method, args.ap_reference_root, args.ap_decode_root),
+    for method, ref_root, decode_root, is_ap, tag in (
+        (
+            official_method,
+            args.official_reference_root,
+            args.official_decode_root,
+            bool(args.official_slot_is_ap),
+            str(args.official_decode_tag),
+        ),
+        (
+            ap_method,
+            args.ap_reference_root,
+            args.ap_decode_root,
+            True,
+            str(args.ap_decode_tag),
+        ),
     ):
         rows = []
         for gop_id in range(gop_count):
             reference_bundle = ref_root / f"gop_{gop_id}"
+            rate_dir = f"r{args.rate}" + (f"_{tag}" if tag else "")
             candidate_bundle = (
-                decode_root / f"GOP_{gop_id}" / f"r{args.rate}" / "clean_decode"
+                decode_root / f"GOP_{gop_id}" / rate_dir / "clean_decode"
             )
             print(f"[334v3] auditing {method} rate {args.rate} GOP {gop_id}", flush=True)
             row = _audit_gop(
                 runtime, reference_bundle, candidate_bundle, method,
-                ap_method, multipliers, args.device,
+                is_ap, multipliers, args.device,
             )
             print(
                 f"[334v3]   pi_bases={ {k: round(v, 6) for k, v in row['d_path_pi_bases'].items()} } "
