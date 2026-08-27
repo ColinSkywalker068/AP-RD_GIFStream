@@ -304,9 +304,14 @@ def _audit_gop(
             .mean(dim=1)
             .detach().cpu().numpy().astype(np.float64, copy=False)
         )
+        moving = reference_action[reference_action > 0]
         pi_bases = {
             "action": float(np.median(reference_action)),
             "motion": float(np.median(reference_motion)),
+            # Supplementary, non-degenerate reading: the median motion of the
+            # identities that move at all (the full-set medians are zero on
+            # scenes where motion is sparse -- the paper's own premise).
+            "moving": float(np.median(moving)) if moving.size else 0.0,
         }
         for name, value in pi_bases.items():
             if not math.isfinite(value) or value < 0:
@@ -430,7 +435,9 @@ def main() -> int:
     official_method = str(campaign["official_method"])
     multipliers = [float(m) for m in campaign["d_path"]["pi_sweep_multipliers"]]
     pi_labels = [
-        f"{name}_x{m:g}" for name in ("action", "motion") for m in multipliers
+        f"{name}_x{m:g}"
+        for name in ("action", "motion", "moving")
+        for m in multipliers
     ]
     runtime = bind_runtime(args.repo_root.resolve(strict=True))
 
@@ -492,6 +499,9 @@ def main() -> int:
             ) == 1,
             "stable_within_motion_definition": len(
                 {v for k, v in signs.items() if k.startswith("motion_")}
+            ) == 1,
+            "stable_within_moving_definition": len(
+                {v for k, v in signs.items() if k.startswith("moving_")}
             ) == 1,
         }
 
