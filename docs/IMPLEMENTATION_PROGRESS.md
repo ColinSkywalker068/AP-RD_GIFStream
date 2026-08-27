@@ -1,6 +1,6 @@
 # AP-RD / GIFStream — Implementation Progress
 
-Status as of 2026-08-15. Covers everything done since taking over the handover
+Status as of 2026-08-16. Covers everything done since taking over the handover
 (`4c2a73e`), on both machines:
 
 - **4090 workstation** (`asus4090`, `~/Research/AP-RD_GIFStream`) — development,
@@ -19,8 +19,8 @@ kept in lockstep on `main`; every change below is committed and pushed.
 | Task | Status |
 |---|---|
 | **3 — donor dual-key** | **Code complete, tested, verified in a real run.** |
-| **2 — closure ablation (`n_knn` 8→0)** | Not started; unblocked — one command (`N_KNN=0 ./submit_train.sh`) once the main matrix exists. |
-| **1 — D_path evaluator** | Not started; independent, next code item. |
+| **2 — closure ablation (`n_knn` 8→0)** | Blocked on a small tree change: `n_knn=0` crashes the KNN builder under mandatory `knn=True`; needs closure-side zero-neighbor support (own campaign generation). |
+| **1 — D_path evaluator** | **Done — built, run over the full matrix; see docs/TASK1_DPATH_RESULTS.md** (π-degeneracy finding inside). |
 | **4/5/6 — writing items** | Untouched by design (paper-writing time). |
 | Onboarding step 1 (env + tests green) | Done on both machines (see §3, §5). |
 | Onboarding step 2 (patch-chain replay + hash check) | Done — replays bit-exactly. |
