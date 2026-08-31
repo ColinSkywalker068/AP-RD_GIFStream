@@ -156,7 +156,8 @@ replicates to tighten the bound, or simplify the method by dropping it.
 
 ## 8. Method-internal statistics (task-4 reporting material)
 
-- **Byte-exact subset-sum infeasibility**: 7 truly-infeasible draws across
+- **Byte-exact subset-sum infeasibility** (drawback O1 in §9): 7
+  truly-infeasible draws across
   ~70 AP training attempts (~10%), *all* at the two highest rates; zero at
   r0–r1. The r3/GOP4 cell alone is infeasible on 4 of 8 draws (~50%).
   Mechanism: coarser quantization at high λ makes per-row byte costs
@@ -167,7 +168,101 @@ replicates to tighten the bound, or simplify the method by dropping it.
 - **Freeze-time audits** consistently plausible: protected count = exactly
   ⌈5% × eligible⌉; whole-anchor promoted = demoted; temporal byte delta = 0.
 
-## 9. What this says about the implementation
+## 9. Drawbacks & pending development
+
+Everything that hurts the method or still needs work, in three tiers by how we
+know it: seen happening in operation, measured in the stats, or inferred but
+not yet measured. Ranked by severity at the end.
+
+### 9a. Observed in operation
+
+- **O1 — The byte-exact halt.** The temporal-exchange subset-sum DP found *no
+  exact byte adjustment* on 7 of ~70 AP training draws (~10%): training stops
+  at the freeze step and the run must be redrawn from scratch (the compute up
+  to the freeze is wasted). All 7 halts were at the two highest rates; the
+  r3/GOP4 cell halted on 4 of 8 draws (~50%). Every halt was the
+  "genuinely infeasible" mode, never the state-cap; retries always recovered —
+  but recovery is stochastic (GPU-nondeterministic anchor sets redraw
+  feasibility), so completion at a hostile cell is not guaranteed in bounded
+  attempts.
+- **O2 — GPU-architecture coupling in the byte-canonical check.** The
+  "entropy stream is the exact canonical re-encoding" verification fails
+  across GPU architectures (H200-encoded archives rejected on L40S): rANS CDF
+  construction drifts with arch. Workable under a same-arch rule, but it means
+  the method's byte-exactness guarantee is hardware-scoped as implemented.
+- **O3 — Strict identity contracts are brittle to float-exact duplicates.**
+  Two stochastic collision modes (densification growing an anchor exactly onto
+  another; official decode merging anchors via the lossy 16-bit round-trip)
+  crashed the deterministic-KNN contract until patched. Fixed, but it shows
+  the identity machinery sits on a knife-edge the base codec never cared
+  about.
+- **O4 — The fail-closed regime taxes iteration.** Because AP checkpoints pin
+  the provenance manifest sha, *any* source change invalidates every trained
+  AP cell: the campaign was fully retrained twice (manifest canonicalization,
+  then the M3 tree change). Intended behavior, but a real development-velocity
+  cost that grows with matrix size.
+
+### 9b. Measured in the stats
+
+- **S1 — Same-λ byte premium: +16.7 / +16.3 / +15.0 / +13.1%** at r0–r3.
+  Structural (sidecars, protected-scope fine quantization, two-class factor
+  streams). The bytes-matched ladder neutralizes it, but the ladder concedes
+  rate position — at matched λ the method always pays.
+- **S2 — Deep-rate quality dip.** At r3 AP is −0.32 dB PSNR (27.67 vs 27.99),
+  the weakest point of the parity claim; the deepest ladder pair (AP r3 vs
+  official r2) trades −0.49 dB. The trend hints the premium's quality cost
+  concentrates where bits are scarcest.
+- **S3 — Possibly dead-weight closure.** One-hop closure doubles the
+  fine-quantization scope (11.17% vs 5.00% of retained rows) and delivers no
+  measurable D_path or rate benefit (both split 2–2 across rates, within
+  noise). Part of S1 may be buying nothing; simplification pending the
+  author's call.
+- **S4 — The prescribed metric is fragile.** The handover's π (median motion
+  of the frozen reference set) degenerates to exactly 0 on this scene — the
+  metric as specified cannot penalize a missing identity here. Conclusions
+  were rescued by the moving-median π and the all-π≥0 dominance argument, but
+  the spec needs repair (author ratification pending).
+
+### 9c. Inferred, not yet measured
+
+- **I1 — Motion-dense scenes stress everything at once.** Protection scope,
+  the byte premium, and DP difficulty all scale with how much motion must be
+  protected; a scene without flame_salmon's >50% static mass could raise S1
+  and O1 together and shrink the ladder's one-rate-step slack.
+- **I2 — The halt worsens toward deeper rates.** O1's mechanism (coarser
+  quantization → chunkier per-row byte costs → fewer exact compositions)
+  predicts rising infeasibility beyond r3; extending the rate grid downward
+  may need a designed fallback (tolerance band, donor-pool widening) rather
+  than retry-as-fresh-draw.
+- **I3 — Freeze-time selection cannot see future motion.** The protected set
+  is chosen from motion scores at the freeze; identities that begin moving
+  later (longer sequences, streaming) are unprotected by construction. Fine
+  for per-GOP contracts, a real limit for temporal generalization.
+- **I4 — Not a drop-in bitstream.** AP decode requires the identity/mask
+  sidecars and the canonical-ID KNN reconstruction contract; combined with O2,
+  deployment on heterogeneous decoders is an integration project, not a codec
+  swap.
+- **I5 — Evidence scope.** One scene, one seed per cell, one protected
+  fraction (5%; the author's archived config used 1%). Every headline number
+  could move elsewhere in that space; the ablation's noise floor (~±30% of the
+  small D_path values) is set by the single-seed design.
+
+### 9d. Severity ranking (most → least hurting the method)
+
+| Rank | Drawback | Why this rank |
+|---|---|---|
+| 1 | S1 same-λ byte premium | Systematic, measured, on the axis compression work is judged by; the ladder defense concedes rate position. |
+| 2 | O1/I2 byte-exact halt | The only *hard failure mode*; observed at ~10% of draws, ~50% at the worst cell, and predicted to worsen exactly where bits matter most. |
+| 3 | I5 evidence scope | Doesn't hurt the method itself, but currently caps every claim: one scene, one seed, one protected fraction. |
+| 4 | I1 motion-dense scaling | The most plausible way S1 and O1 compound into a real problem; untested. |
+| 5 | S2 deep-rate quality dip | −0.3 to −0.5 dB at the extreme; small, but the parity claim's weakest point. |
+| 6 | S3 dead-weight closure | Pure cost inside S1 with no measured benefit — but removable, and the ablation already scoped the fix. |
+| 7 | I3 freeze-time blindness | Real conceptual limit, out of scope for per-GOP claims. |
+| 8 | I4/O2 deployment friction | Integration cost, not a validity threat. |
+| 9 | S4 metric fragility | Already worked around; needs a spec fix, not new science. |
+| 10 | O4/O3 regime & contract brittleness | Costs us development time; invisible to the method's claims. |
+
+## 10. What this says about the implementation
 
 1. **The pipeline is sound end-to-end**: 143 tests green on both machines;
    the 45-check deep verifier passes on real runs; the 11-patch provenance
@@ -180,15 +275,15 @@ replicates to tighten the bound, or simplify the method by dropping it.
 3. **The core claim has multi-axis evidence**: paths (15–90×), rate (ladder
    dominance at fewer bytes), quality (parity). The premise (motion-blind RD)
    is quantified in our own data (41% of motion mass deleted invisibly).
-4. **Named weaknesses**, so nobody oversells: single scene, single seed per
-   cell (bounds the ablation's resolution); the dual-key donor rule has no
-   dedicated single-key-vs-dual-key ablation arm (one submit command if
-   wanted); the same-λ rate overhead (+13–17%) requires the ladder framing;
-   and three design decisions await the original author's ratification
-   (π definition given its degeneracy, dual-key scope on both paying-side
-   sites, closure framing after the null result).
+4. **Nothing is oversold**: the full drawback register — observed, measured,
+   and inferred — is §9, ranked by severity. Beyond it, two open items are
+   evidence, not defects: the dual-key donor rule has no dedicated
+   single-key-vs-dual-key ablation arm (one submit command if wanted), and
+   three design decisions await the original author's ratification
+   (π definition given its degeneracy — S4, dual-key scope on both
+   paying-side sites, closure framing after the null result — S3).
 
-## 10. Reproduction
+## 11. Reproduction
 
 Every table regenerates from committed code: training via
 `hpc_setup/submit_train.sh` (variant/rate/GOP/n_knn/EXP_TAG/ZERO_HOP),
